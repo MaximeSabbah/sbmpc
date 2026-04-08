@@ -10,7 +10,7 @@ from functools import partial
 
 from abc import ABC, abstractmethod
 
-from sbmpc.filter import cubic_spline
+from sbmpc.filter import cubic_spline_matrix
 
 
 
@@ -86,7 +86,19 @@ class RolloutGenerator():
         self.input_min_full_horizon = jnp.tile(model.input_min, (self.horizon, 1))
         self.clip_input = jax.jit(self.clip_input, device=self.device)
 
-        self.control_spline_grid = jnp.round(jnp.linspace(0, self.horizon, self.num_control_points)).astype(int).tolist()
+        self.control_spline_indices = jnp.round(
+            jnp.linspace(0, self.horizon - 1, self.num_control_points)
+        ).astype(jnp.int32)
+        self.control_spline_grid = self.control_spline_indices.astype(
+            self.dtype_general
+        )
+        if self.config.MPC.smoothing == "Spline":
+            self.control_interp_matrix = cubic_spline_matrix(
+                self.control_spline_grid,
+                jnp.arange(self.horizon, dtype=self.dtype_general),
+            )
+        else:
+            self.control_interp_matrix = None
 
         #self.gains = jnp.zeros((model.nu, model.nx))
         # self.ctrl_sens_to_state = jax.jit(jax.jacfwd(self.compute_control_mppi, argnums=0, has_aux=True), device=self.device)
@@ -118,7 +130,7 @@ class RolloutGenerator():
         Interpolates the control variables over the full horizon or passes the control variables directly
         """
         if self.config.MPC.smoothing == "Spline":
-            control_interp = cubic_spline(self.control_spline_grid, control_variables, jnp.arange(0, self.horizon))
+            control_interp = self.control_interp_matrix @ control_variables
             return self.clip_input_single(control_interp)
         else:
             return self.clip_input_single(control_variables)
@@ -203,7 +215,7 @@ class RolloutGenerator():
         gradients = None
 
         if self.config.MPC.smoothing == "Spline":
-            control_vars_all = optimal_samples[self.control_spline_grid, :] + samples_delta
+            control_vars_all = optimal_samples[self.control_spline_indices, :] + samples_delta
         else:
             control_vars_all = optimal_samples + samples_delta
 

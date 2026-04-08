@@ -93,13 +93,12 @@ class ModelParametric(BaseModel):
 
     def integrate_si_euler(self, state, inputs, params, dt: float):
         """
-        Semi-implicit Euler integration.
-        As of now this is probably implemented inefficiently because the whole dynamics is evaluated two times.
+        Semi-implicit Euler integration with a single dynamics evaluation.
         """
-        v_kp1 = state[self.nq:] + dt * self.dynamics_parametric(state, inputs, params)[self.nq:]
-        return jnp.concatenate([
-                    state[:self.nq] + dt * self.dynamics_parametric(jnp.concatenate([state[:self.nq], v_kp1]), inputs, params)[:self.nq],
-                    v_kp1])
+        state_dot = self.dynamics_parametric(state, inputs, params)
+        v_kp1 = state[self.nq:] + dt * state_dot[self.nq:]
+        q_kp1 = state[:self.nq] + dt * v_kp1
+        return jnp.concatenate([q_kp1, v_kp1])
 
     def sensitivity_step(self, state, inputs, params, state_sensitivity, input_sensitivity, dt):
 
@@ -132,11 +131,15 @@ class Model(ModelParametric):
         super().__init__(model_dynamics, nq, nv, nu, len(nominal_parameters), input_bounds, integrator_type)
 
         self.nominal_parameters = nominal_parameters
-
-        self.integrate_rollout_single = self.integrate
+        self._integrate_nominal = jax.jit(
+            lambda state, inputs, dt: self.integrate_parametric(
+                state, inputs, self.nominal_parameters, dt
+            )
+        )
+        self.integrate_rollout_single = self._integrate_nominal
 
     def integrate(self, state, inputs, dt):
-        return self.integrate_parametric(state, inputs, self.nominal_parameters, dt)
+        return self._integrate_nominal(state, inputs, dt)
 
 
 
