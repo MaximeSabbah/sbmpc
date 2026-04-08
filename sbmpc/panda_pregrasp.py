@@ -17,8 +17,13 @@ from sbmpc.solvers import BaseObjective
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PANDA_SCENE_PATH = ROOT / "examples" / "franka_emika_panda" / "scene.xml"
-PANDA_MJCF_PATH = ROOT / "examples" / "franka_emika_panda" / "panda_nohand.xml"
+PANDA_SCENE_PATH = ROOT / "examples" / "panda_pick_place" / "scene.xml"
+PANDA_MJCF_PATH = ROOT / "examples" / "panda_pick_place" / "panda.xml"
+
+_DESIRED_X = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)
+_DESIRED_Z = jnp.array([0.0, 0.0, -1.0], dtype=jnp.float32)
+_ARM_TORQUE_LIMITS = jnp.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], dtype=jnp.float32)
+PREGRASP_CLEARANCE = 0.05
 
 
 @dataclass(frozen=True)
@@ -53,16 +58,27 @@ class PandaPregraspPlanner:
         self.scene_path = str(scene_path)
         self.mjcf_path = str(mjcf_path)
 
-        self.model = pin.buildModelFromMJCF(self.mjcf_path)
+        self.full_model = pin.buildModelFromMJCF(self.mjcf_path)
+        self.home_q_full, self.object_pos, self.target_pos, self.object_half_height = self._load_mujoco_defaults()
+        finger_joint_ids = [
+            self.full_model.getJointId("finger_joint1"),
+            self.full_model.getJointId("finger_joint2"),
+        ]
+        self.model = pin.buildReducedModel(
+            self.full_model,
+            finger_joint_ids,
+            np.asarray(self.home_q_full, dtype=np.float64),
+        )
         self.data = self.model.createData()
-        self.frame_id = self.model.getFrameId("attachment")
+        self.frame_id = self.model.getFrameId("gripper")
 
         self.nq = self.model.nq
         self.nv = self.model.nv
         self.nu = self.model.nv
         self.nx = self.nq + self.nv
 
-        self.home_q, self.torque_limits = self._load_mujoco_defaults()
+        self.home_q = jnp.asarray(np.asarray(self.home_q_full[: self.nq]), dtype=jnp.float32)
+        self.torque_limits = _ARM_TORQUE_LIMITS
         self.damping = jnp.asarray(
             np.asarray(self.model.damping).reshape(-1), dtype=jnp.float32
         )
@@ -71,12 +87,16 @@ class PandaPregraspPlanner:
         self.home_pos = jnp.asarray(home_pos, dtype=jnp.float32)
         self.home_rotation = jnp.asarray(home_rot, dtype=jnp.float32)
 
+        self.pregrasp_offset = jnp.array(
+            [0.0, 0.0, self.object_half_height + PREGRASP_CLEARANCE],
+            dtype=jnp.float32,
+        )
         self.goal_pos = (
-            jnp.array([0.45, 0.0, 0.35], dtype=jnp.float32)
+            self.object_pos + self.pregrasp_offset
             if goal_pos is None
             else jnp.asarray(goal_pos, dtype=jnp.float32)
         )
-        self.goal_rotation = self.home_rotation
+        self.goal_rotation = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
         self.goal_q = jnp.asarray(
             self.solve_ik(
                 np.asarray(self.goal_pos), np.asarray(self.goal_rotation)
@@ -103,14 +123,17 @@ class PandaPregraspPlanner:
 
         self._dynamics_jax, self._ee_features_jax = self._build_symbolic_functions()
 
-    def _load_mujoco_defaults(self) -> tuple[jax.Array, jax.Array]:
+    def _load_mujoco_defaults(self) -> tuple[jax.Array, jax.Array, jax.Array, float]:
         mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
         key_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
-        home_q = jnp.asarray(mj_model.key_qpos[key_id], dtype=jnp.float32)
-        torque_limits = jnp.asarray(
-            mj_model.actuator_forcerange[:, 1], dtype=jnp.float32
-        )
-        return home_q, torque_limits
+        home_q = jnp.asarray(mj_model.key_qpos[key_id][:9], dtype=jnp.float32)
+        object_body_idx = mj_model.body("object").id
+        target_body_idx = mj_model.body("target").id
+        object_geom_idx = mj_model.geom("object_geom").id
+        object_pos = jnp.asarray(mj_model.body_pos[object_body_idx], dtype=jnp.float32)
+        target_pos = jnp.asarray(mj_model.body_pos[target_body_idx], dtype=jnp.float32)
+        object_half_height = float(mj_model.geom_size[object_geom_idx, 2])
+        return home_q, object_pos, target_pos, object_half_height
 
     def _build_symbolic_functions(self) -> tuple[callable, callable]:
         cmodel = cpin.Model(self.model)

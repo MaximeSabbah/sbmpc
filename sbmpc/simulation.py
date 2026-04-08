@@ -105,7 +105,11 @@ class MujocoVisualizer(Visualizer):
 
     def set_qpos(self, qpos) -> None:
         if self.step_mujoco:
-            self.mj_data.qpos = qpos
+            qpos_arr = np.asarray(qpos)
+            if qpos_arr.shape[0] == self.mj_data.qpos.shape[0]:
+                self.mj_data.qpos = qpos_arr
+            else:
+                self.mj_data.qpos[: qpos_arr.shape[0]] = qpos_arr
             mujoco.mj_fwdPosition(self.mj_model, self.mj_data)
         self.viewer.sync()
 
