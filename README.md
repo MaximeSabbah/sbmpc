@@ -17,16 +17,14 @@ Implements the Feedback-MPPI method presented in the [related paper](https://arx
 ```
 
 # Installation
-This repo now supports both `pixi` and `uv`.
+This repo uses `nix` for the outer dev shell and `pixi` for the Python
+environment. This is the supported path for the Panda symbolic work because the
+conda-forge `pinocchio` package exposes `pinocchio.casadi`.
 
-- Use `pixi` if you want to stay close to upstream `sbmpc`.
-- Use `uv` if you want a workflow closer to `hydrax`.
+The examples below assume Python `3.12`.
 
-The examples below assume Python `3.12`, which is what we use in `hydrax` too.
-
-## Recommended: same Nix shell as `hydrax`
-If you want the same entry point as `hydrax`, start by entering the local dev
-shell:
+## Recommended workflow
+Enter the local dev shell:
 ```bash
 nix develop
 ```
@@ -36,58 +34,17 @@ If you use `direnv`, you can make that automatic:
 direnv allow
 ```
 
-Inside that shell, the recommended workflow is:
-```bash
-uv sync --extra dev
-```
-
-Or, on a Linux GPU machine that already runs `hydrax` with CUDA 13:
-```bash
-uv sync --extra dev --extra cuda13
-```
-
-## `uv` workflow
-
-### CPU-only installation
-Create the virtual environment, install the package in editable mode, and pull in the development tools:
-```bash
-uv sync --extra dev
-```
-
-### CUDA-enabled installation
-If your machine already runs `hydrax` with the CUDA 13 wheels, use:
-```bash
-uv sync --extra dev --extra cuda13
-```
-
-If you specifically need the CUDA 12 wheels instead:
-```bash
-uv sync --extra dev --extra cuda12
-```
-
-### Running examples with `uv`
-```bash
-uv run python examples/quadrotor.py
-uv run python examples/franka_kinematic_control.py
-```
-
-## `pixi` workflow
-
-### CPU-only installation
-Install dependencies and activate the CPU-only environment:
+Install the default environment:
 ```bash
 pixi install
-pixi shell
 ```
 
-### CUDA-enabled installation
-For GPU acceleration with CUDA support:
+For Linux GPU machines, install the CUDA environment:
 ```bash
 pixi install -e cuda
-pixi shell -e cuda
 ```
 
-### Running examples with `pixi`
+## Running examples
 Run examples directly with pixi:
 ```bash
 pixi run python examples/quadrotor.py
@@ -98,20 +55,16 @@ Or with the CUDA environment:
 pixi run -e cuda python examples/quadrotor.py
 ```
 
-Refer to the [Jax documentation](https://jax.readthedocs.io/) for more details on GPU acceleration.
+Refer to the [Jax documentation](https://jax.readthedocs.io/) for more details
+on GPU acceleration.
 
 ## Building the package
-With `uv`:
-```bash
-uv build
-```
-
-With `pixi`:
+With the default environment:
 ```bash
 pixi run build
 ```
 
-Or with the Pixi CUDA environment:
+Or with the CUDA environment:
 ```bash
 pixi run -e cuda build
 ```

@@ -36,11 +36,8 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.15",
 ]
-cuda12 = [
-    "jax[cuda12] ; platform_system == 'Linux'"
-]
-cuda13 = [
-    "jax[cuda13] ; platform_system == 'Linux'"
+panda = [
+    "jaxadi>=0.4.0",
 ]
 
 [build-system]
@@ -58,11 +55,16 @@ version_scheme = "no-guess-dev"
 channels = ["conda-forge", "nvidia"]
 platforms = ["linux-64", "osx-arm64"]
 
+[tool.pixi.dependencies]
+python = "3.12.*"
+pinocchio = ">=3.9.0,<4"
+casadi = ">=3.7.2,<4"
+
 [tool.pixi.tasks]
 build = "hatch build"
 
 [tool.pixi.pypi-dependencies]
-sbmpc = { path = ".", editable = true }
+sbmpc = { path = ".", editable = true, extras = ["dev", "panda"] }
 hatch-vcs = "*"
 hatch = "*"
 

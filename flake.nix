@@ -26,7 +26,7 @@
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.cudaPackages.cudatoolkit
-              pkgs.uv
+              pkgs.pixi
               self'.packages.vscode
             ];
             shellHook = ''

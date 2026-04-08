@@ -1,28 +1,20 @@
 # developper guide
 
 ## Development environment
-You can develop this repository with either `pixi` or `uv`.
+The supported development path is `nix` plus `pixi`.
 
-If you are working on `hydrax` and `sbmpc-panda` side by side, `uv` is the
-smoothest option because the workflow matches `hydrax`:
-
-```bash
-direnv allow
-uv sync --extra dev
-```
-
-For Linux GPU machines:
+Enter the repo shell and install the default environment:
 
 ```bash
 direnv allow
-uv sync --extra dev --extra cuda13
-```
-
-The upstream Pixi workflow is still fully supported:
-
-```bash
 pixi install
-pixi shell
+```
+
+For Linux GPU machines, install the CUDA environment:
+
+```bash
+direnv allow
+pixi install -e cuda
 ```
 
 ## Building the Package
