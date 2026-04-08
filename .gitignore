@@ -124,12 +124,14 @@ celerybeat.pid
 
 # Environments
 .env
+.direnv/
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.nix-override-bin/
 
 # Pixi
 .pixi/

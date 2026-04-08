@@ -19,7 +19,7 @@ dependencies = [
     "equinox>=0.13.4"
     ]
 readme = "README.md"
-requires-python = "<3.13"
+requires-python = ">=3.12,<3.13"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -32,8 +32,15 @@ Homepage = "https://github.com/tombelv/sbmpc"
 Issues = "https://github.com/tombelv/sbmpc/issues"
 
 [project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.15",
+]
 cuda12 = [
     "jax[cuda12] ; platform_system == 'Linux'"
+]
+cuda13 = [
+    "jax[cuda13] ; platform_system == 'Linux'"
 ]
 
 [build-system]
