@@ -23,7 +23,7 @@ class BaseObjective(ABC):
         pass
 
     def final_cost(self, state, reference):
-        return 0.0
+        return jnp.asarray(0.0, dtype=jnp.float32)
 
     def cost_and_constraints(self, state, inputs, reference):
         return self.running_cost(state, inputs, reference) + jnp.sum(self.make_barrier(self.constraints(state, inputs, reference)))
@@ -32,14 +32,19 @@ class BaseObjective(ABC):
         return self.final_cost(state, reference) + jnp.sum(self.make_barrier(self.terminal_constraints(state, reference)))
 
     def make_barrier(self, constraint_array):
-        constraint_array = jnp.where(constraint_array > 0, 1e3, 0.0)
+        constraint_array = jnp.asarray(constraint_array, dtype=jnp.float32)
+        constraint_array = jnp.where(
+            constraint_array > 0,
+            jnp.asarray(1e3, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
         return constraint_array
 
     def constraints(self, state, inputs, reference):
-        return 0.0
+        return jnp.asarray(0.0, dtype=jnp.float32)
 
     def terminal_constraints(self, state, reference):
-        return 0.0
+        return jnp.asarray(0.0, dtype=jnp.float32)
 
 
 
@@ -67,7 +72,7 @@ class RolloutGenerator():
         self.config = config
 
         # Sampling time for discrete time model
-        self.dt = config.MPC.dt
+        self.dt = jnp.asarray(config.MPC.dt, dtype=self.dtype_general)
         # Control horizon of the MPC (steps)
         self.horizon = config.MPC.horizon
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel 
@@ -136,7 +141,7 @@ class RolloutGenerator():
             return self.clip_input_single(control_variables)
     
     def rollout_single(self, initial_state, reference, control_variables):
-        cost = 0.0
+        cost = jnp.asarray(0.0, dtype=self.dtype_general)
         curr_state = initial_state
 
         control_variables = self.interpolate_control(control_variables)
@@ -156,7 +161,7 @@ class RolloutGenerator():
     
 
     def rollout_single_with_sensitivity(self, initial_state, reference, control_variables):
-        cost = 0.0
+        cost = jnp.asarray(0.0, dtype=self.dtype_general)
         curr_state = initial_state
         curr_state_sens = jnp.zeros((self.model.nx, self.model.np))
 

@@ -10,8 +10,8 @@ class Gains(ABC):
 
     def __init__(self, config: Config) -> None:
         self.compute_gains = config.MPC.gains
-        self.lam = config.MPC.lambda_mpc
-        self.cur_gains =  jnp.zeros((config.robot.nu, config.robot.nx))
+        self.lam = jnp.asarray(config.MPC.lambda_mpc, dtype=config.general.dtype)
+        self.cur_gains = jnp.zeros((config.robot.nu, config.robot.nx), dtype=config.general.dtype)
         
 
     @abstractmethod

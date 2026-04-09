@@ -37,7 +37,8 @@ dev = [
     "ruff>=0.15",
 ]
 panda = [
-    "jaxadi>=0.4.0",
+    "jaxsim>=0.8.1",
+    "robot_descriptions>=1.17.0",
 ]
 
 [build-system]

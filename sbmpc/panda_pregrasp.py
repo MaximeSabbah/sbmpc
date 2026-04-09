@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
-import casadi as cs
 import jax
 import jax.numpy as jnp
-import jaxadi
+import jaxsim.api as js
+import jaxsim.parsers.rod as rodp
 import mujoco
 import numpy as np
 import pinocchio as pin
-import pinocchio.casadi as cpin
+from robot_descriptions.panda_description import URDF_PATH as PANDA_URDF_PATH
 
 from sbmpc.settings import Config, DynamicsModel, RobotConfig
 from sbmpc.solvers import BaseObjective
@@ -18,7 +19,9 @@ from sbmpc.solvers import BaseObjective
 
 ROOT = Path(__file__).resolve().parents[1]
 PANDA_SCENE_PATH = ROOT / "examples" / "panda_pick_place" / "scene.xml"
-PANDA_MJCF_PATH = ROOT / "examples" / "panda_pick_place" / "panda.xml"
+PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{i}" for i in range(1, 8))
+PANDA_FINGER_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
+PANDA_TCP_FRAME_NAME = "panda_hand_tcp"
 
 _DESIRED_X = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)
 _DESIRED_Z = jnp.array([0.0, 0.0, -1.0], dtype=jnp.float32)
@@ -47,41 +50,60 @@ class PandaPregraspReference:
 
 
 class PandaPregraspPlanner:
-    """Pinocchio + JaxADi model for a 7-DoF Panda pregrasp phase."""
+    """JaxSim + Pinocchio model for a 7-DoF Panda pregrasp phase."""
 
     def __init__(
         self,
         scene_path: str | Path = PANDA_SCENE_PATH,
-        mjcf_path: str | Path = PANDA_MJCF_PATH,
+        urdf_path: str | Path = PANDA_URDF_PATH,
         goal_pos: jax.Array | None = None,
     ) -> None:
         self.scene_path = str(scene_path)
-        self.mjcf_path = str(mjcf_path)
+        self.urdf_path = str(urdf_path)
+        self.joint_names = PANDA_ARM_JOINT_NAMES
+        self.frame_name = PANDA_TCP_FRAME_NAME
 
-        self.full_model = pin.buildModelFromMJCF(self.mjcf_path)
-        self.home_q_full, self.object_pos, self.target_pos, self.object_half_height = self._load_mujoco_defaults()
-        finger_joint_ids = [
-            self.full_model.getJointId("finger_joint1"),
-            self.full_model.getJointId("finger_joint2"),
-        ]
-        self.model = pin.buildReducedModel(
-            self.full_model,
-            finger_joint_ids,
-            np.asarray(self.home_q_full, dtype=np.float64),
+        self.home_q_full, self.object_pos, self.target_pos, self.object_half_height = (
+            self._load_mujoco_defaults()
         )
-        self.data = self.model.createData()
-        self.frame_id = self.model.getFrameId("gripper")
 
-        self.nq = self.model.nq
-        self.nv = self.model.nv
-        self.nu = self.model.nv
+        self.pin_model, self.pin_data = self._build_pinocchio_model()
+        self.model = self.pin_model
+        self.data = self.pin_data
+        self.frame_id = self.pin_model.getFrameId(self.frame_name)
+
+        self.js_model = self._build_jaxsim_model()
+        self.js_joint_names = tuple(self.js_model.joint_names())
+        self._external_to_js = jnp.asarray(
+            [self.js_joint_names.index(name) for name in self.joint_names],
+            dtype=jnp.int32,
+        )
+        self._js_from_external = jnp.asarray(
+            np.argsort(np.asarray(self._external_to_js)),
+            dtype=jnp.int32,
+        )
+        self.js_frame_idx = int(
+            js.frame.name_to_idx(model=self.js_model, frame_name=self.frame_name)
+        )
+
+        self.nq = len(self.joint_names)
+        self.nv = self.nq
+        self.nu = self.nv
         self.nx = self.nq + self.nv
 
-        self.home_q = jnp.asarray(np.asarray(self.home_q_full[: self.nq]), dtype=jnp.float32)
+        self.home_q = jnp.asarray(
+            np.asarray(self.home_q_full[: self.nq]), dtype=jnp.float32
+        )
         self.torque_limits = _ARM_TORQUE_LIMITS
         self.damping = jnp.asarray(
-            np.asarray(self.model.damping).reshape(-1), dtype=jnp.float32
+            np.asarray(self.pin_model.damping).reshape(-1), dtype=jnp.float32
         )
+
+        (
+            self._dynamics_jax,
+            self._ee_features_jax,
+            self._gravity_torques_jax,
+        ) = self._build_jaxsim_functions()
 
         home_pos, home_rot = self.forward_kinematics(self.home_q)
         self.home_pos = jnp.asarray(home_pos, dtype=jnp.float32)
@@ -98,19 +120,10 @@ class PandaPregraspPlanner:
         )
         self.goal_rotation = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
         self.goal_q = jnp.asarray(
-            self.solve_ik(
-                np.asarray(self.goal_pos), np.asarray(self.goal_rotation)
-            ),
+            self.solve_ik(np.asarray(self.goal_pos), np.asarray(self.goal_rotation)),
             dtype=jnp.float32,
         )
-        self.goal_tau = jnp.asarray(
-            pin.computeGeneralizedGravity(
-                self.model,
-                self.data,
-                np.asarray(self.goal_q, dtype=np.float64),
-            ),
-            dtype=jnp.float32,
-        )
+        self.goal_tau = self.gravity_torques(self.goal_q)
 
         self.reference = PandaPregraspReference(
             goal_pos=self.goal_pos,
@@ -120,8 +133,6 @@ class PandaPregraspPlanner:
             goal_tau=self.goal_tau,
         )
         self.reference_vec = self.reference.as_vector()
-
-        self._dynamics_jax, self._ee_features_jax = self._build_symbolic_functions()
 
     def _load_mujoco_defaults(self) -> tuple[jax.Array, jax.Array, jax.Array, float]:
         mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
@@ -135,45 +146,99 @@ class PandaPregraspPlanner:
         object_half_height = float(mj_model.geom_size[object_geom_idx, 2])
         return home_q, object_pos, target_pos, object_half_height
 
-    def _build_symbolic_functions(self) -> tuple[callable, callable]:
-        cmodel = cpin.Model(self.model)
-        cdata = cmodel.createData()
-
-        q_sym = cs.SX.sym("q", self.nq, 1)
-        v_sym = cs.SX.sym("v", self.nv, 1)
-        tau_sym = cs.SX.sym("tau", self.nu, 1)
-
-        damping = cs.DM(np.asarray(self.damping).reshape(-1, 1))
-        ddq = cpin.aba(cmodel, cdata, q_sym, v_sym, tau_sym - damping * v_sym)
-        xdot = cs.vertcat(v_sym, ddq)
-
-        cpin.framesForwardKinematics(cmodel, cdata, q_sym)
-        frame = cdata.oMf[self.frame_id]
-        ee_features = cs.vertcat(
-            frame.translation,
-            frame.rotation[:, 0],
-            frame.rotation[:, 2],
+    def _build_pinocchio_model(self) -> tuple[pin.Model, pin.Data]:
+        full_model = pin.buildModelFromUrdf(self.urdf_path)
+        finger_joint_ids = [
+            full_model.getJointId(name) for name in PANDA_FINGER_JOINT_NAMES
+        ]
+        reduced_model = pin.buildReducedModel(
+            full_model,
+            finger_joint_ids,
+            np.asarray(self.home_q_full, dtype=np.float64),
         )
+        return reduced_model, reduced_model.createData()
 
-        dynamics_fn = jaxadi.convert(
-            cs.Function("panda_aba_dynamics", [q_sym, v_sym, tau_sym], [xdot])
-        )
-        ee_features_fn = jaxadi.convert(
-            cs.Function("panda_attachment_features", [q_sym], [ee_features])
-        )
+    def _build_jaxsim_model(self) -> js.model.JaxSimModel:
+        model_description = rodp.build_model_description(
+            self.urdf_path,
+            is_urdf=True,
+        ).reduce(considered_joints=self.joint_names)
+        model_description = dataclasses.replace(model_description, fixed_base=True)
+        return js.model.JaxSimModel.build(model_description=model_description)
 
-        def _single_output(fn, *args, size: int) -> jax.Array:
-            return jnp.asarray(fn(*args)[0], dtype=jnp.float32).reshape(size)
+    def _to_js_joint_order(self, vec: jax.Array) -> jax.Array:
+        return jnp.take(vec, self._js_from_external, axis=0)
 
-        return (
-            jax.jit(lambda q, v, tau: _single_output(dynamics_fn, q, v, tau, size=self.nx)),
-            jax.jit(lambda q: _single_output(ee_features_fn, q, size=9)),
-        )
+    def _from_js_joint_order(self, vec: jax.Array) -> jax.Array:
+        return jnp.take(vec, self._external_to_js, axis=0)
+
+    def _build_jaxsim_functions(self) -> tuple[callable, callable, callable]:
+        js_model = self.js_model
+        js_frame_idx = self.js_frame_idx
+        damping = self.damping
+        to_js = self._to_js_joint_order
+        from_js = self._from_js_joint_order
+        zeros = jnp.zeros((self.nv,), dtype=jnp.float32)
+
+        @jax.jit
+        def dynamics_fn(q: jax.Array, v: jax.Array, tau: jax.Array) -> jax.Array:
+            q = q.astype(jnp.float32)
+            v = v.astype(jnp.float32)
+            tau = tau.astype(jnp.float32)
+            q_js = to_js(q)
+            v_js = to_js(v)
+            tau_js = to_js(tau - damping * v)
+            data = js.data.JaxSimModelData.build(
+                model=js_model,
+                joint_positions=q_js,
+                joint_velocities=v_js,
+            )
+            _, ddq_js = js.model.forward_dynamics_aba(
+                model=js_model,
+                data=data,
+                joint_forces=tau_js,
+            )
+            ddq = from_js(ddq_js).astype(jnp.float32)
+            return jnp.concatenate([v, ddq]).astype(jnp.float32)
+
+        @jax.jit
+        def ee_features_fn(q: jax.Array) -> jax.Array:
+            q_js = to_js(q.astype(jnp.float32))
+            data = js.data.JaxSimModelData.build(
+                model=js_model,
+                joint_positions=q_js,
+                joint_velocities=zeros,
+            )
+            transform = js.frame.transform(
+                model=js_model,
+                data=data,
+                frame_index=js_frame_idx,
+            )
+            rotation = transform[:3, :3]
+            position = transform[:3, 3]
+            return jnp.concatenate([position, rotation[:, 0], rotation[:, 2]]).astype(jnp.float32)
+
+        @jax.jit
+        def gravity_torques_fn(q: jax.Array) -> jax.Array:
+            q_js = to_js(q.astype(jnp.float32))
+            data = js.data.JaxSimModelData.build(
+                model=js_model,
+                joint_positions=q_js,
+                joint_velocities=zeros,
+            )
+            _, joint_torques_js = js.model.inverse_dynamics(
+                model=js_model,
+                data=data,
+                joint_accelerations=zeros,
+            )
+            return from_js(joint_torques_js).astype(jnp.float32)
+
+        return dynamics_fn, ee_features_fn, gravity_torques_fn
 
     def forward_kinematics(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         q_np = np.asarray(q, dtype=np.float64)
-        pin.framesForwardKinematics(self.model, self.data, q_np)
-        frame = self.data.oMf[self.frame_id]
+        pin.framesForwardKinematics(self.pin_model, self.pin_data, q_np)
+        frame = self.pin_data.oMf[self.frame_id]
         return frame.translation.copy(), frame.rotation.copy()
 
     def solve_ik(
@@ -185,28 +250,36 @@ class PandaPregraspPlanner:
     ) -> np.ndarray:
         q = np.asarray(self.home_q, dtype=np.float64).copy()
         target = pin.SE3(goal_rot, goal_pos)
-        lower = np.asarray(self.model.lowerPositionLimit).reshape(-1)
-        upper = np.asarray(self.model.upperPositionLimit).reshape(-1)
+        lower = np.asarray(self.pin_model.lowerPositionLimit).reshape(-1)
+        upper = np.asarray(self.pin_model.upperPositionLimit).reshape(-1)
 
         for _ in range(max_iters):
-            pin.forwardKinematics(self.model, self.data, q)
-            pin.updateFramePlacement(self.model, self.data, self.frame_id)
-            current = self.data.oMf[self.frame_id]
+            pin.forwardKinematics(self.pin_model, self.pin_data, q)
+            pin.updateFramePlacement(self.pin_model, self.pin_data, self.frame_id)
+            current = self.pin_data.oMf[self.frame_id]
             delta = current.actInv(target)
             err = pin.log6(delta).vector
             if np.linalg.norm(err) < tol:
                 break
 
             jacobian = pin.computeFrameJacobian(
-                self.model, self.data, q, self.frame_id, pin.LOCAL
+                self.pin_model,
+                self.pin_data,
+                q,
+                self.frame_id,
+                pin.LOCAL,
             )
             step = -jacobian.T @ np.linalg.solve(
-                jacobian @ jacobian.T + 1e-4 * np.eye(6), err
+                jacobian @ jacobian.T + 1e-4 * np.eye(6),
+                err,
             )
-            q = pin.integrate(self.model, q, 0.4 * step)
+            q = pin.integrate(self.pin_model, q, 0.4 * step)
             q = np.clip(q, lower, upper)
 
         return q.astype(np.float32)
+
+    def gravity_torques(self, q: jax.Array) -> jax.Array:
+        return self._gravity_torques_jax(q)
 
     def dynamics(
         self, state: jax.Array, inputs: jax.Array, params: jax.Array
@@ -293,13 +366,14 @@ class PandaPregraspObjective(BaseObjective):
         control_cost = jnp.sum(jnp.square((inputs - goal_tau) / torque_scale))
         velocity_cost = jnp.sum(jnp.square(v))
 
-        return (
+        return jnp.asarray(
             120.0 * xy_err
             + 90.0 * z_err
             + 70.0 * orientation_cost
             + 12.0 * posture_cost
             + 0.25 * control_cost
-            + 0.1 * velocity_cost
+            + 0.1 * velocity_cost,
+            dtype=jnp.float32,
         )
 
     def final_cost(self, state: jax.Array, reference: jax.Array) -> jax.Array:
@@ -317,11 +391,12 @@ class PandaPregraspObjective(BaseObjective):
             ee_z, goal_z
         ) + 0.5 * self._axis_alignment_cost(ee_x, goal_x)
 
-        return (
+        return jnp.asarray(
             1500.0 * jnp.sum(jnp.square(goal_pos - ee_pos))
             + 220.0 * orientation_cost
             + 90.0 * jnp.sum(jnp.square(q - goal_q))
-            + 15.0 * jnp.sum(jnp.square(v))
+            + 15.0 * jnp.sum(jnp.square(v)),
+            dtype=jnp.float32,
         )
 
 

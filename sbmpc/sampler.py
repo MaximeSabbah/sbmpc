@@ -13,10 +13,10 @@ class Sampler(ABC):
         self.horizon = config.MPC.horizon
         self.num_control_points = config.MPC.num_control_points
         self.model_nu = config.robot.nu
-        self.lam = config.MPC.lambda_mpc
-        self.std_dev = config.MPC.std_dev_mppi
-        self.std_dev_horizon = jnp.tile(self.std_dev, self.num_control_points)
         self.dtype_general = config.general.dtype
+        self.lam = jnp.asarray(config.MPC.lambda_mpc, dtype=self.dtype_general)
+        self.std_dev = jnp.asarray(config.MPC.std_dev_mppi, dtype=self.dtype_general)
+        self.std_dev_horizon = jnp.tile(self.std_dev, self.num_control_points)
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel
         self.num_parallel_computations = config.MPC.num_parallel_computations
         if config.MPC.initial_guess is None:
@@ -74,9 +74,13 @@ class MPPISampler(Sampler):
         # Generate random samples
         samples_delta = self.zero_random_deviations
         # One sample is kept equal to the guess
-        sampled_variation_all = jax.random.normal(key=key, shape=(self.num_parallel_computations-1, self.num_control_points, self.model_nu)) * self.std_dev
+        sampled_variation_all = jax.random.normal(
+            key=key,
+            shape=(self.num_parallel_computations - 1, self.num_control_points, self.model_nu),
+            dtype=self.dtype_general,
+        ) * self.std_dev
         samples_delta = samples_delta.at[1:, :, :].set(sampled_variation_all)
-        return sampled_variation_all
+        return sampled_variation_all.astype(self.dtype_general)
 
     @partial(jax.jit, static_argnums=(0,))
     def compute_action(self, initial_guess, samples_delta, costs) -> jnp.ndarray:
