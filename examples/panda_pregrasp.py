@@ -48,6 +48,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the number of simulation iterations.",
     )
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=None,
+        help="Override the MPC rollout horizon.",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=None,
+        help="Override the number of MPPI samples.",
+    )
+    parser.add_argument(
+        "--control-points",
+        type=int,
+        default=None,
+        help="Override the spline control point count.",
+    )
     return parser.parse_args()
 
 
@@ -63,6 +81,20 @@ if __name__ == "__main__":
     )
     if args.iterations is not None:
         config.sim_iterations = args.iterations
+    if args.horizon is not None:
+        config.MPC.horizon = args.horizon
+    if args.samples is not None:
+        config.MPC.num_parallel_computations = args.samples
+    if args.control_points is not None:
+        config.MPC.num_control_points = args.control_points
+    if any(
+        value is not None
+        for value in (args.horizon, args.samples, args.control_points)
+    ):
+        config.MPC.initial_guess = planner.nominal_torque_sequence(
+            config.MPC.horizon,
+            config.MPC.dt,
+        )
 
     sim = build_all(
         config,
@@ -76,6 +108,12 @@ if __name__ == "__main__":
 
     print(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
     print(f"gains: {config.MPC.gains}")
+    print(
+        f"mpc: dt={config.MPC.dt:.3f}s horizon={config.MPC.horizon} "
+        f"samples={config.MPC.num_parallel_computations} "
+        f"control_points={config.MPC.num_control_points} "
+        f"gain_method={config.MPC.gain_method}/{config.MPC.gain_fd_scheme}"
+    )
     print(f"visualize: {config.general.visualize}")
     print(f"home_q: {planner.home_q}")
     print(f"goal_pos: {planner.goal_pos}")

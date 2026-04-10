@@ -16,10 +16,10 @@ from sbmpc.simulation import build_model_and_solver
 
 
 # Simple double integrator model
-A = jnp.array([[0, 1], [0, 0]])
-B = jnp.array([[0], [1]])
+A = jnp.array([[0, 1], [0, 0]], dtype=jnp.float32)
+B = jnp.array([[0], [1]], dtype=jnp.float32)
 
-Q = jnp.array([[1, 0], [0, 1]])
+Q = jnp.array([[1, 0], [0, 1]], dtype=jnp.float32)
 R = Q[0, 0]
 
 Ad = jnp.eye(2, 2) + 0.05 * A
@@ -27,23 +27,25 @@ Bd = 0.05*B
 
 
 K, S, E = control.dlqr(Ad, Bd, Q, R)
+K = jnp.asarray(K, dtype=jnp.float32)
+S = jnp.asarray(S, dtype=jnp.float32)
 # Note that the feedback fains from the LQR are supposed to be applied like u = -K x
 print("LQR gains: ", -K)
 
-x = jnp.array([0.0, 0.0])
-x_des = jnp.array([0.5, 0.0])
-optimal_inputs = jnp.zeros((25, 2))
+x = jnp.array([0.0, 0.0], dtype=jnp.float32)
+x_des = jnp.array([0.5, 0.0], dtype=jnp.float32)
+optimal_inputs = jnp.zeros((25, 2), dtype=jnp.float32)
 for i in range(25):
-    u = -K @ (x - x_des)
+    u = jnp.asarray(-K @ (x - x_des), dtype=jnp.float32)
     optimal_inputs = optimal_inputs.at[i, 0].set(u[0])
     x = Ad @ x + Bd @ u
 
 
 # Redefine B matrix since mppi does not support single input systems (to be fixed)
-B_mppi = jnp.array([[0, 0], [1, 0]])
+B_mppi = jnp.array([[0, 0], [1, 0]], dtype=jnp.float32)
 
 def dynamics(x, u, p):
-    return A @ x + B_mppi @ u
+    return (A @ x + B_mppi @ u).astype(jnp.float32)
 
 
 class Objective(BaseObjective):
@@ -66,7 +68,7 @@ if __name__ == "__main__":
 
     config = settings.Config(robot_config)
 
-    config.integrator_type = "euler"
+    config.general.integrator_type = "euler"
 
     config.MPC.dt = 0.05
     config.MPC.horizon = 25
@@ -85,7 +87,7 @@ if __name__ == "__main__":
 
     solver.sampler.optimal_samples = optimal_inputs
 
-    input = solver.command(jnp.array([0.0, 0.0]), jnp.array([0.5, 0.0]), False, num_steps=1).block_until_ready()
+    input = solver.command(jnp.array([0.0, 0.0], dtype=jnp.float32), jnp.array([0.5, 0.0], dtype=jnp.float32), False, num_steps=1).block_until_ready()
 
     mppi_gains = solver.gains[0]
 
@@ -93,5 +95,27 @@ if __name__ == "__main__":
 
 
     print("error norm: ", jnp.linalg.norm(mppi_gains + K, jnp.inf))
+
+    config_fd = settings.Config(robot_config)
+    config_fd.general.integrator_type = "euler"
+    config_fd.MPC.dt = config.MPC.dt
+    config_fd.MPC.horizon = config.MPC.horizon
+    config_fd.MPC.std_dev_mppi = config.MPC.std_dev_mppi
+    config_fd.MPC.num_parallel_computations = config.MPC.num_parallel_computations
+    config_fd.MPC.lambda_mpc = config.MPC.lambda_mpc
+    config_fd.MPC.num_control_points = config.MPC.num_control_points
+    config_fd.MPC.gains = True
+    config_fd.MPC.gain_method = "finite_difference"
+    config_fd.MPC.gain_fd_scheme = "central"
+    config_fd.MPC.gain_fd_epsilon = 1e-3
+    config_fd.solver_dynamics = settings.DynamicsModel.CUSTOM
+    config_fd.sim_dynamics = settings.DynamicsModel.CUSTOM
+
+    _, solver_fd = build_model_and_solver(config_fd, objective, custom_dynamics_fn=dynamics)
+    solver_fd.sampler.optimal_samples = optimal_inputs
+    solver_fd.command(jnp.array([0.0, 0.0], dtype=jnp.float32), jnp.array([0.5, 0.0], dtype=jnp.float32), False, num_steps=1).block_until_ready()
+    mppi_gains_fd = solver_fd.gains[0]
+    print("MPPI finite-difference gains: ", mppi_gains_fd)
+    print("finite-difference error norm: ", jnp.linalg.norm(mppi_gains_fd + K, jnp.inf))
 
 

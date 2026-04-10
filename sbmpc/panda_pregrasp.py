@@ -503,17 +503,28 @@ def make_panda_pregrasp_config(
     config.sim_iterations = 400
 
     config.MPC.dt = 0.02
-    config.MPC.horizon = 16
-    config.MPC.num_parallel_computations = 32
     config.MPC.lambda_mpc = 0.05
     config.MPC.std_dev_mppi = 0.05 * planner.torque_limits
+    config.MPC.smoothing = "Spline"
+    config.MPC.gains = gains
+    if gains:
+        # Full-state finite-difference gains need a shorter rollout budget to keep
+        # the end-to-end controller near 50 Hz. The no-gain behavior keeps the
+        # larger planning budget used for behavior checks.
+        config.MPC.horizon = 8
+        config.MPC.num_parallel_computations = 14
+        config.MPC.num_control_points = 4
+    else:
+        config.MPC.horizon = 16
+        config.MPC.num_parallel_computations = 32
+        config.MPC.num_control_points = 4
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
         config.MPC.dt,
     )
-    config.MPC.smoothing = "Spline"
-    config.MPC.num_control_points = 4
-    config.MPC.gains = gains
+    config.MPC.gain_method = "finite_difference"
+    config.MPC.gain_fd_scheme = "forward"
+    config.MPC.gain_fd_epsilon = 1e-3
 
     config.solver_dynamics = DynamicsModel.CUSTOM
     config.sim_dynamics = DynamicsModel.CUSTOM

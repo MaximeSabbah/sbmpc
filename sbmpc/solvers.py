@@ -80,6 +80,10 @@ class RolloutGenerator():
         self.num_parallel_computations = config.MPC.num_parallel_computations
 
         self.compute_gains = config.MPC.gains
+        self.gain_method = config.MPC.gain_method
+        self.compute_exact_gains = self.compute_gains and self.gain_method == "exact"
+        self.gain_fd_epsilon = jnp.asarray(config.MPC.gain_fd_epsilon, dtype=self.dtype_general)
+        self.gain_fd_scheme = config.MPC.gain_fd_scheme
         
         # Covariance of the input action
         # self.sigma_mppi = jnp.diag(config.MPC.std_dev_mppi**2)
@@ -107,7 +111,14 @@ class RolloutGenerator():
 
         #self.gains = jnp.zeros((model.nu, model.nx))
         # self.ctrl_sens_to_state = jax.jit(jax.jacfwd(self.compute_control_mppi, argnums=0, has_aux=True), device=self.device)
-        self.rollout_sens_to_state = jax.vmap(jax.value_and_grad(self.rollout_single, argnums=0, has_aux=True), in_axes=(None, None, 0), out_axes=(0, 0))
+        if self.compute_exact_gains:
+            self.rollout_sens_to_state = jax.vmap(
+                jax.value_and_grad(self.rollout_single, argnums=0, has_aux=True),
+                in_axes=(None, None, 0),
+                out_axes=(0, 0),
+            )
+        else:
+            self.rollout_sens_to_state = None
 
         # Rename functions for cost during rollout
         self.cost_and_constraints = self.objective.cost_and_constraints
@@ -228,7 +239,7 @@ class RolloutGenerator():
         if reference.ndim == 1:
             reference = jnp.tile(reference, (self.horizon+1, 1))
 
-        if self.compute_gains:
+        if self.compute_exact_gains:
             (costs, control_vars_all), gradients = self.rollout_sens_to_state(state, reference, control_vars_all)
         else:
             costs, control_vars_all = self.rollout_all(state, reference, control_vars_all)
@@ -258,11 +269,24 @@ class Controller:
         gains = self.gains_obj.cur_gains
 
         for i in range(num_steps):
-            samples_delta = self.sampler.sample_input_sequence(self.sampler.master_key)
-            samples, costs, gradients = self.rollout_gen.do_rollout(state, reference, optimal_samples, samples_delta, gains)
-            optimal_samples = self.sampler.update(optimal_samples, samples, costs)
+            previous_optimal_samples = optimal_samples
+            raw_samples_delta = self.sampler.sample_input_sequence(self.sampler.master_key)
+            samples, costs, gradients = self.rollout_gen.do_rollout(
+                state, reference, previous_optimal_samples, raw_samples_delta, gains
+            )
+            optimal_samples = self.sampler.update(previous_optimal_samples, samples, costs)
             # update gains
-            self.gains_obj.cur_gains = self.gains_obj.gains_computation(costs, samples, gradients)
+            if self.gains_obj.compute_gains and self.rollout_gen.gain_method == "finite_difference":
+                self.gains_obj.cur_gains = self._finite_difference_gains(
+                    state,
+                    reference,
+                    previous_optimal_samples,
+                    raw_samples_delta,
+                    samples,
+                    costs,
+                )
+            else:
+                self.gains_obj.cur_gains = self.gains_obj.gains_computation(costs, samples, gradients)
        
         # update sampler best control vars
         if shift_guess:
@@ -272,6 +296,50 @@ class Controller:
         
         return optimal_samples
     
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _finite_difference_gains(
+        self,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
+    ):
+        rollout_gen = self.rollout_gen
+        eps = rollout_gen.gain_fd_epsilon
+        nx = rollout_gen.model.nx
+        eye = jnp.eye(nx, dtype=rollout_gen.dtype_general)
+
+        if rollout_gen.config.MPC.smoothing == "Spline":
+            control_vars_all = (
+                optimal_samples[rollout_gen.control_spline_indices, :] + raw_samples_delta
+            )
+        else:
+            control_vars_all = optimal_samples + raw_samples_delta
+
+        if reference.ndim == 1:
+            reference = jnp.tile(reference, (rollout_gen.horizon + 1, 1))
+
+        nominal_action = self.sampler.compute_action(
+            optimal_samples, samples_delta_clipped, nominal_costs
+        )[0]
+
+        def first_action_for_state(perturbed_state):
+            costs, _ = rollout_gen.rollout_all(perturbed_state, reference, control_vars_all)
+            return self.sampler.compute_action(
+                optimal_samples, samples_delta_clipped, costs
+            )[0]
+
+        plus_actions = jax.vmap(first_action_for_state)(state + eps * eye)
+        if rollout_gen.gain_fd_scheme == "central":
+            minus_actions = jax.vmap(first_action_for_state)(state - eps * eye)
+            gains = ((plus_actions - minus_actions) / (2.0 * eps)).T
+        else:
+            gains = ((plus_actions - nominal_action[jnp.newaxis, :]) / eps).T
+
+        return jnp.nan_to_num(gains).astype(rollout_gen.dtype_general)
 
     @partial(jax.jit, static_argnums=(0,))
     def _shift_guess(self, optimal_samples):

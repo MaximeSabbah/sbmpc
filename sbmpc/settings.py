@@ -147,6 +147,9 @@ class MPCConfig:
         self._lambda_mpc = 1.0
         self._filter = None
         self._gains = False
+        self._gain_method = "exact"
+        self._gain_fd_epsilon = 1e-3
+        self._gain_fd_scheme = "central"
         self._sensitivity = False
         self._smoothing = None
         self._augmented_reference = None
@@ -245,6 +248,44 @@ class MPCConfig:
         if not isinstance(value, bool):
             raise ValueError("bool type is expected")
         self._gains = value
+
+    @property
+    def gain_method(self):
+        return self._gain_method
+
+    @gain_method.setter
+    def gain_method(self, value):
+        if not isinstance(value, str):
+            raise ValueError("str type is expected")
+        supported_methods = ["exact", "finite_difference"]
+        if value not in supported_methods:
+            raise ValueError(f"gain_method not supported. Choose from {supported_methods}")
+        self._gain_method = value
+
+    @property
+    def gain_fd_epsilon(self):
+        return self._gain_fd_epsilon
+
+    @gain_fd_epsilon.setter
+    def gain_fd_epsilon(self, value):
+        if not isinstance(value, float):
+            raise ValueError("float type is expected")
+        if not value > 0.0:
+            raise ValueError("must be greater than zero")
+        self._gain_fd_epsilon = value
+
+    @property
+    def gain_fd_scheme(self):
+        return self._gain_fd_scheme
+
+    @gain_fd_scheme.setter
+    def gain_fd_scheme(self, value):
+        if not isinstance(value, str):
+            raise ValueError("str type is expected")
+        supported_schemes = ["forward", "central"]
+        if value not in supported_schemes:
+            raise ValueError(f"gain_fd_scheme not supported. Choose from {supported_schemes}")
+        self._gain_fd_scheme = value
 
     @property
     def sensitivity(self):
