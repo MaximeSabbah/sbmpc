@@ -1,0 +1,580 @@
+# ROS Deployment Roadmap for SB-MPC Panda
+
+This document is a persistent handoff for future Codex instances. It captures the agreed plan for moving the current `sbmpc-panda` controller from MuJoCo validation toward Gazebo and then a real Franka Panda using `linear-feedback-controller` as the low-level torque controller.
+
+## Project Goal
+
+Develop a real-robot pick-and-place stack where:
+
+- `sbmpc-panda` remains the algorithm repository.
+- The SB-MPC/MPPI planner outputs feedforward joint torques and Riccati-like feedback gains.
+- `linear-feedback-controller` runs the low-level torque loop through `ros2_control`.
+- A new ROS repository, tentatively `sbmpc_ros`, bridges between LFC sensor messages and the `sbmpc-panda` planner.
+- Gazebo/Ignition validation is a mandatory gate before real-robot execution.
+
+The desired final control split is:
+
+```text
+Franka hardware / Gazebo
+  -> ros2_control
+  -> linear_feedback_controller publishes Sensor at low-level rate
+  -> sbmpc_ros_bridge receives Sensor at planner rate, calls sbmpc-panda planner
+  -> sbmpc_ros_bridge publishes Control(feedforward, feedback_gain, initial_state)
+  -> linear_feedback_controller computes tau = feedforward + K * state_error
+  -> ros2_control writes effort commands
+```
+
+## Current State of `sbmpc-panda`
+
+Repository path used during development:
+
+```bash
+/home/msabbah/Desktop/sbmpc
+```
+
+Environment:
+
+```bash
+cd /home/msabbah/Desktop/sbmpc
+direnv exec . pixi run -e cuda python -m pytest tests/test_mppi_gains.py tests/test_panda_pregrasp.py -q
+```
+
+Known current status:
+
+- The algorithm stack is in `sbmpc-panda`.
+- The environment uses Nix/direnv to provide Pixi, then Pixi to provide the Python/CUDA stack.
+- The controller uses JaxSim dynamics and MPPI-style control sampling.
+- Gains are currently computed by a finite-difference approximation for real-time feasibility.
+- MuJoCo validation exists for Panda pregrasp and a scripted pick-and-place state machine.
+- With gains enabled, the target runtime is around 20 ms per planning call, sufficient for roughly 50 Hz planning.
+- The current Gazebo/ROS deployment has not been implemented yet.
+
+Important current files:
+
+```text
+sbmpc/panda_pregrasp.py
+sbmpc/panda_pick_and_place.py
+examples/panda_pregrasp.py
+examples/panda_pick_and_place.py
+tests/test_mppi_gains.py
+tests/test_panda_pregrasp.py
+```
+
+Before starting ROS work, inspect these files and confirm the public planner API is stable enough to call from ROS. If it is not stable, create a small adapter in `sbmpc-panda` rather than importing example scripts from ROS.
+
+## External References To Recheck
+
+These references informed the plan. Future Codex instances should re-open them if implementation details become ambiguous.
+
+- `linear-feedback-controller`: https://github.com/loco-3d/linear-feedback-controller
+- LFC ROS implementation: https://github.com/loco-3d/linear-feedback-controller/blob/main/src/linear_feedback_controller_ros.cpp
+- LFC core control law: https://github.com/loco-3d/linear-feedback-controller/blob/main/src/lf_controller.cpp
+- LFC `Control.msg`: https://github.com/loco-3d/linear-feedback-controller-msgs/blob/main/msg/Control.msg
+- LFC `Sensor.msg`: https://github.com/loco-3d/linear-feedback-controller-msgs/blob/main/msg/Sensor.msg
+- LFC Eigen/ROS conversions: https://github.com/loco-3d/linear-feedback-controller-msgs/blob/main/include/linear_feedback_controller_msgs/eigen_conversions.hpp
+- Agimus demo 03 bringup: https://github.com/agimus-project/agimus-demos/blob/f07f6a28127420aeddee5c09d133d08b98a69e9b/agimus_demo_03_mpc_dummy_traj/launch/bringup.launch.py
+- Agimus Franka LFC launch: https://github.com/agimus-project/agimus-demos/blob/f07f6a28127420aeddee5c09d133d08b98a69e9b/agimus_demos_common/launch/franka/franka_common_lfc.launch.py
+- Agimus Franka LFC params: https://github.com/agimus-project/agimus-demos/blob/f07f6a28127420aeddee5c09d133d08b98a69e9b/agimus_demos_common/config/franka/linear_feedback_controller_params.yaml
+- Agimus Franka controllers params: https://github.com/agimus-project/agimus-demos/blob/f07f6a28127420aeddee5c09d133d08b98a69e9b/agimus_demos_common/config/franka/controllers.yaml
+
+Use Agimus as a bringup reference, not as a controller architecture reference. Do not depend on `agimus_controller_ros` for SB-MPC.
+
+## Key LFC Interface Facts
+
+The ROS bridge must publish `linear_feedback_controller_msgs/msg/Control` and subscribe to `linear_feedback_controller_msgs/msg/Sensor`.
+
+`Control` contains:
+
+```text
+std_msgs/Header header
+std_msgs/Float64MultiArray feedback_gain
+std_msgs/Float64MultiArray feedforward
+Sensor initial_state
+```
+
+`Sensor` contains:
+
+```text
+std_msgs/Header header
+geometry_msgs/Pose base_pose
+geometry_msgs/Twist base_twist
+sensor_msgs/JointState joint_state
+Contact[] contacts
+```
+
+For fixed-base Panda:
+
+- `robot_has_free_flyer: false`.
+- Use 7 arm joints only for the LFC-controlled arm.
+- Internal state dimension is `nx = 14`, ordered as `[q1..q7, v1..v7]`.
+- Control dimension is `nu = 7`, ordered as joint efforts `[tau1..tau7]`.
+- `feedback_gain` must be a `(7, 14)` matrix.
+- `feedforward` must be a `(7,)` vector.
+- `initial_state` must be the exact `Sensor` message used to compute the current control solution.
+- Gripper control is separate and should not be included in the LFC gain matrix.
+
+LFC publishes and subscribes on relative topics from the controller namespace:
+
+```text
+sensor
+control
+```
+
+So, depending on the controller namespace, likely full topics are similar to:
+
+```text
+/linear_feedback_controller/sensor
+/linear_feedback_controller/control
+```
+
+Verify with `ros2 topic list` during implementation.
+
+## Gain Sign Convention
+
+This is a non-negotiable validation item.
+
+The LFC computes a state difference in the direction `desired - measured` and applies:
+
+```text
+control = feedforward + feedback_gain * diff_state
+```
+
+The current SB-MPC finite-difference gain may naturally represent the derivative of the MPPI control with respect to the measured state. If so, the gain sent to LFC may need to be negated.
+
+Before using gains in Gazebo or on hardware, implement an explicit sign test:
+
+1. Choose a nominal state `x0`.
+2. Perturb one joint position or velocity in the measured state.
+3. Apply the same `desired - measured` convention used by LFC.
+4. Verify the resulting feedback torque is stabilizing.
+5. Repeat for position and velocity columns.
+
+Do not infer the sign from naming. Test it.
+
+## Recommended Repository Split
+
+Use three repositories, each with a strict responsibility:
+
+```bash
+/home/msabbah/Desktop/sbmpc-panda        # algorithm and non-ROS validation
+/home/msabbah/Desktop/sbmpc_ros          # ROS bridge, bringup, Gazebo assets
+/home/msabbah/Desktop/sbmpc_containers   # Docker/devcontainer/compose deployment
+```
+
+Responsibilities:
+
+- `sbmpc-panda`: algorithm, dynamics, costs, sampling, gains, MuJoCo/JaxSim validation. Its Python package is currently named `sbmpc`.
+- `sbmpc_ros`: ROS 2 integration, message conversion, launch files, Gazebo validation, robot deployment hooks, safety gates, diagnostics.
+- `sbmpc_containers`: Dockerfiles, devcontainer files, compose files, image build scripts, dependency pinning for ROS/LFC/Franka/Gazebo/JAX deployments.
+
+Do not duplicate the planner logic in `sbmpc_ros`. Import `sbmpc-panda` as a Python dependency during development, probably with an editable/path install inside the planner container.
+
+Do not embed Dockerfiles into `sbmpc_ros`. The ROS repo should remain buildable as a normal ROS 2 workspace package. The container repo should decide how to mount/build/install `sbmpc_ros` and `sbmpc-panda`.
+
+Suggested `sbmpc_ros` layout:
+
+```text
+sbmpc_ros/
+  README.md
+  sbmpc_ros_bridge/
+    package.xml
+    setup.py
+    sbmpc_ros_bridge/
+      __init__.py
+      lfc_bridge_node.py
+      planner_adapter.py
+      lfc_msg_adapter.py
+      joint_mapping.py
+      safety.py
+      diagnostics.py
+  sbmpc_bringup/
+    package.xml
+    launch/
+      sbmpc_franka_lfc_sim.launch.py
+      sbmpc_pick_place_gazebo.launch.py
+      sbmpc_franka_lfc_real.launch.py
+      sbmpc_pick_place_real.launch.py
+    config/
+      franka_controllers.yaml
+      franka_lfc_params.yaml
+      sbmpc_bridge.yaml
+      safety.yaml
+      task.yaml
+  sbmpc_gazebo/
+    package.xml
+    worlds/
+      panda_pick_place.world.sdf
+    models/
+    launch/
+      gazebo_pick_place_world.launch.py
+  tests/
+```
+
+Suggested `sbmpc_containers` layout:
+
+```text
+sbmpc_containers/
+  README.md
+  docker/
+    control-dev.Dockerfile
+    planner-cuda.Dockerfile
+    realtime-control.Dockerfile
+  compose/
+    gazebo.yaml
+    robot.yaml
+    dev.yaml
+  repos/
+    franka_lfc.repos
+    sbmpc_ros.repos
+  scripts/
+    build_control_dev.sh
+    build_planner_cuda.sh
+    build_realtime_control.sh
+    run_gazebo.sh
+    run_planner.sh
+  devcontainer/
+    devcontainer.json
+```
+
+This layout can be simplified, but keep container/deployment logic out of `sbmpc_ros`.
+
+## Container Repository Plan
+
+The Agimus dev-container repository was inspected through Git because the GitLab web UI is protected by Anubis. The relevant repository is:
+
+```bash
+https://gitlab.laas.fr/agimus-project/agimus_dev_container.git
+```
+
+Important files in that repository:
+
+```text
+.devcontainer/Dockerfile.base
+.devcontainer/control/Dockerfile
+.devcontainer/Dockerfile.realtime
+compose.yaml
+```
+
+Assessment of Agimus images:
+
+- `humble-devel-control` is a useful development/Gazebo/LFC base. It starts from ROS 2 Humble desktop, installs `ros-gz`, builds Pinocchio, Crocoddyl, HPP-related dependencies, imports Franka dependencies from `franka.repos`, and imports LFC dependencies from `agimus_dev.repos`.
+- `agimus_dev.repos` includes `linear-feedback-controller` v3.0.1 and `linear-feedback-controller-msgs` v1.1.1, plus Agimus controller packages that we do not want to depend on.
+- `franka.repos` includes Agimus forks of `libfranka`, `franka_ros2`, `franka_description`, and `ros2_net_ft_driver`.
+- `humble-devel-realtime-control` is much smaller and is aimed at the low-level real-time control side. It builds LFC, LFC messages, libfranka, Franka ROS 2 components, and `agimus_demos_common`.
+
+Conclusion:
+
+- The Agimus `control` image likely suits the Gazebo/LFC/Franka development side, but not the SB-MPC planner side by itself.
+- It does not provide the full JAX/JaxSim/CUDA/Pixi or `sbmpc-panda` planner environment we need.
+- It is also heavy and Agimus-opinionated, so it should be treated as a base/reference, not as architecture we adopt wholesale.
+
+Recommended image split for `sbmpc_containers`:
+
+1. `sbmpc-control-dev`
+
+   Purpose: Gazebo, Franka ROS 2, LFC, RViz/PlotJuggler, controller-manager debugging.
+
+   Initial practical base:
+
+   ```dockerfile
+   FROM gitlab.laas.fr:4567/agimus-project/agimus_dev_container:humble-devel-control
+   ```
+
+   Use this first to move quickly. Later, if image size or Agimus coupling becomes a problem, replace it with a minimal Dockerfile inspired by Agimus.
+
+2. `sbmpc-planner-cuda`
+
+   Purpose: run `sbmpc_ros_bridge` and the SB-MPC planner with GPU acceleration.
+
+   Requirements:
+
+   - ROS 2 Humble Python runtime.
+   - `linear_feedback_controller_msgs` Python message package.
+   - CUDA-compatible JAX.
+   - JaxSim and current `sbmpc-panda` dependencies.
+   - Editable/path installs of `/workspace/sbmpc-panda` and `/workspace/sbmpc_ros`.
+   - NVIDIA container runtime support.
+
+   This image should not need the full LFC controller or Gazebo stack unless we decide to run everything monolithically for early debugging.
+
+3. `sbmpc-realtime-control`
+
+   Purpose: real robot low-level side if using an auxiliary real-time computer.
+
+   Initial practical base:
+
+   ```dockerfile
+   FROM gitlab.laas.fr:4567/agimus-project/agimus_dev_container:humble-devel-realtime-control
+   ```
+
+   It should contain only what is needed for Franka hardware, `ros2_control`, LFC, joint-state estimator, and gripper support. It should not contain the JAX planner.
+
+4. Optional `sbmpc-gazebo-monolithic`
+
+   Purpose: one-container debug mode for local Gazebo validation.
+
+   This can combine control-dev and planner dependencies for convenience, but it should not be the final deployment model if it becomes too large or fragile.
+
+Compose strategy:
+
+- `compose/gazebo.yaml`: launches Gazebo/LFC/control services plus planner service on host networking. Use X11/DRI mounts for Gazebo rendering and NVIDIA runtime for planner GPU access.
+- `compose/robot.yaml`: launches planner-side container and connects over ROS 2 DDS to the real-time control computer running LFC.
+- `compose/dev.yaml`: developer shell with all repositories mounted for iterative work.
+
+Initial recommendation:
+
+- Do not fork Agimus dev-container directly as the long-term source of truth.
+- Create our own `sbmpc_containers` repository.
+- For the first Gazebo milestone, derive `sbmpc-control-dev` from the Agimus `humble-devel-control` image to avoid spending days rebuilding Franka/LFC/Gazebo dependencies.
+- In parallel, make `sbmpc-planner-cuda` explicit and minimal because this is where our custom JAX/JaxSim/Pixi stack matters.
+- Once Gazebo works, decide whether to keep deriving from Agimus or replace the control image with a minimal Dockerfile copied conceptually from their `Dockerfile.realtime`/`Dockerfile.control`.
+
+## Roadmap
+
+### Milestone 0: Stabilize `sbmpc-panda` Planner API
+
+Goal: make the controller callable from ROS without importing example scripts.
+
+Expected API shape:
+
+```text
+planner.step(
+  q: np.ndarray shape (7,),
+  v: np.ndarray shape (7,),
+  phase: Phase,
+  object_pose: optional task context,
+  target_pose: optional task context,
+) -> PlannerOutput
+```
+
+`PlannerOutput` should contain:
+
+```text
+tau_ff: shape (7,)
+K: shape (7, 14)
+phase: current/next phase
+gripper_command: open/close/width if needed
+diagnostics: timing, cost, gain norm, torque norm, phase metrics
+```
+
+Acceptance criteria:
+
+- Existing `sbmpc-panda` tests still pass.
+- MuJoCo example still runs.
+- Planner call is deterministic enough for repeated ROS calls.
+- No ROS dependencies are introduced in `sbmpc-panda`.
+
+### Milestone 1: Create `sbmpc_ros` Skeleton and LFC Message Adapter
+
+Goal: prove that we can convert between LFC messages and SB-MPC arrays correctly.
+
+Implement:
+
+- ROS 2 Python package skeleton for `sbmpc_ros_bridge`.
+- `joint_mapping.py` for strict joint-name ordering.
+- `lfc_msg_adapter.py` for `Sensor -> PlannerInput` and `PlannerOutput -> Control`.
+- Unit tests with synthetic `Sensor` messages.
+
+Acceptance criteria:
+
+- Joint order is tested and fails loudly on missing/extra/shuffled names unless explicitly remapped.
+- `feedback_gain` layout is tested as `(7, 14)` with row-major `Float64MultiArray` data.
+- `feedforward` layout is tested as either the LFC-accepted vector convention or a `(7, 1)` matrix convention, based on actual LFC conversion behavior.
+- `initial_state` is exactly the sensor used for planning.
+- NaNs and wrong sizes are rejected.
+
+### Milestone 2: Gain Sign and Safety Unit Tests
+
+Goal: prevent unstable feedback before Gazebo.
+
+Implement tests for:
+
+- LFC sign convention: desired-minus-measured.
+- Whether SB-MPC gain must be sent as `K` or `-K`.
+- Torque clipping.
+- Gain norm clipping.
+- Stale control detection.
+- Planner deadline miss handling.
+- Non-finite output rejection.
+
+Acceptance criteria:
+
+- A perturbed position generates stabilizing feedback torque in the test convention.
+- A perturbed velocity generates damping feedback torque in the test convention.
+- Unsafe outputs are blocked before publishing.
+
+### Milestone 3: Fake ROS Loop
+
+Goal: test bridge timing without Gazebo.
+
+Implement:
+
+- Fake LFC `Sensor` publisher.
+- Fake `Control` subscriber.
+- `sbmpc_lfc_bridge_node` running at 50 Hz.
+- Diagnostics topic or console summary.
+
+Acceptance criteria:
+
+- Bridge publishes valid `Control` at target rate.
+- JAX/JaxSim warmup happens before nonzero commands are allowed.
+- No nonzero control is published until a valid sensor message is received.
+- Missed deadlines are counted.
+- The node can run for several minutes without memory or timing degradation.
+
+### Milestone 4: Gazebo LFC Bringup
+
+Goal: reproduce the Agimus-style Franka/LFC stack under our own clean launch files.
+
+Use the Agimus structure conceptually:
+
+- `controller_manager` update rate: 1000 Hz.
+- `joint_state_broadcaster` active.
+- `gripper_action_controller` active.
+- `joint_state_estimator` loaded.
+- `linear_feedback_controller` loaded and activated.
+- LFC configured with fixed-base Panda, 7 moving joints, effort command interfaces.
+- `sbmpc_lfc_bridge_node` starts after LFC sensor topic exists.
+
+Acceptance criteria:
+
+- `ros2 topic list` shows LFC sensor and control topics.
+- LFC publishes `Sensor` with 7 joint positions, velocities, and efforts.
+- Bridge publishes `Control` with valid feedforward and gain layout.
+- With zero gain and zero feedforward, the system does not crash.
+- With safe hold behavior, the robot remains stable.
+
+### Milestone 5: Gazebo PREGRASP Validation
+
+Goal: validate the ROS/LFC/SB-MPC loop on a simple task before full pick-and-place.
+
+Test sequence:
+
+1. PREGRASP with `K = 0`, feedforward only.
+2. PREGRASP with clipped finite `K`.
+3. PREGRASP repeated from several initial configurations.
+
+Acceptance criteria:
+
+- End-effector reaches pregrasp target within a small tolerance.
+- No NaN commands.
+- No torque spikes above safety limits.
+- Planner runtime remains near target.
+- LFC remains active.
+- The robot does not oscillate or diverge.
+
+### Milestone 6: Gazebo Full Pick-and-Place Validation
+
+Goal: prove the full phase machine works in Gazebo before hardware.
+
+This must use actual Gazebo object pose for validation. Do not only rely on the scripted object state from MuJoCo.
+
+Test sequence:
+
+- Spawn Panda with gripper.
+- Spawn cube.
+- Spawn target/place marker.
+- Run full phase machine: PREGRASP, DESCEND, CLOSE, LIFT, TRANSPORT, PLACE, OPEN, RETREAT, DONE.
+- Control gripper through the ROS gripper action/controller, not through the LFC arm torque path.
+
+Acceptance criteria:
+
+- Cube is actually grasped in Gazebo.
+- Cube is actually moved to the target region.
+- Final placement error is logged.
+- All phase transitions are logged.
+- No phase gets stuck.
+- 20 repeated trials pass with acceptable final object error.
+- Any failure produces enough logs to diagnose: phase, EE pose, object pose, torque norm, gain norm, planner time, latest LFC sensor time.
+
+### Milestone 7: Real Robot Minimal Gate
+
+Gazebo passing does not remove all hardware risk. It should compress the real-robot testing phase, not eliminate it.
+
+Minimum real-robot gate:
+
+1. Launch LFC and bridge with zero nonzero commands disabled.
+2. Confirm LFC `Sensor` is received and joint order is correct.
+3. Publish zero-control `Control` and verify no unexpected motion.
+4. Enable a tiny safe hold or tiny PREGRASP motion with severe torque and gain limits.
+5. Run full pick-and-place with reduced speed, reduced gain, and operator ready for emergency stop.
+6. Only then move to normal settings.
+
+Acceptance criteria:
+
+- The robot does not move unexpectedly at startup.
+- Emergency stop and fallback behavior are known before nonzero commands.
+- Joint order is verified against live robot state.
+- Torque limits and watchdog are active.
+- Full task only runs after the minimal gate passes.
+
+## Safety Requirements
+
+These are mandatory before commanding nonzero torque in Gazebo or on hardware:
+
+- JAX/JaxSim warmup completed before enabling control.
+- No nonzero commands before first valid LFC `Sensor` message.
+- Strict joint-name and joint-order validation.
+- Strict shape validation for `feedforward` and `feedback_gain`.
+- Non-finite values are rejected.
+- Torque magnitude limits.
+- Torque rate limits if feasible.
+- Gain norm limits.
+- Stale-control timeout.
+- Planner deadline miss counter.
+- Safe fallback mode: zero gain and safe feedforward/hold or disabled output.
+- Explicit enable flag required before publishing nonzero commands.
+- Gripper commands gated by phase and safety state.
+- Real robot launch must default to conservative limits.
+
+## Development Rules For Future Codex Instances
+
+When continuing this work:
+
+1. Start by reading this document.
+2. Inspect the current `sbmpc-panda` status and tests.
+3. Do one milestone at a time.
+4. Do not jump directly to real robot code before Gazebo validation exists.
+5. Do not import Agimus controller code as a dependency unless the user explicitly changes the plan.
+6. Use Agimus only as a reference for launch structure and Franka/LFC wiring.
+7. Keep algorithm code out of `sbmpc_ros` except for thin adapters.
+8. Preserve a clear test command for every milestone.
+9. Prefer small, testable files over a monolithic bridge node.
+10. Report exact commands run and exact pass/fail results.
+
+## Suggested First Prompt For A New Codex Instance
+
+The user can paste this into a fresh Codex session:
+
+```text
+We are working on SB-MPC for Franka Panda. Read /home/msabbah/Desktop/sbmpc-panda/docs/ROS_DEPLOYMENT_ROADMAP.md first. The algorithm repo is /home/msabbah/Desktop/sbmpc-panda. We now want to implement the next milestone only: create /home/msabbah/Desktop/sbmpc_ros with the ROS 2 bridge skeleton and LFC Sensor/Control message adapter tests. Do not implement Gazebo yet. Keep sbmpc-panda as the algorithm dependency and do not depend on agimus_controller_ros. Validate joint order, message shapes, initial_state copying, gain sign convention, and safety rejection of invalid outputs.
+```
+
+## Useful Commands
+
+Check current algorithm tests:
+
+```bash
+cd /home/msabbah/Desktop/sbmpc
+direnv exec . pixi run -e cuda python -m pytest tests/test_mppi_gains.py tests/test_panda_pregrasp.py -q
+```
+
+Run the current MuJoCo/GPU examples, if available:
+
+```bash
+cd /home/msabbah/Desktop/sbmpc
+direnv exec . pixi run -e cuda python examples/panda_pregrasp.py --gains
+direnv exec . pixi run -e cuda python examples/panda_pick_and_place.py --gains
+```
+
+Inspect future ROS topics once Gazebo/LFC is running:
+
+```bash
+ros2 topic list
+ros2 topic echo /linear_feedback_controller/sensor --once
+ros2 topic echo /linear_feedback_controller/control --once
+ros2 control list_controllers
+ros2 control list_hardware_interfaces
+```
+
+Exact topic names may differ depending on namespace. Verify during implementation.
