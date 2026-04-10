@@ -103,7 +103,9 @@ class PandaPregraspPlanner:
             self._dynamics_jax,
             self._ee_features_jax,
             self._gravity_torques_jax,
+            self._inverse_dynamics_jax,
         ) = self._build_jaxsim_functions()
+        self._inverse_dynamics_batch_jax = jax.jit(jax.vmap(self._inverse_dynamics_jax))
 
         home_pos, home_rot = self.forward_kinematics(self.home_q)
         self.home_pos = jnp.asarray(home_pos, dtype=jnp.float32)
@@ -172,7 +174,7 @@ class PandaPregraspPlanner:
     def _from_js_joint_order(self, vec: jax.Array) -> jax.Array:
         return jnp.take(vec, self._external_to_js, axis=0)
 
-    def _build_jaxsim_functions(self) -> tuple[callable, callable, callable]:
+    def _build_jaxsim_functions(self) -> tuple[callable, callable, callable, callable]:
         js_model = self.js_model
         js_frame_idx = self.js_frame_idx
         damping = self.damping
@@ -219,21 +221,34 @@ class PandaPregraspPlanner:
             return jnp.concatenate([position, rotation[:, 0], rotation[:, 2]]).astype(jnp.float32)
 
         @jax.jit
-        def gravity_torques_fn(q: jax.Array) -> jax.Array:
-            q_js = to_js(q.astype(jnp.float32))
+        def inverse_dynamics_fn(
+            q: jax.Array, v: jax.Array, ddq: jax.Array
+        ) -> jax.Array:
+            q = q.astype(jnp.float32)
+            v = v.astype(jnp.float32)
+            ddq = ddq.astype(jnp.float32)
+            q_js = to_js(q)
+            v_js = to_js(v)
+            ddq_js = to_js(ddq)
             data = js.data.JaxSimModelData.build(
                 model=js_model,
                 joint_positions=q_js,
-                joint_velocities=zeros,
+                joint_velocities=v_js,
             )
             _, joint_torques_js = js.model.inverse_dynamics(
                 model=js_model,
                 data=data,
-                joint_accelerations=zeros,
+                joint_accelerations=ddq_js,
             )
-            return from_js(joint_torques_js).astype(jnp.float32)
+            # The rollout dynamics subtracts viscous damping before ABA, so feedforward
+            # torques include the matching damping compensation.
+            return (from_js(joint_torques_js) + damping * v).astype(jnp.float32)
 
-        return dynamics_fn, ee_features_fn, gravity_torques_fn
+        @jax.jit
+        def gravity_torques_fn(q: jax.Array) -> jax.Array:
+            return inverse_dynamics_fn(q, zeros, zeros)
+
+        return dynamics_fn, ee_features_fn, gravity_torques_fn, inverse_dynamics_fn
 
     def forward_kinematics(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         q_np = np.asarray(q, dtype=np.float64)
@@ -245,41 +260,105 @@ class PandaPregraspPlanner:
         self,
         goal_pos: np.ndarray,
         goal_rot: np.ndarray,
-        max_iters: int = 250,
-        tol: float = 1e-4,
+        max_iters: int = 100,
+        tol: float = 1e-5,
     ) -> np.ndarray:
-        q = np.asarray(self.home_q, dtype=np.float64).copy()
-        target = pin.SE3(goal_rot, goal_pos)
-        lower = np.asarray(self.pin_model.lowerPositionLimit).reshape(-1)
-        upper = np.asarray(self.pin_model.upperPositionLimit).reshape(-1)
+        """Solve the nominal PREGRASP pose with the same site-Jacobian IK as Hydrax."""
+        mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
+        mj_data = mujoco.MjData(mj_model)
+        mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
+        mujoco.mj_forward(mj_model, mj_data)
+
+        gripper_site_idx = mj_model.site("gripper").id
+        jacp = np.zeros((3, mj_model.nv))
+        jacr = np.zeros((3, mj_model.nv))
 
         for _ in range(max_iters):
-            pin.forwardKinematics(self.pin_model, self.pin_data, q)
-            pin.updateFramePlacement(self.pin_model, self.pin_data, self.frame_id)
-            current = self.pin_data.oMf[self.frame_id]
-            delta = current.actInv(target)
-            err = pin.log6(delta).vector
-            if np.linalg.norm(err) < tol:
+            mujoco.mj_forward(mj_model, mj_data)
+            site_rot = mj_data.site_xmat[gripper_site_idx].reshape(3, 3)
+            ee_pos = mj_data.site_xpos[gripper_site_idx]
+            pos_err = np.asarray(goal_pos) - ee_pos
+            ori_err = 0.5 * (
+                np.cross(site_rot[:, 0], goal_rot[:, 0])
+                + np.cross(site_rot[:, 1], goal_rot[:, 1])
+                + np.cross(site_rot[:, 2], goal_rot[:, 2])
+            )
+            if np.linalg.norm(pos_err) < tol and np.linalg.norm(ori_err) < tol:
                 break
 
-            jacobian = pin.computeFrameJacobian(
-                self.pin_model,
-                self.pin_data,
-                q,
-                self.frame_id,
-                pin.LOCAL,
+            mujoco.mj_jacSite(mj_model, mj_data, jacp, jacr, gripper_site_idx)
+            jacobian = np.vstack([jacp[:, : self.nq], jacr[:, : self.nq]])
+            dq = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + 1e-3 * np.eye(6),
+                np.concatenate([pos_err, ori_err]),
             )
-            step = -jacobian.T @ np.linalg.solve(
-                jacobian @ jacobian.T + 1e-4 * np.eye(6),
-                err,
+            mj_data.qpos[: self.nq] += np.clip(dq, -0.05, 0.05)
+            mj_data.qpos[: self.nq] = np.clip(
+                mj_data.qpos[: self.nq],
+                mj_model.jnt_range[: self.nq, 0],
+                mj_model.jnt_range[: self.nq, 1],
             )
-            q = pin.integrate(self.pin_model, q, 0.4 * step)
-            q = np.clip(q, lower, upper)
 
-        return q.astype(np.float32)
+        return mj_data.qpos[: self.nq].astype(np.float32).copy()
 
     def gravity_torques(self, q: jax.Array) -> jax.Array:
         return self._gravity_torques_jax(q)
+
+    def inverse_dynamics(
+        self, q: jax.Array, v: jax.Array, ddq: jax.Array
+    ) -> jax.Array:
+        return self._inverse_dynamics_jax(q, v, ddq)
+
+    def _cubic_joint_trajectory(
+        self,
+        q_start: jax.Array,
+        v_start: jax.Array,
+        q_goal: jax.Array,
+        horizon: int,
+        dt: float,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Cubic joint trajectory with current velocity and zero terminal velocity."""
+        q_start = jnp.asarray(q_start, dtype=jnp.float32)
+        v_start = jnp.asarray(v_start, dtype=jnp.float32)
+        q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
+        dt = jnp.asarray(dt, dtype=jnp.float32)
+        t_final = jnp.maximum(jnp.asarray((horizon - 1), dtype=jnp.float32) * dt, 1e-6)
+        time = (jnp.arange(horizon, dtype=jnp.float32) * dt)[:, jnp.newaxis]
+
+        v_goal = jnp.zeros_like(v_start)
+        delta_q = q_goal - q_start
+        c0 = q_start
+        c1 = v_start
+        c2 = (3.0 * delta_q - (2.0 * v_start + v_goal) * t_final) / (t_final**2)
+        c3 = (-2.0 * delta_q + (v_start + v_goal) * t_final) / (t_final**3)
+
+        q = c0 + c1 * time + c2 * time**2 + c3 * time**3
+        v = c1 + 2.0 * c2 * time + 3.0 * c3 * time**2
+        ddq = 2.0 * c2 + 6.0 * c3 * time
+        return q.astype(jnp.float32), v.astype(jnp.float32), ddq.astype(jnp.float32)
+
+    def nominal_torque_sequence_from_state(
+        self, state: jax.Array, horizon: int, dt: float
+    ) -> jax.Array:
+        """Receding inverse-dynamics seed from the current arm state to PREGRASP."""
+        state = jnp.asarray(state, dtype=jnp.float32)
+        q, v, ddq = self._cubic_joint_trajectory(
+            state[: self.nq],
+            state[self.nq : self.nq + self.nv],
+            self.goal_q,
+            horizon,
+            dt,
+        )
+        tau = self._inverse_dynamics_batch_jax(q, v, ddq)
+        return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(jnp.float32)
+
+    def nominal_torque_sequence(self, horizon: int, dt: float) -> jax.Array:
+        """Smooth inverse-dynamics seed from home to the PREGRASP IK pose."""
+        state = jnp.concatenate(
+            [self.home_q, jnp.zeros(self.nv, dtype=jnp.float32)],
+            axis=0,
+        )
+        return self.nominal_torque_sequence_from_state(state, horizon, dt)
 
     def dynamics(
         self, state: jax.Array, inputs: jax.Array, params: jax.Array
@@ -417,19 +496,23 @@ def make_panda_pregrasp_config(
 
     config = Config(robot_config)
     config.general.visualize = visualize
+    config.general.verbose = False
     config.general.integrator_type = "si_euler"
 
     config.sim.dt = 0.02
     config.sim_iterations = 400
 
     config.MPC.dt = 0.02
-    config.MPC.horizon = 25
-    config.MPC.num_parallel_computations = 128
+    config.MPC.horizon = 16
+    config.MPC.num_parallel_computations = 32
     config.MPC.lambda_mpc = 0.05
     config.MPC.std_dev_mppi = 0.05 * planner.torque_limits
-    config.MPC.initial_guess = planner.goal_tau
+    config.MPC.initial_guess = planner.nominal_torque_sequence(
+        config.MPC.horizon,
+        config.MPC.dt,
+    )
     config.MPC.smoothing = "Spline"
-    config.MPC.num_control_points = 6
+    config.MPC.num_control_points = 4
     config.MPC.gains = gains
 
     config.solver_dynamics = DynamicsModel.CUSTOM

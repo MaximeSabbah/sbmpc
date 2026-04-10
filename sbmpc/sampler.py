@@ -20,9 +20,24 @@ class Sampler(ABC):
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel
         self.num_parallel_computations = config.MPC.num_parallel_computations
         if config.MPC.initial_guess is None:
-            self.optimal_samples = jnp.zeros((self.horizon, self.model_nu), dtype=self.dtype_general)
+            self.optimal_samples = jnp.zeros(
+                (self.horizon, self.model_nu), dtype=self.dtype_general
+            )
         else:
-            self.optimal_samples = jnp.tile(config.MPC.initial_guess, (self.horizon, 1))
+            initial_guess = jnp.asarray(config.MPC.initial_guess, dtype=self.dtype_general)
+            if initial_guess.ndim == 1:
+                self.optimal_samples = jnp.tile(initial_guess, (self.horizon, 1))
+            elif initial_guess.ndim == 2 and initial_guess.shape[1] == self.model_nu:
+                if initial_guess.shape[0] >= self.horizon:
+                    self.optimal_samples = initial_guess[: self.horizon, :]
+                else:
+                    pad_len = self.horizon - initial_guess.shape[0]
+                    pad = jnp.repeat(initial_guess[-1:, :], pad_len, axis=0)
+                    self.optimal_samples = jnp.concatenate([initial_guess, pad], axis=0)
+            else:
+                raise ValueError(
+                    "MPC.initial_guess must have shape (nu,) or (*, nu)."
+                )
         # scaffolding for storing all the control actions on the prediction horizon for each rollout
         self.zero_random_deviations = jnp.zeros((self.num_parallel_computations, self.num_control_points, self.model_nu), dtype=self.dtype_general)
 
@@ -80,16 +95,18 @@ class MPPISampler(Sampler):
             dtype=self.dtype_general,
         ) * self.std_dev
         samples_delta = samples_delta.at[1:, :, :].set(sampled_variation_all)
-        return sampled_variation_all.astype(self.dtype_general)
+        return samples_delta.astype(self.dtype_general)
 
     @partial(jax.jit, static_argnums=(0,))
     def compute_action(self, initial_guess, samples_delta, costs) -> jnp.ndarray:
+        large_cost = jnp.asarray(1e6, dtype=self.dtype_general)
+        costs = jnp.where(jnp.isfinite(costs), costs, large_cost)
         exp_costs = self._exp_costs_shifted(costs, jnp.min(costs))
-        denom = jnp.sum(exp_costs)
+        denom = jnp.maximum(jnp.sum(exp_costs), jnp.asarray(1e-8, dtype=self.dtype_general))
         weights = exp_costs / denom
         weighted_inputs = weights[:, jnp.newaxis, jnp.newaxis] * samples_delta
         optimal_action = initial_guess + jnp.sum(weighted_inputs, axis=0)
-        return optimal_action
+        return jnp.nan_to_num(optimal_action).astype(self.dtype_general)
     
     def update(self, initial_guess, samples_delta, costs) -> jnp.ndarray:
         optimal_action = self.compute_action(initial_guess, samples_delta, costs)

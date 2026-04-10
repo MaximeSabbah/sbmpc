@@ -151,6 +151,7 @@ class MPCConfig:
         self._smoothing = None
         self._augmented_reference = None
         self._num_control_points = 0
+        self._nu = config.nu
 
         self._std_dev_mppi = jnp.zeros(config.nu)
         self._initial_guess = jnp.zeros(config.nu)
@@ -218,8 +219,13 @@ class MPCConfig:
     def initial_guess(self, value: Array):
         if ((not isinstance(value, Array)) and (value is not None)):
             raise ValueError("jax Array type or None is expected")
-        if value is not None and len(value) != self._initial_guess.size:
-            raise ValueError("length must match nu")
+        if value is not None:
+            if value.ndim == 1 and value.shape[0] != self._nu:
+                raise ValueError("length must match nu")
+            if value.ndim == 2 and value.shape[1] != self._nu:
+                raise ValueError("second dimension must match nu")
+            if value.ndim > 2:
+                raise ValueError("initial guess must have shape (nu,) or (horizon, nu)")
         self._initial_guess = value
 
     @property
@@ -288,6 +294,7 @@ class GeneralConfig:
         self._dtype = jnp.float32
         self._device = jax.devices()[0]
         self._visualize = False
+        self._verbose = True
         self._integrator_type = "si_euler"
 
     @property
@@ -319,6 +326,16 @@ class GeneralConfig:
         if not isinstance(value, bool):
             raise ValueError("bool type is expected")
         self._visualize = value
+
+    @property
+    def verbose(self):
+        return self._verbose
+
+    @verbose.setter
+    def verbose(self, value):
+        if not isinstance(value, bool):
+            raise ValueError("bool type is expected")
+        self._verbose = value
 
     @property
     def integrator_type(self):

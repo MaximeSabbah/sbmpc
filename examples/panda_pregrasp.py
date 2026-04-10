@@ -1,3 +1,5 @@
+import argparse
+
 import jax
 import jax.numpy as jnp
 
@@ -21,14 +23,46 @@ def post_update(sim) -> None:
         f"ee={jnp.asarray(ee_pos)} "
         f"goal={jnp.asarray(planner.goal_pos)} "
         f"err={err:.3f} "
+        f"plan={sim.last_command_time_ms:.1f}ms "
         f"|K|={gain_norm:.3f}"
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run Panda PREGRASP MPPI on the Hydrax pick-and-place scene."
+    )
+    parser.add_argument(
+        "--gains",
+        action="store_true",
+        help="Compute F-MPPI feedback gains. Disabled by default for fast behavior checks.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without opening the MuJoCo viewer.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Override the number of simulation iterations.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner)
-    config = make_panda_pregrasp_config(planner, visualize=True, gains=True)
+    config = make_panda_pregrasp_config(
+        planner,
+        visualize=not args.headless,
+        gains=args.gains,
+    )
+    if args.iterations is not None:
+        config.sim_iterations = args.iterations
 
     sim = build_all(
         config,
@@ -41,6 +75,8 @@ if __name__ == "__main__":
     sim.post_update = post_update
 
     print(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
+    print(f"gains: {config.MPC.gains}")
+    print(f"visualize: {config.general.visualize}")
     print(f"home_q: {planner.home_q}")
     print(f"goal_pos: {planner.goal_pos}")
     print(f"goal_q: {planner.goal_q}")

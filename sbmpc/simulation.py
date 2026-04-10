@@ -147,6 +147,8 @@ class Simulator(ABC):
         self.obstacles = obstacles
 
         self.dt = config.sim.dt
+        self.verbose = getattr(config.general, "verbose", True)
+        self.last_command_time_ms = 0.0
 
         if isinstance(initial_state, (np.ndarray, jnp.ndarray)):
             self.current_state_vec = lambda: self.current_state
@@ -233,11 +235,25 @@ class Simulation(Simulator):
     def update(self):
         # Compute the optimal input sequence
         time_start = time.time_ns()
-        print("iteration: ", self.iter)
-        print("current state: ", self.current_state_vec())
-        input_sequence = self.controller.command(self.current_state_vec(), self.const_reference, num_steps=1).block_until_ready()
+        state_vec = self.current_state_vec()
+        if self.verbose:
+            print("iteration: ", self.iter)
+            print("current state: ", state_vec)
+
+        planner = getattr(self, "planner", None)
+        nominal_seed = getattr(planner, "nominal_torque_sequence_from_state", None)
+        if callable(nominal_seed):
+            self.controller.sampler.optimal_samples = nominal_seed(
+                state_vec,
+                self.rollout_gen.horizon,
+                float(self.rollout_gen.dt),
+            )
+
+        input_sequence = self.controller.command(state_vec, self.const_reference, num_steps=1).block_until_ready()
         ctrl = input_sequence[0, :].block_until_ready()
-        print("computation time: {:.3f} [ms]".format(1e-6 * (time.time_ns() - time_start)))
+        self.last_command_time_ms = 1e-6 * (time.time_ns() - time_start)
+        if self.verbose:
+            print("computation time: {:.3f} [ms]".format(self.last_command_time_ms))
 
         self.input_traj[self.iter, :] = ctrl
 
