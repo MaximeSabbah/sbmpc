@@ -1,15 +1,15 @@
 # ROS Deployment Roadmap for SB-MPC Panda
 
-This document is a persistent handoff for future Codex instances. It captures the agreed plan for moving the current `sbmpc-panda` controller from MuJoCo validation toward Gazebo and then a real Franka Panda using `linear-feedback-controller` as the low-level torque controller.
+This document is a persistent handoff for future Codex instances. It captures the agreed plan for moving the current `sbmpc` controller from MuJoCo validation toward Gazebo and then a real Franka Panda using `linear-feedback-controller` as the low-level torque controller.
 
 ## Project Goal
 
 Develop a real-robot pick-and-place stack where:
 
-- `sbmpc-panda` remains the algorithm repository.
+- `sbmpc` remains the algorithm repository.
 - The SB-MPC/MPPI planner outputs feedforward joint torques and Riccati-like feedback gains.
 - `linear-feedback-controller` runs the low-level torque loop through `ros2_control`.
-- A new ROS repository, tentatively `sbmpc_ros`, bridges between LFC sensor messages and the `sbmpc-panda` planner.
+- A new ROS repository, tentatively `sbmpc_ros`, bridges between LFC sensor messages and the `sbmpc` planner.
 - Gazebo/Ignition validation is a mandatory gate before real-robot execution.
 
 The desired final control split is:
@@ -18,13 +18,13 @@ The desired final control split is:
 Franka hardware / Gazebo
   -> ros2_control
   -> linear_feedback_controller publishes Sensor at low-level rate
-  -> sbmpc_ros_bridge receives Sensor at planner rate, calls sbmpc-panda planner
+  -> sbmpc_ros_bridge receives Sensor at planner rate, calls sbmpc planner
   -> sbmpc_ros_bridge publishes Control(feedforward, feedback_gain, initial_state)
   -> linear_feedback_controller computes tau = feedforward + K * state_error
   -> ros2_control writes effort commands
 ```
 
-## Current State of `sbmpc-panda`
+## Current State of `sbmpc`
 
 Repository path used during development:
 
@@ -41,7 +41,7 @@ direnv exec . pixi run -e cuda python -m pytest tests/test_mppi_gains.py tests/t
 
 Known current status:
 
-- The algorithm stack is in `sbmpc-panda`.
+- The algorithm stack is in `sbmpc`.
 - The environment uses Nix/direnv to provide Pixi, then Pixi to provide the Python/CUDA stack.
 - The controller uses JaxSim dynamics and MPPI-style control sampling.
 - Gains are currently computed by a finite-difference approximation for real-time feasibility.
@@ -60,7 +60,7 @@ tests/test_mppi_gains.py
 tests/test_panda_pregrasp.py
 ```
 
-Before starting ROS work, inspect these files and confirm the public planner API is stable enough to call from ROS. If it is not stable, create a small adapter in `sbmpc-panda` rather than importing example scripts from ROS.
+Before starting ROS work, inspect these files and confirm the public planner API is stable enough to call from ROS. If it is not stable, create a small adapter in `sbmpc` rather than importing example scripts from ROS.
 
 ## External References To Recheck
 
@@ -156,20 +156,20 @@ Do not infer the sign from naming. Test it.
 Use three repositories, each with a strict responsibility:
 
 ```bash
-/home/msabbah/Desktop/sbmpc-panda        # algorithm and non-ROS validation
+/home/msabbah/Desktop/sbmpc        # algorithm and non-ROS validation
 /home/msabbah/Desktop/sbmpc_ros          # ROS bridge, bringup, Gazebo assets
 /home/msabbah/Desktop/sbmpc_containers   # Docker/devcontainer/compose deployment
 ```
 
 Responsibilities:
 
-- `sbmpc-panda`: algorithm, dynamics, costs, sampling, gains, MuJoCo/JaxSim validation. Its Python package is currently named `sbmpc`.
+- `sbmpc`: algorithm, dynamics, costs, sampling, gains, MuJoCo/JaxSim validation. Its Python package is currently named `sbmpc`.
 - `sbmpc_ros`: ROS 2 integration, message conversion, launch files, Gazebo validation, robot deployment hooks, safety gates, diagnostics.
 - `sbmpc_containers`: Dockerfiles, devcontainer files, compose files, image build scripts, dependency pinning for ROS/LFC/Franka/Gazebo/JAX deployments.
 
-Do not duplicate the planner logic in `sbmpc_ros`. Import `sbmpc-panda` as a Python dependency during development, probably with an editable/path install inside the planner container.
+Do not duplicate the planner logic in `sbmpc_ros`. Import `sbmpc` as a Python dependency during development, probably with an editable/path install inside the planner container.
 
-Do not embed Dockerfiles into `sbmpc_ros`. The ROS repo should remain buildable as a normal ROS 2 workspace package. The container repo should decide how to mount/build/install `sbmpc_ros` and `sbmpc-panda`.
+Do not embed Dockerfiles into `sbmpc_ros`. The ROS repo should remain buildable as a normal ROS 2 workspace package. The container repo should decide how to mount/build/install `sbmpc_ros` and `sbmpc`.
 
 Suggested `sbmpc_ros` layout:
 
@@ -265,7 +265,7 @@ Assessment of Agimus images:
 Conclusion:
 
 - The Agimus `control` image likely suits the Gazebo/LFC/Franka development side, but not the SB-MPC planner side by itself.
-- It does not provide the full JAX/JaxSim/CUDA/Pixi or `sbmpc-panda` planner environment we need.
+- It does not provide the full JAX/JaxSim/CUDA/Pixi or `sbmpc` planner environment we need.
 - It is also heavy and Agimus-opinionated, so it should be treated as a base/reference, not as architecture we adopt wholesale.
 
 Recommended image split for `sbmpc_containers`:
@@ -291,8 +291,8 @@ Recommended image split for `sbmpc_containers`:
    - ROS 2 Humble Python runtime.
    - `linear_feedback_controller_msgs` Python message package.
    - CUDA-compatible JAX.
-   - JaxSim and current `sbmpc-panda` dependencies.
-   - Editable/path installs of `/workspace/sbmpc-panda` and `/workspace/sbmpc_ros`.
+   - JaxSim and current `sbmpc` dependencies.
+   - Editable/path installs of `/workspace/sbmpc` and `/workspace/sbmpc_ros`.
    - NVIDIA container runtime support.
 
    This image should not need the full LFC controller or Gazebo stack unless we decide to run everything monolithically for early debugging.
@@ -331,7 +331,7 @@ Initial recommendation:
 
 ## Roadmap
 
-### Milestone 0: Stabilize `sbmpc-panda` Planner API
+### Milestone 0: Stabilize `sbmpc` Planner API
 
 Goal: make the controller callable from ROS without importing example scripts.
 
@@ -359,10 +359,10 @@ diagnostics: timing, cost, gain norm, torque norm, phase metrics
 
 Acceptance criteria:
 
-- Existing `sbmpc-panda` tests still pass.
+- Existing `sbmpc` tests still pass.
 - MuJoCo example still runs.
 - Planner call is deterministic enough for repeated ROS calls.
-- No ROS dependencies are introduced in `sbmpc-panda`.
+- No ROS dependencies are introduced in `sbmpc`.
 
 ### Milestone 1: Create `sbmpc_ros` Skeleton and LFC Message Adapter
 
@@ -532,7 +532,7 @@ These are mandatory before commanding nonzero torque in Gazebo or on hardware:
 When continuing this work:
 
 1. Start by reading this document.
-2. Inspect the current `sbmpc-panda` status and tests.
+2. Inspect the current `sbmpc` status and tests.
 3. Do one milestone at a time.
 4. Do not jump directly to real robot code before Gazebo validation exists.
 5. Do not import Agimus controller code as a dependency unless the user explicitly changes the plan.
@@ -547,7 +547,7 @@ When continuing this work:
 The user can paste this into a fresh Codex session:
 
 ```text
-We are working on SB-MPC for Franka Panda. Read /home/msabbah/Desktop/sbmpc-panda/docs/ROS_DEPLOYMENT_ROADMAP.md first. The algorithm repo is /home/msabbah/Desktop/sbmpc-panda. We now want to implement the next milestone only: create /home/msabbah/Desktop/sbmpc_ros with the ROS 2 bridge skeleton and LFC Sensor/Control message adapter tests. Do not implement Gazebo yet. Keep sbmpc-panda as the algorithm dependency and do not depend on agimus_controller_ros. Validate joint order, message shapes, initial_state copying, gain sign convention, and safety rejection of invalid outputs.
+We are working on SB-MPC for Franka Panda. Read /home/msabbah/Desktop/sbmpc/docs/ROS_DEPLOYMENT_ROADMAP.md first. The algorithm repo is /home/msabbah/Desktop/sbmpc. We now want to implement the next milestone only: create /home/msabbah/Desktop/sbmpc_ros with the ROS 2 bridge skeleton and LFC Sensor/Control message adapter tests. Do not implement Gazebo yet. Keep sbmpc as the algorithm dependency and do not depend on agimus_controller_ros. Validate joint order, message shapes, initial_state copying, gain sign convention, and safety rejection of invalid outputs.
 ```
 
 ## Useful Commands

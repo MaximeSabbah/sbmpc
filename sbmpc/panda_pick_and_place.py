@@ -162,27 +162,98 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
         self._hold_count = 0
         self.set_phase(self.phase)
 
-    def set_phase(self, phase: Phase) -> None:
+    def goal_position_for_phase(
+        self,
+        phase: Phase | None = None,
+        object_pos: jax.Array | None = None,
+        target_pos: jax.Array | None = None,
+    ) -> jax.Array:
+        phase = self.phase if phase is None else Phase(phase)
+        if object_pos is None and target_pos is None:
+            return self.phase_goal_pos_map[phase]
+
+        object_pos = (
+            self.initial_object_pos
+            if object_pos is None
+            else jnp.asarray(object_pos, dtype=jnp.float32)
+        )
+        target_pos = (
+            self.default_target_pos
+            if target_pos is None
+            else jnp.asarray(target_pos, dtype=jnp.float32)
+        )
+
+        if phase == Phase.PREGRASP:
+            return object_pos + self.pregrasp_offset
+        if phase in (Phase.DESCEND, Phase.CLOSE):
+            return object_pos
+        if phase == Phase.LIFT:
+            return object_pos + self.carry_offset
+        if phase == Phase.TRANSPORT:
+            return target_pos + self.carry_offset
+        if phase in (Phase.PLACE, Phase.OPEN):
+            return target_pos + self.place_offset
+        return target_pos + self.retreat_offset
+
+    def set_phase(
+        self,
+        phase: Phase,
+        object_pos: jax.Array | None = None,
+        target_pos: jax.Array | None = None,
+    ) -> None:
         self.phase = Phase(phase)
-        self.goal_pos = self.phase_goal_pos_map[self.phase]
-        self.goal_q = self.phase_goal_q_map[self.phase]
-        self.goal_tau = self.phase_goal_tau_map[self.phase]
-        self.reference = self.reference_for_phase(self.phase)
+        self.reference = self.reference_for_phase(
+            self.phase,
+            object_pos=object_pos,
+            target_pos=target_pos,
+        )
+        self.goal_pos = self.reference.goal_pos
+        self.goal_q = self.reference.goal_q
+        self.goal_tau = self.reference.goal_tau
         self.reference_vec = self.reference.as_vector()
 
-    def reference_for_phase(self, phase: Phase | None = None) -> PandaPickAndPlaceReference:
+    def reference_for_phase(
+        self,
+        phase: Phase | None = None,
+        object_pos: jax.Array | None = None,
+        target_pos: jax.Array | None = None,
+    ) -> PandaPickAndPlaceReference:
         phase = self.phase if phase is None else Phase(phase)
+        if object_pos is None and target_pos is None:
+            goal_pos = self.phase_goal_pos_map[phase]
+            goal_q = self.phase_goal_q_map[phase]
+            goal_tau = self.phase_goal_tau_map[phase]
+        else:
+            goal_pos = self.goal_position_for_phase(
+                phase,
+                object_pos=object_pos,
+                target_pos=target_pos,
+            )
+            goal_q = jnp.asarray(
+                self.solve_ik(np.asarray(goal_pos), np.asarray(self.goal_rotation)),
+                dtype=jnp.float32,
+            )
+            goal_tau = self.gravity_torques(goal_q)
         return PandaPickAndPlaceReference(
-            goal_pos=self.phase_goal_pos_map[phase],
-            goal_q=self.phase_goal_q_map[phase],
+            goal_pos=goal_pos,
+            goal_q=goal_q,
             goal_x_axis=jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
             goal_z_axis=jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
-            goal_tau=self.phase_goal_tau_map[phase],
+            goal_tau=goal_tau,
             weights=self.phase_weights_map[phase],
         )
 
-    def reference_vector(self, phase: Phase | None = None) -> jax.Array:
-        return self.reference_for_phase(phase).as_vector()
+    def reference_vector(
+        self,
+        phase: Phase | None = None,
+        object_pos: jax.Array | None = None,
+        target_pos: jax.Array | None = None,
+    ) -> jax.Array:
+        return self.reference_for_phase(
+            phase,
+            object_pos=object_pos,
+            target_pos=target_pos,
+        ).as_vector()
 
     def gripper_target(self, phase: Phase | None = None) -> float:
         phase = self.phase if phase is None else Phase(phase)
@@ -190,17 +261,32 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
             return self.GRIPPER_OPEN
         return self.GRIPPER_CLOSE
 
-    def object_goal_position(self, phase: Phase | None = None) -> jax.Array:
+    def object_goal_position(
+        self,
+        phase: Phase | None = None,
+        object_pos: jax.Array | None = None,
+        target_pos: jax.Array | None = None,
+    ) -> jax.Array:
         phase = self.phase if phase is None else Phase(phase)
+        object_pos = (
+            self.initial_object_pos
+            if object_pos is None
+            else jnp.asarray(object_pos, dtype=jnp.float32)
+        )
+        target_pos = (
+            self.default_target_pos
+            if target_pos is None
+            else jnp.asarray(target_pos, dtype=jnp.float32)
+        )
         if phase in (Phase.PREGRASP, Phase.DESCEND, Phase.CLOSE):
-            return self.initial_object_pos
+            return object_pos
         if phase == Phase.LIFT:
-            return self.initial_object_pos + self.carry_offset
+            return object_pos + self.carry_offset
         if phase == Phase.TRANSPORT:
-            return self.default_target_pos + self.carry_offset
+            return target_pos + self.carry_offset
         if phase == Phase.PLACE:
-            return self.default_target_pos + self.place_offset
-        return self.default_target_pos
+            return target_pos + self.place_offset
+        return target_pos
 
     def nominal_torque_sequence_from_state(
         self,
@@ -208,18 +294,21 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
         horizon: int,
         dt: float,
         phase: Phase | None = None,
+        object_pos: jax.Array | None = None,
+        target_pos: jax.Array | None = None,
     ) -> jax.Array:
         phase = self.phase if phase is None else Phase(phase)
-        state = jnp.asarray(state, dtype=jnp.float32)
-        q, v, ddq = self._cubic_joint_trajectory(
-            state[: self.nq],
-            state[self.nq : self.nq + self.nv],
-            self.phase_goal_q_map[phase],
+        reference = self.reference_for_phase(
+            phase,
+            object_pos=object_pos,
+            target_pos=target_pos,
+        )
+        return self.nominal_torque_sequence_to_goal(
+            state,
+            reference.goal_q,
             horizon,
             dt,
         )
-        tau = self._inverse_dynamics_batch_jax(q, v, ddq)
-        return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(jnp.float32)
 
     def pose_error(self, state: jax.Array, phase: Phase | None = None) -> tuple[float, float]:
         phase = self.phase if phase is None else Phase(phase)

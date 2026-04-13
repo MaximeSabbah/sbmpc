@@ -341,11 +341,21 @@ class PandaPregraspPlanner:
         self, state: jax.Array, horizon: int, dt: float
     ) -> jax.Array:
         """Receding inverse-dynamics seed from the current arm state to PREGRASP."""
+        return self.nominal_torque_sequence_to_goal(state, self.goal_q, horizon, dt)
+
+    def nominal_torque_sequence_to_goal(
+        self,
+        state: jax.Array,
+        goal_q: jax.Array,
+        horizon: int,
+        dt: float,
+    ) -> jax.Array:
+        """Receding inverse-dynamics seed from the current arm state to a goal pose."""
         state = jnp.asarray(state, dtype=jnp.float32)
         q, v, ddq = self._cubic_joint_trajectory(
             state[: self.nq],
             state[self.nq : self.nq + self.nv],
-            self.goal_q,
+            jnp.asarray(goal_q, dtype=jnp.float32),
             horizon,
             dt,
         )
