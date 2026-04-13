@@ -703,7 +703,7 @@ When continuing this work:
 The user can paste this into a fresh Codex session:
 
 ```text
-We are working on SB-MPC for Franka Panda. Read /home/msabbah/Desktop/sbmpc/docs/ROS_DEPLOYMENT_ROADMAP.md first. The algorithm repo is /home/msabbah/Desktop/sbmpc. We now want to implement the next milestone only: create /home/msabbah/Desktop/sbmpc_ros with the ROS 2 bridge skeleton and LFC Sensor/Control message adapter tests. Do not implement Gazebo yet. Keep sbmpc as the algorithm dependency and do not depend on agimus_controller_ros. Validate joint order, message shapes, initial_state copying, gain sign convention, and safety rejection of invalid outputs.
+We are working on SB-MPC for Franka Panda. Read /workspace/sbmpc/docs/ROS_DEPLOYMENT_ROADMAP.md first. The algorithm repo is /workspace/sbmpc. We now want to implement the next milestone only: create /home/msabbah/Desktop/sbmpc_ros with the ROS 2 bridge skeleton and LFC Sensor/Control message adapter tests. Do not implement Gazebo yet. Keep sbmpc as the algorithm dependency and do not depend on agimus_controller_ros. Validate joint order, message shapes, initial_state copying, gain sign convention, and safety rejection of invalid outputs.
 ```
 
 ## Useful Commands
