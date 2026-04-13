@@ -387,6 +387,21 @@ Acceptance criteria:
 
 Goal: prevent unstable feedback before Gazebo.
 
+Safety philosophy for this milestone and beyond:
+
+- Keep a small `always_on` bridge safety layer in every deployment. This covers
+  message validity, non-finite rejection, gain sign convention, and stale
+  control checks.
+- Treat `bringup_limits` as optional and tunable. Torque clipping, gain-norm
+  clipping, and conservative fallback behavior are appropriate during early
+  robot testing, but they should not become accidental permanent restrictions on
+  the controller.
+- Treat deadline and performance signals as `monitoring_only` by default unless
+  the deployment explicitly chooses a fail-closed behavior.
+- Do not rely on Franka hardware limits alone. Hardware limits protect the
+  robot at the low level, while the bridge safety layer is there to catch
+  software and integration mistakes before they reach those limits.
+
 Implement tests for:
 
 - LFC sign convention: desired-minus-measured.
@@ -517,11 +532,13 @@ These are mandatory before commanding nonzero torque in Gazebo or on hardware:
 - Strict joint-name and joint-order validation.
 - Strict shape validation for `feedforward` and `feedback_gain`.
 - Non-finite values are rejected.
-- Torque magnitude limits.
+- `always_on` checks stay enabled in all deployments.
+- `bringup_limits` remain explicitly optional and tunable.
+- Torque magnitude limits when conservative bringup limits are enabled.
 - Torque rate limits if feasible.
-- Gain norm limits.
+- Gain norm limits when conservative bringup limits are enabled.
 - Stale-control timeout.
-- Planner deadline miss counter.
+- Planner deadline miss counter and configurable fail-closed behavior.
 - Safe fallback mode: zero gain and safe feedforward/hold or disabled output.
 - Explicit enable flag required before publishing nonzero commands.
 - Gripper commands gated by phase and safety state.
@@ -541,6 +558,11 @@ When continuing this work:
 8. Preserve a clear test command for every milestone.
 9. Prefer small, testable files over a monolithic bridge node.
 10. Report exact commands run and exact pass/fail results.
+11. Preserve the bridge safety split:
+    `always_on` for validity/sign/staleness, `bringup_limits` for optional
+    conservative caps, and `monitoring_only` for deadline/performance signals.
+12. Do not turn temporary bringup limits into permanent hidden restrictions
+    unless the user explicitly asks for that tradeoff.
 
 ## Suggested First Prompt For A New Codex Instance
 
