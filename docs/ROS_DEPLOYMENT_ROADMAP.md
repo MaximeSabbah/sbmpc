@@ -422,6 +422,12 @@ Acceptance criteria:
 
 Goal: test bridge timing without Gazebo.
 
+Current implementation note:
+
+- The fake-loop milestone is implemented in `sbmpc_ros_bridge` with a timer-based
+  `sbmpc_lfc_bridge_node`, JSON diagnostics topic, and integration coverage in
+  `test/test_fake_ros_loop.py`.
+
 Implement:
 
 - Fake LFC `Sensor` publisher.
