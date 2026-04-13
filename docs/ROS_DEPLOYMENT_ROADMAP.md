@@ -24,6 +24,31 @@ Franka hardware / Gazebo
   -> ros2_control writes effort commands
 ```
 
+## Current ROS Workspace Status
+
+The active ROS workspace is now:
+
+```bash
+/workspace/ros2_ws
+```
+
+Develop the ROS repository from:
+
+```bash
+/workspace/ros2_ws/src/sbmpc_ros
+```
+
+Implemented packages:
+
+- `sbmpc_ros_bridge`: message adapters, safety profiles, diagnostics, timer loop, planner smoke tooling.
+- `sbmpc_bringup`: FER-adapted launch and configuration assets for Gazebo and real Franka bringup.
+
+Important current local convention:
+
+- The installed Franka stack in this environment exposes a `fer` robot description.
+- The current bringup defaults therefore use runtime joint names `fer_joint1 ... fer_joint7`.
+- Do not assume `panda_joint*` names at runtime. The bridge must use the exact joint names of the active ROS model in its `joint_names` parameter and in the `initial_state` snapshot sent back to LFC.
+
 ## Current State of `sbmpc`
 
 Repository path used during development:
@@ -78,6 +103,71 @@ These references informed the plan. Future Codex instances should re-open them i
 - Agimus Franka controllers params: https://github.com/agimus-project/agimus-demos/blob/f07f6a28127420aeddee5c09d133d08b98a69e9b/agimus_demos_common/config/franka/controllers.yaml
 
 Use Agimus as a bringup reference, not as a controller architecture reference. Do not depend on `agimus_controller_ros` for SB-MPC.
+
+## Milestone 4 Status
+
+Milestone 4 was started with a new `sbmpc_bringup` package and a real planner smoke path.
+
+What is implemented:
+
+- `sbmpc_bringup/launch/sbmpc_franka_lfc_sim.launch.py`
+- `sbmpc_bringup/launch/sbmpc_franka_lfc_real.launch.py`
+- `sbmpc_bringup/config/franka_controllers.yaml`
+- `sbmpc_bringup/config/franka_lfc_params.yaml`
+- `sbmpc_bringup/config/sbmpc_bridge.yaml`
+- FER-specific controller interface wiring based on the Agimus `joint_state_estimator` plus `linear_feedback_controller` pattern
+- `sbmpc_ros_bridge.planner_smoke` for validating real `sbmpc` + JAX planner calls from the ROS-side environment
+
+Verified commands:
+
+```bash
+cd /workspace/ros2_ws
+colcon build --symlink-install --packages-select sbmpc_ros_bridge sbmpc_bringup
+colcon test --packages-select sbmpc_ros_bridge sbmpc_bringup --event-handlers console_direct+
+colcon test-result --verbose
+```
+
+Current test result:
+
+- `39 tests, 0 errors, 0 failures, 0 skipped`
+
+Verified planner smoke:
+
+```bash
+/workspace/sbmpc_containers/scripts/pixi_ros_run.sh \
+  python -m sbmpc_ros_bridge.planner_smoke --joint-set fer
+```
+
+Observed result:
+
+- planner call succeeds through the ROS bridge adapter
+- `Control.initial_state.joint_state.name` is `fer_joint1 ... fer_joint7`
+- `feedback_gain` shape is `(7, 14)`
+- `feedforward` shape is `(7, 1)`
+- measured planning time was about `19.6 ms`
+
+Current Gazebo blocker:
+
+```bash
+cd /workspace/ros2_ws
+source install/setup.bash
+ros2 launch sbmpc_bringup sbmpc_franka_lfc_sim.launch.py \
+  gz_args:='empty.sdf -r -s' use_rviz:=false
+```
+
+Observed result:
+
+- the FER robot entity spawns successfully
+- `/joint_states` publishes `fer_joint1 ... fer_joint7`
+- Gazebo reports: `A link named fer_link4 has invalid inertia`
+- `/controller_manager/list_controllers` appears in the graph but is not contactable
+- `joint_state_broadcaster` spawner times out, so the LFC stack never activates
+
+Interpretation:
+
+- the SB-MPC bridge package, bringup package, and planner import path are working
+- the current simulation failure is in the installed FER Gazebo model / controller-manager path, not in the bridge-to-planner integration
+- next work should inspect or patch the FER inertial description used by Gazebo before treating Milestone 4 Gazebo validation as complete
 
 ## Key LFC Interface Facts
 
@@ -456,6 +546,36 @@ Use the Agimus structure conceptually:
 - `linear_feedback_controller` loaded and activated.
 - LFC configured with fixed-base Panda, 7 moving joints, effort command interfaces.
 - `sbmpc_lfc_bridge_node` starts after LFC sensor topic exists.
+
+Agimus reference mapping that should guide our implementation:
+
+- In `agimus_demos_common/launch/franka/franka_common_lfc.launch.py`, Agimus
+  does not implement a custom controller manager. It includes its common Franka
+  launch and passes two extra controller names:
+  `linear_feedback_controller` and `joint_state_estimator`.
+- Agimus injects those controllers through:
+  `external_controllers_params` and `external_controllers_names`, rather than by
+  changing the LFC controller implementation itself.
+- The important LFC controller parameters in
+  `agimus_demos_common/config/franka/linear_feedback_controller_params.yaml` are:
+  `moving_joint_names`, `chainable_controller.command_interfaces`,
+  `joint_velocity_filter_coefficient`, `pd_to_lf_transition_duration`,
+  `remove_gravity_compensation_effort`, and `robot_has_free_flyer: false`.
+- The important controller-manager parameters in
+  `agimus_demos_common/config/franka/controllers.yaml` are:
+  `controller_manager.update_rate: 1000`,
+  `joint_state_broadcaster`, and `gripper_action_controller`.
+- The local stack available in this repository differs slightly from Agimus:
+  we have upstream `franka_bringup/launch/franka.launch.py` and
+  `franka_gazebo_bringup`, not `franka_common.launch.py`. So our clean-room
+  `sbmpc_bringup` should reproduce the same wiring by:
+  1. including `franka_bringup` or `franka_gazebo_bringup`,
+  2. supplying our own controller YAML that extends Franka's defaults with
+     `joint_state_estimator` and `linear_feedback_controller`,
+  3. spawning those controllers explicitly, and
+  4. starting `sbmpc_lfc_bridge_node` only after the LFC `sensor` topic is live.
+- Use Agimus only as a reference for the launch/config split and the order of
+  controller activation. Do not depend on `agimus_controller_ros`.
 
 Acceptance criteria:
 
