@@ -390,7 +390,9 @@ Recommended image split for `sbmpc_containers`:
    - `linear_feedback_controller_msgs` Python message package.
    - CUDA-compatible JAX.
    - JaxSim and current `sbmpc` dependencies.
-   - Editable/path installs of `/workspace/sbmpc` and `/workspace/sbmpc_ros`.
+   - Editable/path installs of `/workspace/sbmpc` and
+     `/workspace/ros2_ws/src/sbmpc_ros` (legacy `/workspace/sbmpc_ros`
+     compatibility mount optional).
    - NVIDIA container runtime support.
 
    This image should not need the full LFC controller or Gazebo stack unless we decide to run everything monolithically for early debugging.
