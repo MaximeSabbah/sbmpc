@@ -104,6 +104,14 @@ These references informed the plan. Future Codex instances should re-open them i
 
 Use Agimus as a bringup reference, not as a controller architecture reference. Do not depend on `agimus_controller_ros` for SB-MPC.
 
+Description package decision:
+
+- for this project, prefer `agimus-project/agimus-franka-description` over upstream `frankarobotics/franka_description`
+- the user already relies on the Agimus description stack on the real `fer` robot
+- the Agimus repository still exports the ROS package name `franka_description`
+- because of that, the container image must replace upstream `franka_description` rather than install both at once
+- keep launch code referring to `franka_description`; the container build decides which source tree provides that package name
+
 ## Milestone 4 Status
 
 Milestone 4 was started with a new `sbmpc_bringup` package and a real planner smoke path.
