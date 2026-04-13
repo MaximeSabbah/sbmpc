@@ -599,6 +599,27 @@ Acceptance criteria:
 
 Goal: validate the ROS/LFC/SB-MPC loop on a simple task before full pick-and-place.
 
+Current implementation note:
+
+- The local LFC stack publishes `Sensor` on `/sensor` and consumes `Control` on
+  `/control` using best-effort QoS. The bridge must match those endpoints; the
+  earlier `/linear_feedback_controller/{sensor,control}` assumption is not
+  correct for this stack.
+- `sbmpc_bringup/config/sbmpc_bridge_milestone5_feedforward.yaml` and
+  `sbmpc_bringup/config/sbmpc_bridge_milestone5_feedback.yaml` start disarmed
+  with `enable_nonzero_control: false`. Arm the bridge explicitly with:
+  `ros2 param set /sbmpc_lfc_bridge_node enable_nonzero_control true`.
+- In one headless validation run, the feedforward PREGRASP path reached
+  `state="running"` with zero gain, nonzero `/control` feedforward, and a
+  measured position error drop from about `0.43` to about `0.27`.
+- In one headless validation run, the finite-gain PREGRASP path also reached
+  `state="running"` with nonzero gain norm and a measured position error near
+  `0.09`.
+- The current bridge is still the simple single-step replanning version. The
+  next likely refinement is an Agimus-style buffered receding-horizon layer,
+  because the finite-gain run observed planning times around the 20 ms deadline
+  and accumulated deadline misses.
+
 Test sequence:
 
 1. PREGRASP with `K = 0`, feedforward only.
