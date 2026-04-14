@@ -69,3 +69,43 @@ def test_panda_pick_and_place_controller_step_uses_task_context() -> None:
     assert output.gripper_command.action == "close"
     assert output.diagnostics.object_error is not None
     assert np.isfinite(output.diagnostics.object_error)
+
+
+def test_panda_pick_and_place_controller_reuses_solution_guess_for_same_context() -> None:
+    controller = build_controller(gains=True)
+    call_count = 0
+    original = controller.planner.nominal_torque_sequence_to_goal
+
+    def wrapped(state, goal_q, horizon, dt):
+        nonlocal call_count
+        call_count += 1
+        return original(state, goal_q, horizon, dt)
+
+    controller.planner.nominal_torque_sequence_to_goal = wrapped
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    controller.step(q, v, Phase.PREGRASP)
+    controller.step(q, v, Phase.PREGRASP)
+
+    assert call_count == 1
+
+
+def test_panda_pick_and_place_controller_resets_solution_guess_on_phase_change() -> None:
+    controller = build_controller(gains=True)
+    call_count = 0
+    original = controller.planner.nominal_torque_sequence_to_goal
+
+    def wrapped(state, goal_q, horizon, dt):
+        nonlocal call_count
+        call_count += 1
+        return original(state, goal_q, horizon, dt)
+
+    controller.planner.nominal_torque_sequence_to_goal = wrapped
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    controller.step(q, v, Phase.PREGRASP)
+    controller.step(q, v, Phase.TRANSPORT)
+
+    assert call_count == 2

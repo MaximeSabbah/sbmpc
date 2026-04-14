@@ -63,6 +63,7 @@ class PandaPickAndPlaceController:
         config: Config | None = None,
         *,
         gains: bool = True,
+        num_steps: int = 1,
         visualize: bool = False,
     ) -> None:
         self.planner = PandaPickAndPlacePlanner() if planner is None else planner
@@ -81,12 +82,16 @@ class PandaPickAndPlaceController:
             self.objective,
             custom_dynamics_fn=self.planner.dynamics,
         )
+        self._default_num_steps = self._validate_num_steps(num_steps)
+        self._solution_initialized = False
+        self._last_reference_signature: tuple[object, ...] | None = None
 
     def warmup(
         self,
         phase: Phase = Phase.PREGRASP,
         object_pose: TaskPose | np.ndarray | None = None,
         target_pose: TaskPose | np.ndarray | None = None,
+        num_steps: int | None = None,
     ) -> PlannerOutput:
         return self.step(
             self.planner.home_q,
@@ -94,6 +99,8 @@ class PandaPickAndPlaceController:
             phase,
             object_pose=object_pose,
             target_pose=target_pose,
+            num_steps=num_steps,
+            reset_guess=True,
         )
 
     def reference_for_phase(
@@ -117,6 +124,9 @@ class PandaPickAndPlaceController:
         phase: Phase,
         object_pose: TaskPose | np.ndarray | None = None,
         target_pose: TaskPose | np.ndarray | None = None,
+        *,
+        num_steps: int | None = None,
+        reset_guess: bool = False,
     ) -> PlannerOutput:
         phase = Phase(phase)
         q = self._joint_vector(q, self.planner.nq, "q")
@@ -131,21 +141,30 @@ class PandaPickAndPlaceController:
         )
         reference = self.planner.reference
         state = jnp.concatenate([q, v], axis=0)
-        self.controller.sampler.optimal_samples = self.planner.nominal_torque_sequence_to_goal(
-            state,
-            reference.goal_q,
-            self.config.MPC.horizon,
-            self.config.MPC.dt,
+        reference_signature = self._reference_signature(
+            phase,
+            object_pos=object_pos,
+            target_pos=target_pos,
         )
+        effective_num_steps = self._default_num_steps if num_steps is None else num_steps
+        effective_num_steps = self._validate_num_steps(effective_num_steps)
+        if (
+            reset_guess
+            or not self._solution_initialized
+            or reference_signature != self._last_reference_signature
+        ):
+            self._seed_nominal_solution(state, reference.goal_q)
 
         start_time = time.time_ns()
         input_sequence = self.controller.command(
             state,
             self.planner.reference_vec,
-            shift_guess=False,
-            num_steps=1,
+            shift_guess=True,
+            num_steps=effective_num_steps,
         )
         input_sequence = jax.block_until_ready(input_sequence)
+        self._solution_initialized = True
+        self._last_reference_signature = reference_signature
         gains = np.asarray(jax.block_until_ready(self.controller.gains), dtype=np.float32)
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
@@ -217,3 +236,42 @@ class PandaPickAndPlaceController:
         if array.shape != (3,):
             raise ValueError(f"{name} position must have shape (3,), got {array.shape}.")
         return jnp.asarray(array, dtype=jnp.float32)
+
+    def _seed_nominal_solution(self, state: jax.Array, goal_q: jax.Array) -> None:
+        self.controller.sampler.optimal_samples = self.planner.nominal_torque_sequence_to_goal(
+            state,
+            goal_q,
+            self.config.MPC.horizon,
+            self.config.MPC.dt,
+        )
+        self.controller.gains_obj.cur_gains = jnp.zeros(
+            (self.planner.nu, self.planner.nx),
+            dtype=getattr(self.config.general, "dtype", jnp.float32),
+        )
+
+    @staticmethod
+    def _validate_num_steps(value: int) -> int:
+        num_steps = int(value)
+        if num_steps <= 0:
+            raise ValueError("num_steps must be strictly positive.")
+        return num_steps
+
+    @staticmethod
+    def _reference_signature(
+        phase: Phase,
+        *,
+        object_pos: jax.Array | None,
+        target_pos: jax.Array | None,
+    ) -> tuple[object, ...]:
+        return (
+            phase.name,
+            PandaPickAndPlaceController._vector_signature(object_pos),
+            PandaPickAndPlaceController._vector_signature(target_pos),
+        )
+
+    @staticmethod
+    def _vector_signature(value: jax.Array | None) -> tuple[float, ...] | None:
+        if value is None:
+            return None
+        array = np.asarray(value, dtype=np.float32).reshape(-1)
+        return tuple(float(entry) for entry in array)
