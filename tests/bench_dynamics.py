@@ -62,15 +62,26 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+import jaxsim.api as js
+import jaxsim.parsers.rod as rodp
+from robot_descriptions.panda_description import URDF_PATH
+from robot_descriptions.panda_mj_description import MJCF_PATH
+import xml.etree.ElementTree as ET
+
+import casadi as cs
+import pinocchio as pin
+import pinocchio.casadi as cpin
+from jaxadi import convert
+import mujoco
+from mujoco import mjx
+import jaxsim.api as js
+
 # ── Configuration ──────────────────────────────────────────────────────────
 DEFAULT_BATCH_SIZES = [32, 512, 2048]
 N_WARMUP = 10
 N_TRIALS = 300
-NQ = 7          # arm DOF
-NQ_MJX = 9     # panda.xml has 7 arm + 2 finger joints
+NQ = NQ_MJX = 9     # panda.xml has 7 arm + 2 finger joints
 DT = 0.02
-
-PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{i}" for i in range(1, 8))
 
 
 class BenchResult(NamedTuple):
@@ -121,22 +132,22 @@ def make_state_and_tau(key, K=None):
 # JaxSim shared helpers
 # ══════════════════════════════════════════════════════════════════════════
 
-def _build_jaxsim_model():
-    import jaxsim.api as js
-    import jaxsim.parsers.rod as rodp
-    from robot_descriptions.panda_description import URDF_PATH
-
+def _build_models():
     desc = rodp.build_model_description(
         URDF_PATH, is_urdf=True,
-    ).reduce(considered_joints=PANDA_ARM_JOINT_NAMES)
+    )
     desc = dataclasses.replace(desc, fixed_base=True)
-    # Note: reduce() lumps the hand + finger inertia into panda_link7.
-    return js.model.JaxSimModel.build(model_description=desc), URDF_PATH
+    jaxsim_model = js.model.JaxSimModel.build(model_description=desc)
+    
+    pin_model = pin.buildModelFromUrdf(URDF_PATH)
+    mj_model = mujoco.MjModel.from_xml_path(MJCF_PATH)
+    
+    return jaxsim_model, mj_model, pin_model, URDF_PATH
 
 
 def _js_reorder(js_model):
     names = tuple(js_model.joint_names())
-    e2j = jnp.array([names.index(n) for n in PANDA_ARM_JOINT_NAMES], dtype=jnp.int32)
+    e2j = jnp.array([names.index(n) for n in js_model.joint_names()], dtype=jnp.int32)
     j2e = jnp.array(np.argsort(np.array(e2j)), dtype=jnp.int32)
     return e2j, j2e
 
@@ -146,7 +157,6 @@ def _js_reorder(js_model):
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_A(js_model):
-    import jaxsim.api as js
     e2j, j2e = _js_reorder(js_model)
 
     def aba(q, qd, tau):
@@ -167,22 +177,11 @@ def build_A(js_model):
 # D: MJX-JAX — mjx.forward, full Panda model WITH hand
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_D(panda_xml_path: str):
+def build_D(mj_model):
     """
-    Uses panda.xml (9 DOF: 7 arm + 2 fingers). Fingers are pinned at q=0
-    internally so only the 7-DOF arm dynamics are exercised, but the hand
-    mass (0.73 kg) IS present in the kinematic tree, matching JaxSim.
-
-    Fairness fixes applied:
-      - actuator gainprm/biasprm → 0  (removes PD position/velocity feedback)
-      - dof_damping, dof_frictionloss, dof_armature → 0  (matches URDF params)
-    After these, MJX computes qacc = M⁻¹(τ − c(q,v)) for the same physical
-    model as JaxSim (up to lumped vs. explicit hand representation).
+    Mujoco build
     """
-    import mujoco
-    from mujoco import mjx
 
-    mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
     mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
     mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
 
@@ -211,7 +210,7 @@ def build_D(panda_xml_path: str):
 # E: Pinocchio + CasADi + Jaxadi  (forward pass only — too slow for grads)
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_E(panda_xml_path: str):
+def build_E(pin_model):
     """
     CasADi-symbolic ABA compiled through Jaxadi to XLA.
     Pinocchio reads the same URDF as JaxSim; after locking the finger joints
@@ -219,24 +218,13 @@ def build_E(panda_xml_path: str):
     Jaxadi's convert() returns a list of outputs — we extract [0] and ravel
     to get a plain (NQ,) JAX array.
     """
-    import casadi as cs
-    import pinocchio as pin
-    import pinocchio.casadi as cpin
-    from jaxadi import convert
-    
-    full_model = pin.buildModelFromMJCF(panda_xml_path) 
-    finger_ids = [
-        full_model.getJointId(n)
-        for n in ("finger_joint1", "finger_joint2")
-    ]
-    model = pin.buildReducedModel(full_model, finger_ids, np.zeros(full_model.nq))
 
-    cmodel = cpin.Model(model)
+    cmodel = cpin.Model(pin_model)
     cdata = cmodel.createData()
 
-    q_sym   = cs.SX.sym("q",   model.nq)
-    v_sym   = cs.SX.sym("v",   model.nv)
-    tau_sym = cs.SX.sym("tau", model.nv)
+    q_sym   = cs.SX.sym("q",   pin_model.nq)
+    v_sym   = cs.SX.sym("v",   pin_model.nv)
+    tau_sym = cs.SX.sym("tau", pin_model.nv)
 
     ddq_sym = cpin.aba(cmodel, cdata, q_sym, v_sym, tau_sym)
     aba_cs  = cs.Function("aba", [q_sym, v_sym, tau_sym], [ddq_sym])
@@ -254,7 +242,21 @@ def build_E(panda_xml_path: str):
 # F: ADAM-JAX — CRBA + RNEA forward dynamics
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_F(panda_xml_path: str):
+def get_cleaned_urdf_string(urdf_path: str) -> str:
+    """Parse URDF, remove all <dynamics> tags, and return as string."""
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    
+    # Find and remove all <dynamics> elements from all <joint> tags
+    for joint in root.findall(".//joint"):
+        dynamics = joint.find("dynamics")
+        if dynamics is not None:
+            joint.remove(dynamics)
+    
+    # Return the modified XML as a string
+    return ET.tostring(root, encoding="unicode")
+
+def build_F(urdf_path: str, joints_name_list: list[str]):
     """
     ADAM (Automatic Differentiation for rigid-body dynamics Algorithm in
     Multi-body systems) JAX backend. 
@@ -268,31 +270,32 @@ def build_F(panda_xml_path: str):
             "then run: pixi install"
         ) from exc
         
-    import mujoco
-    mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
-    mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
-    mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
-
-    mj_model.actuator_gainprm[:] = 0.0
-    mj_model.actuator_biasprm[:] = 0.0
-    mj_model.dof_damping[:] = 0.0
-    mj_model.dof_frictionloss[:] = 0.0
-    mj_model.dof_armature[:] = 0.0
-
-    comp = KinDynComputations.from_mujoco_model(mj_model)
+    urdf_string = get_cleaned_urdf_string(urdf_path)
+    comp = KinDynComputations(
+        urdf_string,
+        joints_name_list=joints_name_list,
+        # Fixed-base: gravity vector can be optionally specified
+        gravity=jnp.array([0, 0, -9.80665, 0, 0, 0])
+    )
     
     # Set velocity representation
     comp.set_frame_velocity_representation(Representations.MIXED_REPRESENTATION)
-
-    # Set gravity to match MuJoCo settings
-    comp.g = np.concatenate([mj_model.opt.gravity, np.zeros(3)])
 
     # Fixed-base constants (traced once into the JIT graph)
     H_b = jnp.eye(4)     # base homogeneous transform: identity = fixed at world
     vB  = jnp.zeros(6)   # base spatial velocity = 0
 
     def aba(q, qd, tau):
-        return comp.aba(H_b=H_b, q=q, vB=vB, qd=qd, tau=tau)
+        qdd = comp.aba(
+            base_transform=H_b,
+            joint_positions=q,
+            base_velocity=vB,
+            joint_velocities=qd,
+            joint_torques=tau
+        )
+        # The return value is a 1D array: [base_acceleration (6), joint_accelerations (n)]
+        # For a fixed-base robot, we only need the joint part.
+        return qdd[6:]
 
     return jax.jit(aba)
 
@@ -451,8 +454,6 @@ def main():
     n_trials = args.trials
     bs       = args.batch_sizes
 
-    panda_xml = str(Path(__file__).resolve().parents[1]
-                    / "examples" / "franka_emika_panda" / "panda.xml")
 
     print("=" * 75)
     print("  CROSS-LIBRARY DYNAMICS BENCHMARK FOR FEEDBACK-MPPI")
@@ -471,9 +472,21 @@ def main():
     aba_fns: dict = {}
 
     # ── Build JaxSim model (also yields the URDF path for E and F) ──
-    print(f"\n  Building JaxSim model...")
-    js_model, urdf_path = _build_jaxsim_model()
+    print(f"\n  Building models...")
+    js_model, mj_model, pin_model, urdf_path = _build_models()
     print(f"  JaxSim joints : {list(js_model.joint_names())}")
+    
+    mj_joint_names = [
+        mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_JOINT, i)
+        for i in range(mj_model.njnt)
+    ]
+    print(f"  Mujoco joints : {mj_joint_names}")
+    
+    pin_joint_names = []
+    for joint_id in range(1, pin_model.njoints):
+        joint_name = pin_model.names[joint_id]
+        pin_joint_names.append(joint_name)
+    print(f"  Pinocchio joints : {pin_joint_names}")
 
     # ═══════════════════════════════════════════════════════
     #  PART 1: FORWARD DYNAMICS
@@ -492,7 +505,7 @@ def main():
     if not args.skip_mjx:
         try:
             print(f"\n  Building MJX model (panda.xml, contacts disabled)...")
-            fn_d = build_D(panda_xml)
+            fn_d = build_D(mj_model)
             aba_fns["D"] = fn_d
             fwd_results.append(bench(
                 "D: MJX-JAX forward (hand incl.)", fn_d, make_inputs, key, bs, n_trials))
@@ -503,7 +516,7 @@ def main():
     if not args.skip_jaxadi:
         try:
             print(f"\n  Building Pinocchio + CasADi + Jaxadi ABA...")
-            fn_e = build_E(panda_xml)
+            fn_e = build_E(pin_model)
             aba_fns["E"] = fn_e
             fwd_results.append(bench(
                 "E: Pinocchio+CasADi+Jaxadi", fn_e, make_inputs, key, bs, n_trials))
@@ -511,15 +524,15 @@ def main():
             print(f"  E FAILED:\n{traceback.format_exc()}")
 
     # F: ADAM-JAX
-    if not args.skip_adam:
-        try:
-            print(f"\n  Building ADAM-JAX model...")
-            fn_f = build_F(panda_xml)
-            aba_fns["F"] = fn_f
-            fwd_results.append(bench(
-                "F: ADAM-JAX", fn_f, make_inputs, key, bs, n_trials))
-        except Exception:
-            print(f"  F FAILED:\n{traceback.format_exc()}")
+    # if not args.skip_adam:
+    #     try:
+    #         print(f"\n  Building ADAM-JAX model...")
+    #         fn_f = build_F(urdf_path, pin_joint_names)
+    #         aba_fns["F"] = fn_f
+    #         fwd_results.append(bench(
+    #             "F: ADAM-JAX", fn_f, make_inputs, key, bs, n_trials))
+    #     except Exception:
+    #         print(f"  F FAILED:\n{traceback.format_exc()}")
 
     if fwd_results:
         print_summary("FORWARD DYNAMICS — vmap(aba)(q, qd, tau)", fwd_results, bs)
@@ -542,10 +555,9 @@ def main():
         name_map = {
             "A": "A: JaxSim build() GRAD",
             "D": "D: MJX-JAX GRAD",
-            "F": "F: ADAM-JAX GRAD",
         }
         # E is excluded (Pinocchio+Jaxadi grad is ~30× slower and impractical)
-        for label in ["A", "D", "F"]:
+        for label in ["A", "D"]:
             if label not in aba_fns:
                 continue
             try:

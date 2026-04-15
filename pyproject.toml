@@ -12,7 +12,7 @@ description = "A package to do sampling based trajectory control for robotic app
 dependencies = [
     "numpy",
     "matplotlib",
-    "jax>=0.8.0",
+    "jax>=0.6.0",
     "control",
     "mujoco-mjx",
     "interpax",
@@ -78,9 +78,9 @@ cuda-nvcc = "*"
 
 [tool.pixi.feature.cuda.pypi-dependencies]
 jaxlib = "*"
-jax = { version = ">=0.8.0", extras = ["cuda12"] }
+jax = { version = ">=0.6.0", extras = ["cuda12"] }
 jaxadi = "*"
-adam-robotics = "*"
+adam-robotics = { version = "==0.5.0", extras = ["jax"] }  
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
