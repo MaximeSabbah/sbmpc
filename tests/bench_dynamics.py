@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from pyexpat import model
 import time
 import traceback
 from pathlib import Path
@@ -162,6 +163,7 @@ def build_B(js_model):
 
     def aba(q, qd, tau):
         data = tpl.replace(
+            model=js_model,
             joint_positions=jnp.take(q, j2e, axis=-1),
             joint_velocities=jnp.take(qd, j2e, axis=-1),
         )
@@ -188,6 +190,7 @@ def build_C(js_model):
 
     def minv(q, qd, tau):
         data = tpl.replace(
+            model=js_model,
             joint_positions=jnp.take(q, j2e, axis=-1),
             joint_velocities=jnp.take(qd, j2e, axis=-1),
         )
@@ -256,7 +259,7 @@ def build_E(urdf_path: str):
     aba_jax = convert(aba_cs, compile=True)
 
     def aba(q, qd, tau):
-        return aba_jax(q, qd, tau).flatten()
+        return aba_jax(q, qd, tau)
 
     return jax.jit(aba)
 
