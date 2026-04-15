@@ -450,13 +450,13 @@ def main():
         print(f"  GPU:            {jax.devices('gpu')[0]}")
     print(f"  Precision:      {'f64' if jax.config.jax_enable_x64 else 'f32'}")
     print(f"  Batch sizes:    {bs}")
-    print(f"  Gradient test:  {'OFF' if args.skip_grad else 'ON (A, D, F)'}")
+    print(f"  Gradient test:  {'OFF' if args.skip_grad else 'ON (A, B)'}")
 
     key = jax.random.PRNGKey(42)
     fwd_results, grad_results = [], []
     aba_fns: dict = {}
 
-    # ── Build JaxSim model (also yields the URDF path for E and F) ──
+    # ── Build JaxSim model (also yields the URDF path for C and D) ──
     print(f"\n  Building models...")
     js_model, mj_model, pin_model, urdf_path = _build_models()
     print(f"  JaxSim joints : {list(js_model.joint_names())}")
