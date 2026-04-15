@@ -32,8 +32,13 @@ Homepage = "https://github.com/tombelv/sbmpc"
 Issues = "https://github.com/tombelv/sbmpc/issues"
 
 [project.optional-dependencies]
-cuda12 = [
-    "jax[cuda12] ; platform_system == 'Linux'"
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.15",
+]
+panda = [
+    "jaxsim>=0.8.1",
+    "robot_descriptions>=1.17.0",
 ]
 
 [build-system]
@@ -51,11 +56,16 @@ version_scheme = "no-guess-dev"
 channels = ["conda-forge", "nvidia"]
 platforms = ["linux-64", "osx-arm64"]
 
+[tool.pixi.dependencies]
+python = "3.12.*"
+pinocchio = ">=3.9.0,<4"
+casadi = ">=3.7.2,<4"
+
 [tool.pixi.tasks]
 build = "hatch build"
 
 [tool.pixi.pypi-dependencies]
-sbmpc = { path = ".", editable = true }
+sbmpc = { path = ".", editable = true, extras = ["dev", "panda"] }
 hatch-vcs = "*"
 hatch = "*"
 
@@ -69,26 +79,8 @@ cuda-nvcc = "*"
 [tool.pixi.feature.cuda.pypi-dependencies]
 jaxlib = "*"
 jax = { version = ">=0.8.0", extras = ["cuda12"] }
-
-# Benchmark feature — adds all backends for bench_dynamics.py
-[tool.pixi.feature.bench]
-platforms = ["linux-64", "osx-arm64"]
-
-[tool.pixi.feature.bench.dependencies]
-pinocchio = ">=3.0"
-casadi = "*"
-
-[tool.pixi.feature.bench.pypi-dependencies]
-jaxsim = "*"
-robot-descriptions = "*"
 jaxadi = "*"
-
-[tool.pixi.feature.bench.tasks]
-bench = "python tests/bench_dynamics.py"
-bench-quick = "python tests/bench_dynamics.py --skip-grad --batch-sizes 32 512 2048"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
 cuda = ["cuda"]
-bench = ["bench"]
-cuda-bench = ["cuda", "bench"]

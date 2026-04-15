@@ -299,7 +299,7 @@ def make_grad_step(integrator_fn):
 # BENCHMARK RUNNER
 # ══════════════════════════════════════════════════════════════════════════
 
-def bench(name, fn, make_args, key, batch_sizes):
+def bench(name, fn, make_args, key, batch_sizes, n_trials=N_TRIALS):
     print(f"\n{'─'*65}")
     print(f"  {name}")
     print(f"{'─'*65}")
@@ -307,7 +307,7 @@ def bench(name, fn, make_args, key, batch_sizes):
     args = make_args(key)
     jit_ms = time_jit(fn, *args)
     print(f"  JIT compile:     {jit_ms:9.1f} ms")
-    single_us = time_exec(fn, *args)
+    single_us = time_exec(fn, *args, n_trials=n_trials)
     print(f"  Single call:     {single_us:9.1f} us")
 
     fn_batch = jax.jit(jax.vmap(fn))
@@ -315,7 +315,7 @@ def bench(name, fn, make_args, key, batch_sizes):
     for K in batch_sizes:
         args_b = make_args(key, K)
         jax.block_until_ready(fn_batch(*args_b))
-        us = time_exec(fn_batch, *args_b)
+        us = time_exec(fn_batch, *args_b, n_trials=n_trials)
         ms = us / 1000.0
         batch_ms[K] = ms
         print(f"  K={K:<5d}:       {ms:9.3f} ms   ({us/K:.2f} us/eval)")
@@ -361,8 +361,7 @@ def main():
     parser.add_argument("--skip-jaxadi", action="store_true")
     args = parser.parse_args()
 
-    global N_TRIALS
-    N_TRIALS = args.trials
+    n_trials = args.trials
     bs = args.batch_sizes
 
     scene_path = str(Path(__file__).resolve().parents[1]
@@ -406,7 +405,7 @@ def main():
                 "B": "B: JaxSim ABA .replace()      [FIX]",
                 "C": "C: JaxSim CRBA+Cholesky",
             }
-            fwd_results.append(bench(names[label], fn, make_inputs, key, bs))
+            fwd_results.append(bench(names[label], fn, make_inputs, key, bs, n_trials))
         except Exception:
             print(f"  {label} FAILED:\n{traceback.format_exc()}")
 
@@ -415,7 +414,7 @@ def main():
             print(f"\n  Building MJX-JAX model (contacts disabled)...")
             fn_d = build_D(scene_path)
             aba_fns["D"] = fn_d
-            fwd_results.append(bench("D: MJX-JAX forward (no contacts)", fn_d, make_inputs, key, bs))
+            fwd_results.append(bench("D: MJX-JAX forward (no contacts)", fn_d, make_inputs, key, bs, n_trials))
         except Exception:
             print(f"  D FAILED:\n{traceback.format_exc()}")
 
@@ -424,7 +423,7 @@ def main():
             print(f"\n  Building Pinocchio + CasADi + Jaxadi ABA...")
             fn_e = build_E(urdf_path)
             aba_fns["E"] = fn_e
-            fwd_results.append(bench("E: Pinocchio+CasADi+Jaxadi", fn_e, make_inputs, key, bs))
+            fwd_results.append(bench("E: Pinocchio+CasADi+Jaxadi", fn_e, make_inputs, key, bs, n_trials))
         except Exception:
             print(f"  E FAILED:\n{traceback.format_exc()}")
 
@@ -453,7 +452,7 @@ def main():
                 step_fn = make_si_euler_fixed(aba_fn)
                 grad_fn = make_grad_step(step_fn)
                 grad_results.append(bench(name_map.get(label, f"{label} GRAD"),
-                                          grad_fn, make_state_and_tau, key, bs))
+                                          grad_fn, make_state_and_tau, key, bs, n_trials))
             except Exception:
                 print(f"  {label} GRAD FAILED:\n{traceback.format_exc()}")
 
@@ -473,9 +472,9 @@ def main():
         fn = aba_fns["B"]
         int_res = []
         int_res.append(bench("si_euler CURRENT (2x)", jax.jit(make_si_euler_current(fn)),
-                             make_state_and_tau, key, bs))
+                             make_state_and_tau, key, bs, n_trials))
         int_res.append(bench("si_euler FIXED   (1x)", jax.jit(make_si_euler_fixed(fn)),
-                             make_state_and_tau, key, bs))
+                             make_state_and_tau, key, bs, n_trials))
         print_summary("INTEGRATOR OVERHEAD", int_res, bs)
         for K in bs:
             t2, t1 = int_res[0].batch_ms.get(K, 0), int_res[1].batch_ms.get(K, 0)
