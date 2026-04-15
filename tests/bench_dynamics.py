@@ -174,10 +174,10 @@ def build_A(js_model):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# D: MJX-JAX — mjx.forward, full Panda model WITH hand
+# B: MJX-JAX — mjx.forward, full Panda model WITH hand
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_D(mj_model):
+def build_B(mj_model):
     """
     Mujoco build
     """
@@ -207,10 +207,10 @@ def build_D(mj_model):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# E: Pinocchio + CasADi + Jaxadi  (forward pass only — too slow for grads)
+# C: Pinocchio + CasADi + Jaxadi  (forward pass only — too slow for grads)
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_E(pin_model):
+def build_C(pin_model):
     """
     CasADi-symbolic ABA compiled through Jaxadi to XLA.
     Pinocchio reads the same URDF as JaxSim; after locking the finger joints
@@ -239,65 +239,50 @@ def build_E(pin_model):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# F: ADAM-JAX — CRBA + RNEA forward dynamics
+# D: ADAM-JAX — CRBA + RNEA forward dynamics (not working yet)
 # ══════════════════════════════════════════════════════════════════════════
 
-def get_cleaned_urdf_string(urdf_path: str) -> str:
-    """Parse URDF, remove all <dynamics> tags, and return as string."""
-    tree = ET.parse(urdf_path)
-    root = tree.getroot()
-    
-    # Find and remove all <dynamics> elements from all <joint> tags
-    for joint in root.findall(".//joint"):
-        dynamics = joint.find("dynamics")
-        if dynamics is not None:
-            joint.remove(dynamics)
-    
-    # Return the modified XML as a string
-    return ET.tostring(root, encoding="unicode")
-
-def build_F(urdf_path: str, joints_name_list: list[str]):
-    """
-    ADAM (Automatic Differentiation for rigid-body dynamics Algorithm in
-    Multi-body systems) JAX backend. 
-    """
-    try:
-        from adam.jax import KinDynComputations
-        from adam import Representations
-    except ImportError as exc:
-        raise ImportError(
-            "ADAM not installed.  Add to pyproject.toml:\n"
-            "then run: pixi install"
-        ) from exc
+# def build_D(urdf_path: str, joints_name_list: list[str]):
+#     """
+#     ADAM (Automatic Differentiation for rigid-body dynamics Algorithm in
+#     Multi-body systems) JAX backend. 
+#     """
+#     try:
+#         from adam.jax import KinDynComputations
+#         from adam import Representations
+#     except ImportError as exc:
+#         raise ImportError(
+#             "ADAM not installed.  Add to pyproject.toml:\n"
+#             "then run: pixi install"
+#         ) from exc
         
-    urdf_string = get_cleaned_urdf_string(urdf_path)
-    comp = KinDynComputations(
-        urdf_string,
-        joints_name_list=joints_name_list,
-        # Fixed-base: gravity vector can be optionally specified
-        gravity=jnp.array([0, 0, -9.80665, 0, 0, 0])
-    )
+#     comp = KinDynComputations(
+#         urdf_path,
+#         joints_name_list=joints_name_list,
+#         # Fixed-base: gravity vector can be optionally specified
+#         gravity=jnp.array([0, 0, -9.80665, 0, 0, 0])
+#     )
     
-    # Set velocity representation
-    comp.set_frame_velocity_representation(Representations.MIXED_REPRESENTATION)
+#     # Set velocity representation
+#     comp.set_frame_velocity_representation(Representations.MIXED_REPRESENTATION)
 
-    # Fixed-base constants (traced once into the JIT graph)
-    H_b = jnp.eye(4)     # base homogeneous transform: identity = fixed at world
-    vB  = jnp.zeros(6)   # base spatial velocity = 0
+#     # Fixed-base constants (traced once into the JIT graph)
+#     H_b = jnp.eye(4)     # base homogeneous transform: identity = fixed at world
+#     vB  = jnp.zeros(6)   # base spatial velocity = 0
 
-    def aba(q, qd, tau):
-        qdd = comp.aba(
-            base_transform=H_b,
-            joint_positions=q,
-            base_velocity=vB,
-            joint_velocities=qd,
-            joint_torques=tau
-        )
-        # The return value is a 1D array: [base_acceleration (6), joint_accelerations (n)]
-        # For a fixed-base robot, we only need the joint part.
-        return qdd[6:]
+#     def aba(q, qd, tau):
+#         qdd = comp.aba(
+#             base_transform=H_b,
+#             joint_positions=q,
+#             base_velocity=vB,
+#             joint_velocities=qd,
+#             joint_torques=tau
+#         )
+#         # The return value is a 1D array: [base_acceleration (6), joint_accelerations (n)]
+#         # For a fixed-base robot, we only need the joint part.
+#         return qdd[6:]
 
-    return jax.jit(aba)
+#     return jax.jit(aba)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -332,9 +317,9 @@ def check_correctness(aba_fns: dict):
     against A (JaxSim ABA) as the reference.
 
     Expected residuals:
-      A vs D  < 5 rad/s²   — lumped vs. explicit hand representation
-      A vs E  < 5 rad/s²   — same reason
-      A vs F  < 5 rad/s²   — ADAM uses same URDF, same lumping
+      A vs B  < 5 rad/s²   — lumped vs. explicit hand representation
+      A vs C  < 5 rad/s²   — same reason
+      A vs D  < 5 rad/s²   — ADAM uses same URDF, same lumping
     A residual >> 10 rad/s² signals a model-parameter or unit mismatch.
     """
     print(f"\n{'='*75}")
@@ -358,7 +343,7 @@ def check_correctness(aba_fns: dict):
     # >> 10 signals a real model mismatch (wrong params or missing body).
     THRESH = 10.0
     all_ok = True
-    for label in ["D", "E", "F"]:
+    for label in ["B", "C", "D"]:
         if label not in aba_fns:
             continue
         try:
@@ -501,38 +486,38 @@ def main():
     except Exception:
         print(f"  A FAILED:\n{traceback.format_exc()}")
 
-    # D: MJX
+    # B: MJX
     if not args.skip_mjx:
         try:
             print(f"\n  Building MJX model (panda.xml, contacts disabled)...")
-            fn_d = build_D(mj_model)
-            aba_fns["D"] = fn_d
+            fn_b = build_B(mj_model)
+            aba_fns["B"] = fn_b
             fwd_results.append(bench(
-                "D: MJX-JAX forward (hand incl.)", fn_d, make_inputs, key, bs, n_trials))
+                "B: MJX-JAX forward (hand incl.)", fn_b, make_inputs, key, bs, n_trials))
         except Exception:
-            print(f"  D FAILED:\n{traceback.format_exc()}")
+            print(f"  B FAILED:\n{traceback.format_exc()}")
 
-    # E: Pinocchio+CasADi+Jaxadi (forward only)
+    # C: Pinocchio+CasADi+Jaxadi (forward only)
     if not args.skip_jaxadi:
         try:
             print(f"\n  Building Pinocchio + CasADi + Jaxadi ABA...")
-            fn_e = build_E(pin_model)
-            aba_fns["E"] = fn_e
+            fn_c = build_C(pin_model)
+            aba_fns["C"] = fn_c
             fwd_results.append(bench(
-                "E: Pinocchio+CasADi+Jaxadi", fn_e, make_inputs, key, bs, n_trials))
+                "C: Pinocchio+CasADi+Jaxadi", fn_c, make_inputs, key, bs, n_trials))
         except Exception:
-            print(f"  E FAILED:\n{traceback.format_exc()}")
+            print(f"  C FAILED:\n{traceback.format_exc()}")
 
-    # F: ADAM-JAX
+    # D: ADAM-JAX
     # if not args.skip_adam:
     #     try:
     #         print(f"\n  Building ADAM-JAX model...")
-    #         fn_f = build_F(urdf_path, pin_joint_names)
-    #         aba_fns["F"] = fn_f
+    #         fn_d = build_D(urdf_path, pin_joint_names)
+    #         aba_fns["D"] = fn_d
     #         fwd_results.append(bench(
-    #             "F: ADAM-JAX", fn_f, make_inputs, key, bs, n_trials))
+    #             "D: ADAM-JAX", fn_d, make_inputs, key, bs, n_trials))
     #     except Exception:
-    #         print(f"  F FAILED:\n{traceback.format_exc()}")
+    #         print(f"  D FAILED:\n{traceback.format_exc()}")
 
     if fwd_results:
         print_summary("FORWARD DYNAMICS — vmap(aba)(q, qd, tau)", fwd_results, bs)
@@ -543,7 +528,7 @@ def main():
 
     # ═══════════════════════════════════════════════════════
     #  PART 2: GRADIENT (Feedback-MPPI gains)
-    #  E (Pinocchio) is skipped — 30× slower, no new info.
+    #  C (Pinocchio) is skipped — 30× slower, no new info.
     # ═══════════════════════════════════════════════════════
 
     if not args.skip_grad:
@@ -554,10 +539,10 @@ def main():
 
         name_map = {
             "A": "A: JaxSim build() GRAD",
-            "D": "D: MJX-JAX GRAD",
+            "B": "B: MJX-JAX GRAD",
         }
-        # E is excluded (Pinocchio+Jaxadi grad is ~30× slower and impractical)
-        for label in ["A", "D"]:
+        # C is excluded (Pinocchio+Jaxadi grad is ~30× slower and impractical)
+        for label in ["A", "B"]:
             if label not in aba_fns:
                 continue
             try:
@@ -588,9 +573,9 @@ def main():
     hand inertia into link7 while Pinocchio/MJX keep it as a separate body.
 
   FORWARD TABLE:
-    A vs D  → JaxSim vs MJX-JAX.  D faster → MJX is the better engine.
-    A vs E  → JaxSim vs Pinocchio symbolic.  E slow → CasADi→XLA overhead.
-    A vs F  → JaxSim vs ADAM.  Reveals CRBA+solve vs ABA tradeoff.
+    A vs B  → JaxSim vs MJX-JAX.  B faster → MJX is the better engine.
+    A vs C  → JaxSim vs Pinocchio symbolic.  C slow → CasADi→XLA overhead.
+    A vs D  → JaxSim vs ADAM.  Reveals CRBA+solve vs ABA tradeoff.
 
   GRADIENT TABLE (THE number for Feedback-MPPI):
     This is what dominates controller loop time.
