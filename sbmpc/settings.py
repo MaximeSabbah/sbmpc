@@ -257,7 +257,7 @@ class MPCConfig:
     def gain_method(self, value):
         if not isinstance(value, str):
             raise ValueError("str type is expected")
-        supported_methods = ["exact", "finite_difference"]
+        supported_methods = ["exact", "finite_difference", "local_lqr"]
         if value not in supported_methods:
             raise ValueError(f"gain_method not supported. Choose from {supported_methods}")
         self._gain_method = value

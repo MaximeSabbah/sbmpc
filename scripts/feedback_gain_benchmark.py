@@ -37,6 +37,7 @@ class BenchmarkResult:
     num_parallel_computations: int
     num_control_points: int
     lambda_mpc: float
+    smoothing: str
     std_mode: str
     std_value: float
     planner_step_ms_avg: float
@@ -62,14 +63,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--name", default="case", help="Label used in the output.")
     parser.add_argument(
         "--mode",
-        choices=("ff", "fd", "exact"),
+        choices=("ff", "fd", "exact", "local_lqr"),
         default="exact",
-        help="Benchmark feedforward only, finite-difference gains, or exact gains.",
+        help=(
+            "Benchmark feedforward only, finite-difference gains, exact gains, "
+            "or the temporary local-LQR fallback."
+        ),
     )
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--samples", type=int, default=14)
     parser.add_argument("--control-points", type=int, default=4)
     parser.add_argument("--lambda-mpc", type=float, default=0.05)
+    parser.add_argument(
+        "--smoothing",
+        choices=("Spline", "none"),
+        default="Spline",
+        help="Use spline-compressed controls or direct full-horizon controls.",
+    )
     parser.add_argument(
         "--std-mode",
         choices=("scale", "absolute"),
@@ -103,7 +113,12 @@ def _parse_args() -> argparse.Namespace:
 def _build_controller(args: argparse.Namespace) -> tuple[PandaPickAndPlacePlanner, PandaPickAndPlaceController]:
     planner = PandaPickAndPlacePlanner()
     gains_enabled = args.mode != "ff"
-    gain_method = "exact" if args.mode == "exact" else "finite_difference"
+    if args.mode == "exact":
+        gain_method = "exact"
+    elif args.mode == "local_lqr":
+        gain_method = "local_lqr"
+    else:
+        gain_method = "finite_difference"
 
     config = make_panda_pick_and_place_config(
         planner,
@@ -128,6 +143,7 @@ def _build_controller(args: argparse.Namespace) -> tuple[PandaPickAndPlacePlanne
     config.MPC.gains = gains_enabled
     config.MPC.gain_method = gain_method
     config.MPC.gain_fd_scheme = args.gain_fd_scheme
+    config.MPC.smoothing = None if args.smoothing == "none" else args.smoothing
 
     controller = PandaPickAndPlaceController(
         planner=planner,
@@ -192,6 +208,12 @@ def _profile_command(
                 raw_samples_delta,
                 samples,
                 costs,
+            )
+        elif gains_obj.compute_gains and rollout_gen.gain_method == "local_lqr":
+            new_gains = rollout_gen.local_lqr_gain(
+                state,
+                reference,
+                optimal_samples,
             )
         else:
             new_gains = gains_obj.gains_computation(costs, samples, gradients)
@@ -328,7 +350,12 @@ def _benchmark(args: argparse.Namespace) -> BenchmarkResult:
     )
     clip_fraction, max_ratio_to_limit = _clip_stats(controller, planner, state)
     gains_enabled = args.mode != "ff"
-    gain_method = "exact" if args.mode == "exact" else "finite_difference"
+    if args.mode == "exact":
+        gain_method = "exact"
+    elif args.mode == "local_lqr":
+        gain_method = "local_lqr"
+    else:
+        gain_method = "finite_difference"
 
     return BenchmarkResult(
         name=args.name,
@@ -339,6 +366,7 @@ def _benchmark(args: argparse.Namespace) -> BenchmarkResult:
         num_parallel_computations=args.samples,
         num_control_points=args.control_points,
         lambda_mpc=float(args.lambda_mpc),
+        smoothing=args.smoothing,
         std_mode=args.std_mode,
         std_value=float(args.std_value),
         planner_step_ms_avg=float(np.mean(planner_times)),
