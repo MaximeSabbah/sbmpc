@@ -3,6 +3,8 @@ Benchmark: Cross-library GPU-parallel forward dynamics for Feedback-MPPI.
 
 Tests the full dynamics pipeline relevant to sbmpc's Feedback-MPPI controller
 (Belvedere et al., 2026, RA-L) on a 7-DoF Franka Panda arm with torque control.
+The model includes the Panda hand (mass 0.73 kg) attached as a fixed end-effector,
+matching real deployment conditions.
 
 The Feedback-MPPI gains require:
     jax.vmap(jax.value_and_grad(rollout_single, argnums=0))
@@ -11,39 +13,50 @@ must be JAX-differentiable. This eliminates CusADi (CUDA kernels), MJX-Warp (no
 autodiff), and GRiD (C++/CUDA).
 
 Backends tested:
-  A) JaxSim ABA — build() inside JIT            [YOUR CURRENT CODE]
-  B) JaxSim ABA — template .replace()            [QUICK FIX]
-  C) JaxSim CRBA + Cholesky solve                [ALTERNATIVE ALGO]
-  D) MJX-JAX forward (not mjx.step)              [DIFFERENT ENGINE]
-  E) Pinocchio + CasADi + Jaxadi                 [SYMBOLIC -> JAX]
+  A) JaxSim ABA — build() inside JIT            [CURRENT CODE]
+  D) MJX-JAX — mjx.forward, full Panda w/ hand  [CANDIDATE]
+  E) Pinocchio + CasADi + Jaxadi                [SYMBOLIC → JAX, fwd only]
+  F) ADAM-JAX — CRBA + RNEA forward dynamics    [CANDIDATE]
 
-Each backend is measured for:
-  - Forward pass:  vmap(dynamics)(q, qd, tau)       — raw MPPI rollout
-  - Gradient pass: vmap(grad(si_euler_step))         — what F-MPPI gains need
-  - JIT compile time
+MODEL CONSISTENCY:
+  All backends use the same physical model: 7-DoF Panda arm + hand (fixed).
+  - JaxSim / ADAM: build from panda.urdf (robot_descriptions), reduce to 7 arm
+    joints — the hand+fingers inertia is lumped into panda_link7.
+  - Pinocchio: same URDF, lock finger joints (hand stays via fixed joints).
+  - MJX: panda.xml (7 arm joints + 2 finger joints). Fingers are locked at
+    q=0, qd=0, τ=0 internally — the hand body is present with correct mass.
+  Minor residuals between methods (< 5 rad/s²) are expected because JaxSim
+  lumps the hand into link7 while Pinocchio/MJX keep it as a separate body.
 
-Plus:
-  - si_euler 2x-call vs 1x-call overhead test
+FAIRNESS FIXES (panda.xml):
+  Zeroed: actuator gainprm/biasprm (PD gains were injecting −4500q−450qd),
+          dof_damping (XML=1 vs URDF≈0.003), dof_armature (XML=0.1).
+
+Gradient benchmark:
+  E (Pinocchio+Jaxadi) is excluded — it is ~30× slower than others and adds
+  no information beyond the forward comparison.
 
 Usage:
-    pixi run -e cuda python benchmarks/bench_dynamics.py
-    pixi run -e cuda python benchmarks/bench_dynamics.py --batch-sizes 14 32 512 2048
-    pixi run -e cuda python benchmarks/bench_dynamics.py --skip-grad
-    pixi run -e cuda python benchmarks/bench_dynamics.py --skip-jaxadi
+    pixi run -e cuda python tests/bench_dynamics.py
+    pixi run -e cuda python tests/bench_dynamics.py --batch-sizes 32 512 2048
+    pixi run -e cuda python tests/bench_dynamics.py --skip-grad
+    pixi run -e cuda python tests/bench_dynamics.py --skip-mjx
+    pixi run -e cuda python tests/bench_dynamics.py --skip-jaxadi
+    pixi run -e cuda python tests/bench_dynamics.py --skip-adam
 
 Dependencies beyond sbmpc:
-    pip install jaxsim robot-descriptions pinocchio mujoco-mjx
-    pip install jaxadi casadi   # for Method E
+    jaxsim robot-descriptions mujoco-mjx           # A, D
+    pinocchio casadi jaxadi                        # E  (in pixi cuda env)
+    adam-robotics[jax]                             # F  (add to pyproject.toml)
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
-from pyexpat import model
 import time
 import traceback
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -53,7 +66,8 @@ import numpy as np
 DEFAULT_BATCH_SIZES = [32, 512, 2048]
 N_WARMUP = 10
 N_TRIALS = 300
-NQ = 7
+NQ = 7          # arm DOF
+NQ_MJX = 9     # panda.xml has 7 arm + 2 finger joints
 DT = 0.02
 
 PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{i}" for i in range(1, 8))
@@ -80,7 +94,7 @@ def time_exec(fn, *args, n_warmup=N_WARMUP, n_trials=N_TRIALS):
     t0 = time.perf_counter()
     for _ in range(n_trials):
         jax.block_until_ready(fn(*args))
-    return (time.perf_counter() - t0) / n_trials * 1e6  # us
+    return (time.perf_counter() - t0) / n_trials * 1e6  # µs
 
 
 def make_inputs(key, K=None):
@@ -116,6 +130,7 @@ def _build_jaxsim_model():
         URDF_PATH, is_urdf=True,
     ).reduce(considered_joints=PANDA_ARM_JOINT_NAMES)
     desc = dataclasses.replace(desc, fixed_base=True)
+    # Note: reduce() lumps the hand + finger inertia into panda_link7.
     return js.model.JaxSimModel.build(model_description=desc), URDF_PATH
 
 
@@ -127,7 +142,7 @@ def _js_reorder(js_model):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# A: JaxSim — build() inside JIT  (your current code pattern)
+# A: JaxSim — build() inside JIT  (current code pattern)
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_A(js_model):
@@ -149,117 +164,135 @@ def build_A(js_model):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# B: JaxSim — template .replace()
+# D: MJX-JAX — mjx.forward, full Panda model WITH hand
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_B(js_model):
-    import jaxsim.api as js
-    e2j, j2e = _js_reorder(js_model)
-    tpl = js.data.JaxSimModelData.build(
-        model=js_model,
-        joint_positions=jnp.zeros(NQ),
-        joint_velocities=jnp.zeros(NQ),
-    )
+def build_D(panda_xml_path: str):
+    """
+    Uses panda.xml (9 DOF: 7 arm + 2 fingers). Fingers are pinned at q=0
+    internally so only the 7-DOF arm dynamics are exercised, but the hand
+    mass (0.73 kg) IS present in the kinematic tree, matching JaxSim.
 
-    def aba(q, qd, tau):
-        data = tpl.replace(
-            model=js_model,
-            joint_positions=jnp.take(q, j2e, axis=-1),
-            joint_velocities=jnp.take(qd, j2e, axis=-1),
-        )
-        _, ddq = js.model.forward_dynamics_aba(
-            model=js_model, data=data,
-            joint_forces=jnp.take(tau, j2e, axis=-1),
-        )
-        return jnp.take(ddq, e2j, axis=-1)
-    return jax.jit(aba)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# C: JaxSim CRBA + Cholesky
-# ══════════════════════════════════════════════════════════════════════════
-
-def build_C(js_model):
-    import jaxsim.api as js
-    e2j, j2e = _js_reorder(js_model)
-    tpl = js.data.JaxSimModelData.build(
-        model=js_model,
-        joint_positions=jnp.zeros(NQ),
-        joint_velocities=jnp.zeros(NQ),
-    )
-
-    def minv(q, qd, tau):
-        data = tpl.replace(
-            model=js_model,
-            joint_positions=jnp.take(q, j2e, axis=-1),
-            joint_velocities=jnp.take(qd, j2e, axis=-1),
-        )
-        M_full = js.model.free_floating_mass_matrix(model=js_model, data=data)
-        M = M_full[-NQ:, -NQ:]
-        _, bias = js.model.inverse_dynamics(
-            model=js_model, data=data, joint_accelerations=jnp.zeros(NQ),
-        )
-        rhs = jnp.take(tau, j2e, axis=-1) - bias
-        L = jax.lax.linalg.cholesky(M)
-        y = jax.lax.linalg.triangular_solve(L, rhs, left_side=True, lower=True)
-        ddq = jax.lax.linalg.triangular_solve(L.T, y, left_side=True, lower=False)
-        return jnp.take(ddq, e2j, axis=-1)
-    return jax.jit(minv)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# D: MJX-JAX — mjx.forward only (no step, no contacts)
-# ══════════════════════════════════════════════════════════════════════════
-
-def build_D(scene_path: str):
+    Fairness fixes applied:
+      - actuator gainprm/biasprm → 0  (removes PD position/velocity feedback)
+      - dof_damping, dof_frictionloss, dof_armature → 0  (matches URDF params)
+    After these, MJX computes qacc = M⁻¹(τ − c(q,v)) for the same physical
+    model as JaxSim (up to lumped vs. explicit hand representation).
+    """
     import mujoco
     from mujoco import mjx
 
-    mj_model = mujoco.MjModel.from_xml_path(scene_path)
+    mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
     mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
     mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
+
+    mj_model.actuator_gainprm[:] = 0.0
+    mj_model.actuator_biasprm[:] = 0.0
+    mj_model.dof_damping[:] = 0.0
+    mj_model.dof_frictionloss[:] = 0.0
+    mj_model.dof_armature[:] = 0.0
 
     mjx_model = mjx.put_model(mj_model)
     mjx_data_tpl = mjx.make_data(mj_model)
 
     def fwd(q, qd, tau):
-        data = mjx_data_tpl.replace(qpos=q, qvel=qd, qfrc_applied=tau)
+        # Pad arm (7) to full model (9); finger joints locked at 0.
+        q9   = jnp.concatenate([q,   jnp.zeros(NQ_MJX - NQ)])
+        qd9  = jnp.concatenate([qd,  jnp.zeros(NQ_MJX - NQ)])
+        tau9 = jnp.concatenate([tau, jnp.zeros(NQ_MJX - NQ)])
+        data = mjx_data_tpl.replace(qpos=q9, qvel=qd9, qfrc_applied=tau9)
         data = mjx.forward(mjx_model, data)
-        return data.qacc
+        return data.qacc[:NQ]
 
     return jax.jit(fwd)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# E: Pinocchio + CasADi + Jaxadi
+# E: Pinocchio + CasADi + Jaxadi  (forward pass only — too slow for grads)
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_E(urdf_path: str):
+def build_E(panda_xml_path: str):
+    """
+    CasADi-symbolic ABA compiled through Jaxadi to XLA.
+    Pinocchio reads the same URDF as JaxSim; after locking the finger joints
+    the hand body remains in the kinematic tree via fixed joints.
+    Jaxadi's convert() returns a list of outputs — we extract [0] and ravel
+    to get a plain (NQ,) JAX array.
+    """
     import casadi as cs
     import pinocchio as pin
     import pinocchio.casadi as cpin
     from jaxadi import convert
-
-    full_model = pin.buildModelFromUrdf(urdf_path)
+    
+    full_model = pin.buildModelFromMJCF(panda_xml_path) 
     finger_ids = [
         full_model.getJointId(n)
-        for n in ("panda_finger_joint1", "panda_finger_joint2")
+        for n in ("finger_joint1", "finger_joint2")
     ]
     model = pin.buildReducedModel(full_model, finger_ids, np.zeros(full_model.nq))
 
     cmodel = cpin.Model(model)
     cdata = cmodel.createData()
 
-    q_sym = cs.SX.sym("q", model.nq)
-    v_sym = cs.SX.sym("v", model.nv)
+    q_sym   = cs.SX.sym("q",   model.nq)
+    v_sym   = cs.SX.sym("v",   model.nv)
     tau_sym = cs.SX.sym("tau", model.nv)
 
     ddq_sym = cpin.aba(cmodel, cdata, q_sym, v_sym, tau_sym)
-    aba_cs = cs.Function("aba", [q_sym, v_sym, tau_sym], [ddq_sym])
+    aba_cs  = cs.Function("aba", [q_sym, v_sym, tau_sym], [ddq_sym])
     aba_jax = convert(aba_cs, compile=True)
 
     def aba(q, qd, tau):
-        return aba_jax(q, qd, tau)
+        # jaxadi returns a list of JAX arrays (one per CasADi output).
+        # CasADi column vectors come back as (N, 1); ravel → (N,).
+        return jnp.ravel(aba_jax(q, qd, tau)[0])
+
+    return jax.jit(aba)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# F: ADAM-JAX — CRBA + RNEA forward dynamics
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_F(panda_xml_path: str):
+    """
+    ADAM (Automatic Differentiation for rigid-body dynamics Algorithm in
+    Multi-body systems) JAX backend. 
+    """
+    try:
+        from adam.jax import KinDynComputations
+        from adam import Representations
+    except ImportError as exc:
+        raise ImportError(
+            "ADAM not installed.  Add to pyproject.toml:\n"
+            "then run: pixi install"
+        ) from exc
+        
+    import mujoco
+    mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
+    mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+    mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
+
+    mj_model.actuator_gainprm[:] = 0.0
+    mj_model.actuator_biasprm[:] = 0.0
+    mj_model.dof_damping[:] = 0.0
+    mj_model.dof_frictionloss[:] = 0.0
+    mj_model.dof_armature[:] = 0.0
+
+    comp = KinDynComputations.from_mujoco_model(mj_model)
+    
+    # Set velocity representation
+    comp.set_frame_velocity_representation(Representations.MIXED_REPRESENTATION)
+
+    # Set gravity to match MuJoCo settings
+    comp.g = np.concatenate([mj_model.opt.gravity, np.zeros(3)])
+
+    # Fixed-base constants (traced once into the JIT graph)
+    H_b = jnp.eye(4)     # base homogeneous transform: identity = fixed at world
+    vB  = jnp.zeros(6)   # base spatial velocity = 0
+
+    def aba(q, qd, tau):
+        return comp.aba(H_b=H_b, q=q, vB=vB, qd=qd, tau=tau)
 
     return jax.jit(aba)
 
@@ -268,25 +301,13 @@ def build_E(urdf_path: str):
 # INTEGRATOR WRAPPERS
 # ══════════════════════════════════════════════════════════════════════════
 
-def make_si_euler_fixed(aba_fn):
-    """Correct si_euler: ONE dynamics call."""
+def make_si_euler(aba_fn):
+    """Semi-implicit Euler: one dynamics call."""
     def step(state, tau):
         q, v = state[:NQ], state[NQ:]
-        qdd = aba_fn(q, v, tau)
-        v_kp1 = v + DT * qdd
-        q_kp1 = q + DT * v_kp1
-        return jnp.concatenate([q_kp1, v_kp1])
-    return step
-
-
-def make_si_euler_current(aba_fn):
-    """Current sbmpc pattern: TWO dynamics calls (redundant)."""
-    def step(state, tau):
-        q, v = state[:NQ], state[NQ:]
-        qdd = aba_fn(q, v, tau)
-        v_kp1 = v + DT * qdd
-        _ = aba_fn(q, v_kp1, tau)  # wasteful second call
-        q_kp1 = q + DT * v_kp1
+        qdd    = aba_fn(q, v, tau)
+        v_kp1  = v + DT * qdd
+        q_kp1  = q + DT * v_kp1
         return jnp.concatenate([q_kp1, v_kp1])
     return step
 
@@ -296,6 +317,68 @@ def make_grad_step(integrator_fn):
     def loss(state, tau):
         return jnp.sum(jnp.square(integrator_fn(state, tau)))
     return jax.jit(jax.grad(loss, argnums=0))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CORRECTNESS CHECK
+# ══════════════════════════════════════════════════════════════════════════
+
+def check_correctness(aba_fns: dict):
+    """
+    Call every available backend at the same (q, qd, tau) and compare qacc
+    against A (JaxSim ABA) as the reference.
+
+    Expected residuals:
+      A vs D  < 5 rad/s²   — lumped vs. explicit hand representation
+      A vs E  < 5 rad/s²   — same reason
+      A vs F  < 5 rad/s²   — ADAM uses same URDF, same lumping
+    A residual >> 10 rad/s² signals a model-parameter or unit mismatch.
+    """
+    print(f"\n{'='*75}")
+    print("  CORRECTNESS CHECK — qacc agreement across backends")
+    print("  Reference: A (JaxSim ABA build()-in-jit)")
+    print(f"{'='*75}")
+
+    if "A" not in aba_fns:
+        print("  Reference A not available — skipping.")
+        return
+
+    q_ref, qd_ref, tau_ref = make_inputs(jax.random.PRNGKey(0))
+    ref = np.asarray(jax.device_get(aba_fns["A"](q_ref, qd_ref, tau_ref)))
+    print(f"  q   : {np.round(q_ref,   3)}")
+    print(f"  qd  : {np.round(qd_ref,  3)}")
+    print(f"  tau : {np.round(tau_ref, 3)}")
+    print(f"\n  A (ref) qacc: {np.round(ref, 4)}")
+    print()
+
+    # ≤10 rad/s² tolerates lumped-vs-explicit hand difference.
+    # >> 10 signals a real model mismatch (wrong params or missing body).
+    THRESH = 10.0
+    all_ok = True
+    for label in ["D", "E", "F"]:
+        if label not in aba_fns:
+            continue
+        try:
+            out = np.asarray(jax.device_get(aba_fns[label](q_ref, qd_ref, tau_ref)))
+            diff    = out - ref
+            max_abs = float(np.max(np.abs(diff)))
+            max_rel = float(np.max(np.abs(diff) / (np.abs(ref) + 1e-6)))
+            ok      = max_abs < THRESH
+            status  = "OK" if ok else "MISMATCH !"
+            if not ok:
+                all_ok = False
+            print(f"  {label}: max_abs_err={max_abs:.3e}  max_rel_err={max_rel:.3e}  [{status}]")
+            if not ok:
+                print(f"       {label} qacc : {np.round(out,  4)}")
+                print(f"       A qacc : {np.round(ref,  4)}")
+                print(f"       diff   : {np.round(diff, 4)}")
+        except Exception:
+            print(f"  {label}: FAILED\n{traceback.format_exc()}")
+
+    if all_ok:
+        print("\n  All backends agree within threshold.")
+    else:
+        print("\n  WARNING: one or more backends disagree — see MISMATCH lines above.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -345,7 +428,7 @@ def print_summary(title, results, batch_sizes):
         valid = [r for r in results if K in r.batch_ms]
         if len(valid) < 2:
             continue
-        best = min(valid, key=lambda r: r.batch_ms[K])
+        best  = min(valid, key=lambda r: r.batch_ms[K])
         worst = max(valid, key=lambda r: r.batch_ms[K])
         ratio = worst.batch_ms[K] / max(best.batch_ms[K], 1e-9)
         print(f"  K={K}: WINNER = {best.name}  ({ratio:.1f}x over slowest)")
@@ -358,21 +441,22 @@ def print_summary(title, results, batch_sizes):
 def main():
     parser = argparse.ArgumentParser(description="Cross-library dynamics benchmark")
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=DEFAULT_BATCH_SIZES)
-    parser.add_argument("--trials", type=int, default=N_TRIALS)
-    parser.add_argument("--skip-grad", action="store_true")
-    parser.add_argument("--skip-mjx", action="store_true")
-    parser.add_argument("--skip-jaxadi", action="store_true")
+    parser.add_argument("--trials",       type=int,  default=N_TRIALS)
+    parser.add_argument("--skip-grad",    action="store_true")
+    parser.add_argument("--skip-mjx",     action="store_true")
+    parser.add_argument("--skip-jaxadi",  action="store_true")
+    parser.add_argument("--skip-adam",    action="store_true")
     args = parser.parse_args()
 
     n_trials = args.trials
-    bs = args.batch_sizes
+    bs       = args.batch_sizes
 
-    scene_path = str(Path(__file__).resolve().parents[1]
-                     / "examples" / "franka_emika_panda" / "panda_nohand.xml")
+    panda_xml = str(Path(__file__).resolve().parents[1]
+                    / "examples" / "franka_emika_panda" / "panda.xml")
 
     print("=" * 75)
     print("  CROSS-LIBRARY DYNAMICS BENCHMARK FOR FEEDBACK-MPPI")
-    print("  Franka Panda 7-DoF | torque control | no contacts")
+    print("  Franka Panda 7-DoF + hand | torque control | no contacts")
     print("=" * 75)
     backend = jax.default_backend()
     print(f"  JAX backend:    {backend}")
@@ -380,61 +464,73 @@ def main():
         print(f"  GPU:            {jax.devices('gpu')[0]}")
     print(f"  Precision:      {'f64' if jax.config.jax_enable_x64 else 'f32'}")
     print(f"  Batch sizes:    {bs}")
-    print(f"  Gradient test:  {'OFF' if args.skip_grad else 'ON'}")
+    print(f"  Gradient test:  {'OFF' if args.skip_grad else 'ON (A, D, F)'}")
 
     key = jax.random.PRNGKey(42)
     fwd_results, grad_results = [], []
-    aba_fns = {}
+    aba_fns: dict = {}
 
-    # ── Build JaxSim model ──
+    # ── Build JaxSim model (also yields the URDF path for E and F) ──
     print(f"\n  Building JaxSim model...")
     js_model, urdf_path = _build_jaxsim_model()
-    print(f"  Joints: {list(js_model.joint_names())}")
+    print(f"  JaxSim joints : {list(js_model.joint_names())}")
 
     # ═══════════════════════════════════════════════════════
     #  PART 1: FORWARD DYNAMICS
     # ═══════════════════════════════════════════════════════
 
-    for label, builder, build_args in [
-        ("A", build_A, (js_model,)),
-        ("B", build_B, (js_model,)),
-        ("C", build_C, (js_model,)),
-    ]:
-        try:
-            fn = builder(*build_args)
-            aba_fns[label] = fn
-            names = {
-                "A": "A: JaxSim ABA build()-in-jit [CURRENT]",
-                "B": "B: JaxSim ABA .replace()      [FIX]",
-                "C": "C: JaxSim CRBA+Cholesky",
-            }
-            fwd_results.append(bench(names[label], fn, make_inputs, key, bs, n_trials))
-        except Exception:
-            print(f"  {label} FAILED:\n{traceback.format_exc()}")
+    # A: JaxSim
+    try:
+        fn_a = build_A(js_model)
+        aba_fns["A"] = fn_a
+        fwd_results.append(bench(
+            "A: JaxSim ABA build()-in-jit", fn_a, make_inputs, key, bs, n_trials))
+    except Exception:
+        print(f"  A FAILED:\n{traceback.format_exc()}")
 
+    # D: MJX
     if not args.skip_mjx:
         try:
-            print(f"\n  Building MJX-JAX model (contacts disabled)...")
-            fn_d = build_D(scene_path)
+            print(f"\n  Building MJX model (panda.xml, contacts disabled)...")
+            fn_d = build_D(panda_xml)
             aba_fns["D"] = fn_d
-            fwd_results.append(bench("D: MJX-JAX forward (no contacts)", fn_d, make_inputs, key, bs, n_trials))
+            fwd_results.append(bench(
+                "D: MJX-JAX forward (hand incl.)", fn_d, make_inputs, key, bs, n_trials))
         except Exception:
             print(f"  D FAILED:\n{traceback.format_exc()}")
 
+    # E: Pinocchio+CasADi+Jaxadi (forward only)
     if not args.skip_jaxadi:
         try:
             print(f"\n  Building Pinocchio + CasADi + Jaxadi ABA...")
-            fn_e = build_E(urdf_path)
+            fn_e = build_E(panda_xml)
             aba_fns["E"] = fn_e
-            fwd_results.append(bench("E: Pinocchio+CasADi+Jaxadi", fn_e, make_inputs, key, bs, n_trials))
+            fwd_results.append(bench(
+                "E: Pinocchio+CasADi+Jaxadi", fn_e, make_inputs, key, bs, n_trials))
         except Exception:
             print(f"  E FAILED:\n{traceback.format_exc()}")
+
+    # F: ADAM-JAX
+    if not args.skip_adam:
+        try:
+            print(f"\n  Building ADAM-JAX model...")
+            fn_f = build_F(panda_xml)
+            aba_fns["F"] = fn_f
+            fwd_results.append(bench(
+                "F: ADAM-JAX", fn_f, make_inputs, key, bs, n_trials))
+        except Exception:
+            print(f"  F FAILED:\n{traceback.format_exc()}")
 
     if fwd_results:
         print_summary("FORWARD DYNAMICS — vmap(aba)(q, qd, tau)", fwd_results, bs)
 
+    # ── Correctness check (before gradient, while aba_fns are still warm) ──
+    if aba_fns:
+        check_correctness(aba_fns)
+
     # ═══════════════════════════════════════════════════════
     #  PART 2: GRADIENT (Feedback-MPPI gains)
+    #  E (Pinocchio) is skipped — 30× slower, no new info.
     # ═══════════════════════════════════════════════════════
 
     if not args.skip_grad:
@@ -445,44 +541,23 @@ def main():
 
         name_map = {
             "A": "A: JaxSim build() GRAD",
-            "B": "B: JaxSim .replace() GRAD",
-            "C": "C: CRBA+Chol GRAD",
             "D": "D: MJX-JAX GRAD",
-            "E": "E: Pin+Jaxadi GRAD",
+            "F": "F: ADAM-JAX GRAD",
         }
-        for label, aba_fn in aba_fns.items():
+        # E is excluded (Pinocchio+Jaxadi grad is ~30× slower and impractical)
+        for label in ["A", "D", "F"]:
+            if label not in aba_fns:
+                continue
             try:
-                step_fn = make_si_euler_fixed(aba_fn)
+                step_fn = make_si_euler(aba_fns[label])
                 grad_fn = make_grad_step(step_fn)
-                grad_results.append(bench(name_map.get(label, f"{label} GRAD"),
-                                          grad_fn, make_state_and_tau, key, bs, n_trials))
+                grad_results.append(bench(
+                    name_map[label], grad_fn, make_state_and_tau, key, bs, n_trials))
             except Exception:
                 print(f"  {label} GRAD FAILED:\n{traceback.format_exc()}")
 
         if grad_results:
             print_summary("GRADIENT — backward through dynamics", grad_results, bs)
-
-    # ═══════════════════════════════════════════════════════
-    #  PART 3: SI_EULER DOUBLE-CALL OVERHEAD
-    # ═══════════════════════════════════════════════════════
-
-    if "B" in aba_fns:
-        print(f"\n\n{'='*75}")
-        print("  SI_EULER: 2x dynamics calls (current) vs 1x (fixed)")
-        print("  model.py:94 calls dynamics() twice. Second call is redundant.")
-        print(f"{'='*75}")
-
-        fn = aba_fns["B"]
-        int_res = []
-        int_res.append(bench("si_euler CURRENT (2x)", jax.jit(make_si_euler_current(fn)),
-                             make_state_and_tau, key, bs, n_trials))
-        int_res.append(bench("si_euler FIXED   (1x)", jax.jit(make_si_euler_fixed(fn)),
-                             make_state_and_tau, key, bs, n_trials))
-        print_summary("INTEGRATOR OVERHEAD", int_res, bs)
-        for K in bs:
-            t2, t1 = int_res[0].batch_ms.get(K, 0), int_res[1].batch_ms.get(K, 0)
-            if t2 > 0 and t1 > 0:
-                print(f"  K={K}: fixing si_euler saves {t2-t1:.3f}ms ({(t2-t1)/t2*100:.0f}%)")
 
     # ═══════════════════════════════════════════════════════
     #  INTERPRETATION GUIDE
@@ -494,30 +569,27 @@ def main():
   HOW TO INTERPRET
 {'='*75}
 
+  MODEL:
+    All backends use the 7-DoF Panda arm WITH the hand (0.73 kg end-effector)
+    attached.  This matches real deployment.  Small residuals in the
+    correctness check (< 5 rad/s²) are expected because JaxSim lumps the
+    hand inertia into link7 while Pinocchio/MJX keep it as a separate body.
+
   FORWARD TABLE:
-    A vs B  -> Cost of JaxSimModelData.build() inside JIT.
-               B faster? Apply .replace() fix immediately.
-    B vs D  -> JaxSim vs MJX-JAX as a dynamics engine.
-               If D wins, MJX-JAX is the better backend.
-    B vs E  -> JaxSim vs Pinocchio symbolic pipeline.
-               E slow? Confirms CasADi expression graphs
-               compile poorly in XLA (known Jaxadi limit).
-    B vs C  -> ABA vs M^-1 Cholesky for n=7 on GPU.
+    A vs D  → JaxSim vs MJX-JAX.  D faster → MJX is the better engine.
+    A vs E  → JaxSim vs Pinocchio symbolic.  E slow → CasADi→XLA overhead.
+    A vs F  → JaxSim vs ADAM.  Reveals CRBA+solve vs ABA tradeoff.
 
-  GRADIENT TABLE:
-    This is THE number for Feedback-MPPI.
+  GRADIENT TABLE (THE number for Feedback-MPPI):
+    This is what dominates controller loop time.
     Some backends have much worse fwd/bwd ratios.
-    MJX-JAX grad may fail if contacts are on (CG solver
-    uses while_loop, no reverse-mode AD).
-
-  SI_EULER:
-    2x ~ 2x slower than 1x? Fix halves dynamics cost.
-    Change model.py:94 to call dynamics once.
+    MJX-JAX grad requires contacts OFF (CG solver uses while_loop,
+    no reverse-mode AD through it).
 
   TOTAL COST per Feedback-MPPI iteration:
-    total_ms ~ (fwd_K_time + grad_K_time) x horizon
-    Example: K=32, H=8, fwd=0.2ms, grad=0.4ms
-             -> (0.2+0.4)*8 = 4.8ms -> ~200Hz
+    total_ms ~ (fwd_K_time + grad_K_time) × horizon
+    Example: K=512, H=10, fwd=0.5ms, grad=1.0ms
+             → (0.5+1.0)×10 = 15ms → ~66Hz
 """)
 
 

@@ -80,6 +80,7 @@ cuda-nvcc = "*"
 jaxlib = "*"
 jax = { version = ">=0.8.0", extras = ["cuda12"] }
 jaxadi = "*"
+adam-robotics = "*"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
