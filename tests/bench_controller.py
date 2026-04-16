@@ -140,18 +140,20 @@ def main():
 
         horizons = [4, 8, 12, 16]
         samples_list = [32, 256, 512, 1024]
-        control_points = 4
+        control_points = [4, 8, 12, 16]
 
         for h in horizons:
+            valid_control_points = [cp for cp in control_points if 2 <= cp <= h]
             for s in samples_list:
-                config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
-                config.MPC.horizon = h
-                config.MPC.num_parallel_computations = s
-                config.MPC.num_control_points = control_points
-                config.MPC.initial_guess = planner.nominal_torque_sequence(h, config.MPC.dt)
-                label = f"horizon={h:2d} samples={s:3d} cp={control_points}"
-                row, *_ = _run_headless(planner, objective, config, args.steps, label)
-                print(row)
+                for cp in valid_control_points:
+                    config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
+                    config.MPC.horizon = h
+                    config.MPC.num_parallel_computations = s
+                    config.MPC.num_control_points = cp
+                    config.MPC.initial_guess = planner.nominal_torque_sequence(h, config.MPC.dt)
+                    label = f"horizon={h:2d} samples={s:3d} cp={cp}"
+                    row, *_ = _run_headless(planner, objective, config, args.steps, label)
+                    print(row)
         return
 
     # Single-config benchmark
