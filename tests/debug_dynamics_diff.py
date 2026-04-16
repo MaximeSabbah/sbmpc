@@ -30,42 +30,112 @@ import jax
 import jax.numpy as jnp
 
 import jaxsim.api as js
+import jaxsim.math as jsm
 import jaxsim.parsers.rod as rodp
 from robot_descriptions.panda_description import URDF_PATH
 from robot_descriptions.panda_mj_description import MJCF_PATH
 
 import casadi as cs
 import pinocchio as pin
-import pinocchio.casadi as cpin
-from jaxadi import convert
 
 import mujoco
 from mujoco import mjx
 
 
-# ── Model builders (match bench_dynamics.py) ──────────────────────────────
+# ── Model builders ────────────────────────────────────────────────────────
+#
+# Two modes:
+#   * harmonize=True  → all three backends read the SAME URDF file (with
+#                        visuals/collisions stripped so MuJoCo can load
+#                        it without meshes).  JaxSim gravity is also set
+#                        to -9.81 (JaxSim's default is +9.81, which
+#                        flips the sign of qacc).  Expected agreement:
+#                        ~1e-10.
+#   * harmonize=False → original bench setup (URDF for A/C, MJCF for B).
+#                        Useful to see URDF-vs-MJCF model drift.
 
-def build_jaxsim():
-    desc = rodp.build_model_description(URDF_PATH, is_urdf=True)
+def _stripped_urdf(urdf_path: str) -> str:
+    import re, tempfile
+    txt = open(urdf_path).read()
+    txt = re.sub(r'<visual>.*?</visual>',      '', txt, flags=re.S)
+    txt = re.sub(r'<collision>.*?</collision>', '', txt, flags=re.S)
+    txt = re.sub(
+        r'(<robot[^>]*>)',
+        r'\1\n  <mujoco>\n'
+        r'    <compiler balanceinertia="true" discardvisual="false"/>\n'
+        r'  </mujoco>\n',
+        txt, count=1,
+    )
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='_harmonized.urdf', delete=False)
+    tmp.write(txt); tmp.close()
+    return tmp.name
+
+
+def build_jaxsim(urdf_path: str, flip_gravity: bool = True):
+    desc = rodp.build_model_description(urdf_path, is_urdf=True)
     desc = dataclasses.replace(desc, fixed_base=True)
-    return js.model.JaxSimModel.build(model_description=desc)
+    # JaxSim's default gravity is +9.81 (z-component of the gravity vector).
+    # Set it to -9.81 so gravity points DOWN, matching Pinocchio/MuJoCo.
+    g = -jsm.STANDARD_GRAVITY if flip_gravity else jsm.STANDARD_GRAVITY
+    return js.model.JaxSimModel.build(model_description=desc, gravity=g)
 
 
-def build_pinocchio():
-    return pin.buildModelFromUrdf(URDF_PATH)
+def build_pinocchio(urdf_path: str):
+    return pin.buildModelFromUrdf(urdf_path)
 
 
-def build_mujoco():
-    mj = mujoco.MjModel.from_xml_path(MJCF_PATH)
-    # Same "fairness fixes" as bench_dynamics.py
+def build_mujoco(xml_path: str):
+    mj = mujoco.MjModel.from_xml_path(xml_path)
     mj.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
     mj.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
-    mj.actuator_gainprm[:] = 0.0
-    mj.actuator_biasprm[:]  = 0.0
-    mj.dof_damping[:]       = 0.0
-    mj.dof_frictionloss[:]  = 0.0
-    mj.dof_armature[:]      = 0.0
+    if mj.nu > 0:
+        mj.actuator_gainprm[:] = 0.0
+        mj.actuator_biasprm[:] = 0.0
+    mj.dof_damping[:]      = 0.0
+    mj.dof_frictionloss[:] = 0.0
+    mj.dof_armature[:]     = 0.0
     return mj
+
+
+def apply_pin_inertias_to_mujoco(mj_model, pin_model):
+    """
+    Overwrite MuJoCo's per-body inertial parameters (mass/CoM/principal
+    inertia) with Pinocchio's values.  Used in `harmonized` mode to
+    remove the final source of disagreement between MuJoCo/MJX and
+    Pinocchio/JaxSim — MuJoCo's URDF loader computes a different merged
+    CoM for panda_link7 than Pinocchio does when the fixed-joint chain
+    link7 -> link8 -> hand is collapsed.
+
+    Assumes body frames (body_pos, body_quat) already agree between the
+    two models, which is the case for the Franka Panda URDF.
+    """
+    pin_body = {}
+    for joint_id in range(1, pin_model.njoints):
+        I = pin_model.inertias[joint_id]
+        for frame in pin_model.frames:
+            if frame.parentJoint == joint_id and frame.type == pin.BODY:
+                pin_body[frame.name] = (
+                    float(I.mass),
+                    np.array(I.lever, dtype=np.float64),
+                    np.array(I.inertia, dtype=np.float64),
+                )
+                break
+
+    for body_id in range(1, mj_model.nbody):
+        name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+        if name not in pin_body:
+            continue
+        mass, lever, I3 = pin_body[name]
+        eigvals, eigvecs = np.linalg.eigh(I3)
+        if np.linalg.det(eigvecs) < 0:
+            eigvecs[:, 0] = -eigvecs[:, 0]
+        quat = np.zeros(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quat, eigvecs.flatten())
+        mj_model.body_mass[body_id]    = mass
+        mj_model.body_ipos[body_id]    = lever
+        mj_model.body_iquat[body_id]   = quat
+        mj_model.body_inertia[body_id] = eigvals
 
 
 def make_jaxsim_fn(js_model):
@@ -315,10 +385,33 @@ def section7_finger_zeroed(fns, nq, seed=0):
 # ══════════════════════════════════════════════════════════════════════════
 
 def main():
-    print("Building models...")
-    js_model  = build_jaxsim()
-    pin_model = build_pinocchio()
-    mj_model  = build_mujoco()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--mode", choices=["harmonized", "native"], default="harmonized",
+        help="harmonized = all three backends read the same URDF "
+             "(+ JaxSim gravity sign fix).  native = URDF for JaxSim / "
+             "Pinocchio, menagerie MJCF for MuJoCo / MJX.",
+    )
+    args = ap.parse_args()
+
+    print(f"Building models  (mode = {args.mode}) ...")
+    if args.mode == "harmonized":
+        harmonized_urdf = _stripped_urdf(URDF_PATH)
+        print(f"  Harmonized URDF: {harmonized_urdf}")
+        js_model  = build_jaxsim(harmonized_urdf, flip_gravity=True)
+        pin_model = build_pinocchio(harmonized_urdf)
+        mj_model  = build_mujoco(harmonized_urdf)
+        # Patch MuJoCo's per-body inertias with Pinocchio's values so
+        # the merged-body inertias (panda_link7) match to machine
+        # precision.  Without this, MuJoCo's URDF loader and Pinocchio
+        # disagree on the CoM of panda_link7 after collapsing the
+        # fixed-joint chain link7 -> link8 -> hand.
+        apply_pin_inertias_to_mujoco(mj_model, pin_model)
+    else:
+        js_model  = build_jaxsim(URDF_PATH, flip_gravity=False)
+        pin_model = build_pinocchio(URDF_PATH)
+        mj_model  = build_mujoco(MJCF_PATH)
 
     # Sanity: we only proceed if the three models agree on DoF count.
     nq_js, nq_pin, nq_mj = (len(js_model.joint_names()),
