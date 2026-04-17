@@ -467,12 +467,12 @@ def make_panda_pregrasp_config(
     config.MPC.gains = gains
     if gains:
         config.MPC.horizon = 8
-        config.MPC.num_parallel_computations = 1024
+        config.MPC.num_parallel_computations = 2048
         config.MPC.num_control_points = 8   # cp=horizon: no spline artifacts in FD gains
         config.MPC.gain_method = "finite_difference"
         config.MPC.gain_fd_scheme = "forward"
         config.MPC.gain_fd_epsilon = 1e-3
-        config.MPC.gain_fd_num_samples = 128  # FD uses 128 samples; MPPI uses 1024
+        config.MPC.gain_fd_num_samples = 256  # FD uses 256 samples; MPPI uses 2048
     else:
         config.MPC.horizon = 16
         config.MPC.num_parallel_computations = 32
