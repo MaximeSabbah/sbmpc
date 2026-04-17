@@ -1,7 +1,8 @@
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
-from sbmpc import PandaPickAndPlaceController, TaskPose
+from sbmpc import PandaPickAndPlaceController, PandaPregraspController, TaskPose
+from sbmpc.panda_pregrasp import PandaPregraspPlanner, make_panda_pregrasp_config
 from sbmpc.panda_pick_and_place import (
     Phase,
     PandaPickAndPlacePlanner,
@@ -16,6 +17,17 @@ def build_controller(gains: bool) -> PandaPickAndPlaceController:
     config.MPC.num_parallel_computations = 8
     config.MPC.num_control_points = 2
     return PandaPickAndPlaceController(planner=planner, config=config)
+
+
+def build_pregrasp_controller(gains: bool) -> PandaPregraspController:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=gains)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    if gains:
+        config.MPC.gain_fd_num_samples = 8
+    return PandaPregraspController(planner=planner, config=config)
 
 
 def test_panda_pick_and_place_controller_step_returns_ros_ready_shapes() -> None:
@@ -107,5 +119,79 @@ def test_panda_pick_and_place_controller_resets_solution_guess_on_phase_change()
     v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
     controller.step(q, v, Phase.PREGRASP)
     controller.step(q, v, Phase.TRANSPORT)
+
+    assert call_count == 2
+
+
+def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
+    controller = build_pregrasp_controller(gains=True)
+
+    output = controller.step(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+    )
+
+    assert output.tau_ff.shape == (controller.planner.nu,)
+    assert output.K.shape == (controller.planner.nu, controller.planner.nx)
+    assert output.phase == "PREGRASP"
+    assert output.next_phase == "PREGRASP"
+    assert output.gripper_command.action == "open"
+    assert np.isclose(output.gripper_command.width, controller.GRIPPER_OPEN)
+    assert output.diagnostics.goal_position.shape == (3,)
+    assert output.diagnostics.object_error is None
+    assert np.isfinite(output.diagnostics.planning_time_ms)
+    assert np.isfinite(output.diagnostics.running_cost)
+    assert np.isfinite(output.diagnostics.gain_norm)
+    assert np.isfinite(output.diagnostics.torque_norm)
+    assert np.all(np.isfinite(output.tau_ff))
+    assert np.all(np.isfinite(output.K))
+
+
+def test_panda_pregrasp_controller_reuses_solution_guess() -> None:
+    controller = build_pregrasp_controller(gains=True)
+    call_count = 0
+    original = controller.planner.nominal_torque_sequence_from_state
+
+    def wrapped(state, horizon, dt):
+        nonlocal call_count
+        call_count += 1
+        return original(state, horizon, dt)
+
+    controller.planner.nominal_torque_sequence_from_state = wrapped
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    controller.step(q, v)
+    controller.step(q, v)
+
+    assert call_count == 1
+
+
+def test_panda_pregrasp_controller_can_reseed_every_step() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    config.MPC.gain_fd_num_samples = 8
+    controller = PandaPregraspController(
+        planner=planner,
+        config=config,
+        reseed_every_step=True,
+    )
+    call_count = 0
+    original = controller.planner.nominal_torque_sequence_from_state
+
+    def wrapped(state, horizon, dt):
+        nonlocal call_count
+        call_count += 1
+        return original(state, horizon, dt)
+
+    controller.planner.nominal_torque_sequence_from_state = wrapped
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    controller.step(q, v)
+    controller.step(q, v)
 
     assert call_count == 2

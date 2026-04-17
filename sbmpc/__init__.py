@@ -14,6 +14,7 @@ from sbmpc.panda_pick_and_place import (
 )
 from sbmpc.planner_api import (
     GripperCommand,
+    PandaPregraspController,
     PandaPickAndPlaceController,
     PlannerDiagnostics,
     PlannerOutput,
