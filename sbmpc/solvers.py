@@ -85,6 +85,7 @@ class RolloutGenerator():
         self.compute_exact_gains = self.compute_gains and self.gain_method == "exact"
         self.gain_fd_epsilon = jnp.asarray(config.MPC.gain_fd_epsilon, dtype=self.dtype_general)
         self.gain_fd_scheme = config.MPC.gain_fd_scheme
+        self.gain_fd_num_samples = config.MPC.gain_fd_num_samples  # None = use all samples
         
         # Covariance of the input action
         # self.sigma_mppi = jnp.diag(config.MPC.std_dev_mppi**2)
@@ -462,14 +463,27 @@ class Controller:
         if reference.ndim == 1:
             reference = jnp.tile(reference, (rollout_gen.horizon + 1, 1))
 
+        # Subsample for FD if gain_fd_num_samples is set — reduces nx×N_fd rollouts
+        n_fd = rollout_gen.gain_fd_num_samples
+        if n_fd is not None and n_fd < control_vars_all.shape[0]:
+            control_vars_fd = control_vars_all[:n_fd]
+            optimal_fd = optimal_samples[:n_fd]
+            delta_fd = samples_delta_clipped[:n_fd]
+            costs_fd = nominal_costs[:n_fd]
+        else:
+            control_vars_fd = control_vars_all
+            optimal_fd = optimal_samples
+            delta_fd = samples_delta_clipped
+            costs_fd = nominal_costs
+
         nominal_action = self.sampler.compute_action(
-            optimal_samples, samples_delta_clipped, nominal_costs
+            optimal_fd, delta_fd, costs_fd
         )[0]
 
         def first_action_for_state(perturbed_state):
-            costs, _ = rollout_gen.rollout_all(perturbed_state, reference, control_vars_all)
+            costs, _ = rollout_gen.rollout_all(perturbed_state, reference, control_vars_fd)
             return self.sampler.compute_action(
-                optimal_samples, samples_delta_clipped, costs
+                optimal_fd, delta_fd, costs
             )[0]
 
         plus_actions = jax.vmap(first_action_for_state)(state + eps * eye)

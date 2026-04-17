@@ -466,12 +466,13 @@ def make_panda_pregrasp_config(
     config.MPC.smoothing = "Spline"
     config.MPC.gains = gains
     if gains:
-        # Full-state finite-difference gains need a shorter rollout budget to keep
-        # the end-to-end controller near 50 Hz. The no-gain behavior keeps the
-        # larger planning budget used for behavior checks.
         config.MPC.horizon = 8
-        config.MPC.num_parallel_computations = 14
-        config.MPC.num_control_points = 4
+        config.MPC.num_parallel_computations = 1024
+        config.MPC.num_control_points = 8   # cp=horizon: no spline artifacts in FD gains
+        config.MPC.gain_method = "finite_difference"
+        config.MPC.gain_fd_scheme = "forward"
+        config.MPC.gain_fd_epsilon = 1e-3
+        config.MPC.gain_fd_num_samples = 128  # FD uses 128 samples; MPPI uses 1024
     else:
         config.MPC.horizon = 16
         config.MPC.num_parallel_computations = 32
@@ -480,9 +481,6 @@ def make_panda_pregrasp_config(
         config.MPC.horizon,
         config.MPC.dt,
     )
-    config.MPC.gain_method = "finite_difference"
-    config.MPC.gain_fd_scheme = "forward"
-    config.MPC.gain_fd_epsilon = 1e-3
 
     config.solver_dynamics = DynamicsModel.CUSTOM
     config.sim_dynamics = DynamicsModel.CUSTOM

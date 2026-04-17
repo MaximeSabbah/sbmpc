@@ -150,6 +150,7 @@ class MPCConfig:
         self._gain_method = "exact"
         self._gain_fd_epsilon = 1e-3
         self._gain_fd_scheme = "central"
+        self._gain_fd_num_samples = None
         self._sensitivity = False
         self._smoothing = None
         self._augmented_reference = None
@@ -286,6 +287,16 @@ class MPCConfig:
         if value not in supported_schemes:
             raise ValueError(f"gain_fd_scheme not supported. Choose from {supported_schemes}")
         self._gain_fd_scheme = value
+
+    @property
+    def gain_fd_num_samples(self):
+        return self._gain_fd_num_samples
+
+    @gain_fd_num_samples.setter
+    def gain_fd_num_samples(self, value):
+        if value is not None and (not isinstance(value, int) or value < 1):
+            raise ValueError("gain_fd_num_samples must be a positive int or None")
+        self._gain_fd_num_samples = value
 
     @property
     def sensitivity(self):

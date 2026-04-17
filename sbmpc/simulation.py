@@ -234,21 +234,15 @@ class Simulation(Simulator):
 
     def update(self):
         # Compute the optimal input sequence
-        time_start = time.time_ns()
         state_vec = self.current_state_vec()
         if self.verbose:
             print("iteration: ", self.iter)
             print("current state: ", state_vec)
 
-        planner = getattr(self, "planner", None)
-        nominal_seed = getattr(planner, "nominal_torque_sequence_from_state", None)
-        if callable(nominal_seed):
-            self.controller.sampler.optimal_samples = nominal_seed(
-                state_vec,
-                self.rollout_gen.horizon,
-                float(self.rollout_gen.dt),
-            )
+        if getattr(self, "warm_start_fn", None) is not None:
+            self.controller.sampler.optimal_samples = self.warm_start_fn(state_vec)
 
+        time_start = time.time_ns()
         input_sequence = self.controller.command(state_vec, self.const_reference, num_steps=1).block_until_ready()
         ctrl = input_sequence[0, :].block_until_ready()
         self.last_command_time_ms = 1e-6 * (time.time_ns() - time_start)
