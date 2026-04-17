@@ -74,8 +74,18 @@ class RolloutGenerator():
 
         # Sampling time for discrete time model
         self.dt = jnp.asarray(config.MPC.dt, dtype=self.dtype_general)
+        # Variable-dt schedule: expand [(n_steps, multiplier), ...] into per-step array
+        schedule = config.MPC.dt_schedule
+        if schedule is not None:
+            dt_list = []
+            for n_steps, mult in schedule:
+                dt_list.extend([float(config.MPC.dt) * mult] * n_steps)
+            self.dt_array = jnp.array(dt_list, dtype=self.dtype_general)
+            self.horizon = len(dt_list)
+        else:
+            self.horizon = config.MPC.horizon
+            self.dt_array = jnp.full(self.horizon, config.MPC.dt, dtype=self.dtype_general)
         # Control horizon of the MPC (steps)
-        self.horizon = config.MPC.horizon
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel 
         # check if we need to move it
         self.num_parallel_computations = config.MPC.num_parallel_computations
@@ -182,17 +192,18 @@ class RolloutGenerator():
         
         def cost_and_state_rollout(idx, cost_and_state):
             cost, curr_state = cost_and_state
-            cost += self.dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
-            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], self.dt)
-            
+            step_dt = self.dt_array[idx]
+            cost += step_dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
+            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], step_dt)
+
             return cost, next_state
 
         cost, final_state = jax.lax.fori_loop(0, self.horizon, cost_and_state_rollout, (cost, curr_state))
 
-        cost += self.dt*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
+        cost += self.dt_array[-1]*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
-    
+
 
     def rollout_single_with_sensitivity(self, initial_state, reference, control_variables):
         cost = jnp.asarray(0.0, dtype=self.dtype_general)
@@ -200,17 +211,18 @@ class RolloutGenerator():
         curr_state_sens = jnp.zeros((self.model.nx, self.model.np))
 
         control_variables = self.interpolate_control(control_variables)
-        
+
         def cost_and_state_rollout(idx, cost_and_state):
             cost, curr_state = cost_and_state
-            cost += self.dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
-            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], self.dt)
-            
+            step_dt = self.dt_array[idx]
+            cost += step_dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
+            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], step_dt)
+
             return cost, next_state
 
         cost, final_state = jax.lax.fori_loop(0, self.horizon, cost_and_state_rollout, (cost, curr_state))
 
-        cost += self.dt*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
+        cost += self.dt_array[-1]*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
 

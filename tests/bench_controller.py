@@ -285,6 +285,7 @@ def main():
     if args.visual:
         config = make_panda_pregrasp_config(planner, visualize=True, gains=args.gains)
         if args.horizon is not None:
+            config.MPC.dt_schedule = None
             config.MPC.horizon = args.horizon
         if args.samples is not None:
             config.MPC.num_parallel_computations = args.samples
@@ -319,6 +320,7 @@ def main():
             for s in samples_list:
                 for cp in valid_cp:
                     config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
+                    config.MPC.dt_schedule = None
                     config.MPC.horizon = h
                     config.MPC.num_parallel_computations = s
                     config.MPC.num_control_points = cp
@@ -344,6 +346,7 @@ def main():
     # ── Single-config benchmark ──────────────────────────────────────────────
     config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
     if args.horizon is not None:
+        config.MPC.dt_schedule = None
         config.MPC.horizon = args.horizon
     if args.samples is not None:
         config.MPC.num_parallel_computations = args.samples
@@ -364,7 +367,10 @@ def main():
     # Gains overhead: compare to same config with gains disabled
     if args.gains:
         config_ng = make_panda_pregrasp_config(planner, visualize=False, gains=False)
-        config_ng.MPC.horizon = config.MPC.horizon
+        if config.MPC.dt_schedule is not None:
+            config_ng.MPC.dt_schedule = config.MPC.dt_schedule
+        else:
+            config_ng.MPC.horizon = config.MPC.horizon
         config_ng.MPC.num_parallel_computations = config.MPC.num_parallel_computations
         config_ng.MPC.num_control_points = config.MPC.num_control_points
         config_ng.MPC.initial_guess = planner.nominal_torque_sequence(

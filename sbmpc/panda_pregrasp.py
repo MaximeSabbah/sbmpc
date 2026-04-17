@@ -466,7 +466,7 @@ def make_panda_pregrasp_config(
     config.MPC.smoothing = "Spline"
     config.MPC.gains = gains
     if gains:
-        config.MPC.horizon = 8
+        config.MPC.dt_schedule = [(4, 1), (4, 4)]  # 4×0.02s + 4×0.08s = 0.40s look-ahead, h=8
         config.MPC.num_parallel_computations = 2048
         config.MPC.num_control_points = 8   # cp=horizon: no spline artifacts in FD gains
         config.MPC.gain_method = "finite_difference"
@@ -474,7 +474,7 @@ def make_panda_pregrasp_config(
         config.MPC.gain_fd_epsilon = 1e-3
         config.MPC.gain_fd_num_samples = 256  # FD uses 256 samples; MPPI uses 2048
     else:
-        config.MPC.horizon = 16
+        config.MPC.dt_schedule = [(8, 1), (8, 4)]  # 8×0.02s + 8×0.08s = 0.80s look-ahead, h=16
         config.MPC.num_parallel_computations = 32
         config.MPC.num_control_points = 4
     config.MPC.initial_guess = planner.nominal_torque_sequence(
