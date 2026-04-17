@@ -85,6 +85,13 @@ class RolloutGenerator():
         else:
             self.horizon = config.MPC.horizon
             self.dt_array = jnp.full(self.horizon, config.MPC.dt, dtype=self.dtype_general)
+        self.rollout_time_grid = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=self.dtype_general),
+                jnp.cumsum(self.dt_array[:-1]),
+            ],
+            axis=0,
+        )
         # Control horizon of the MPC (steps)
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel 
         # check if we need to move it
@@ -110,13 +117,11 @@ class RolloutGenerator():
         self.control_spline_indices = jnp.round(
             jnp.linspace(0, self.horizon - 1, self.num_control_points)
         ).astype(jnp.int32)
-        self.control_spline_grid = self.control_spline_indices.astype(
-            self.dtype_general
-        )
+        self.control_spline_grid = self.rollout_time_grid[self.control_spline_indices]
         if self.config.MPC.smoothing == "Spline":
             self.control_interp_matrix = cubic_spline_matrix(
                 self.control_spline_grid,
-                jnp.arange(self.horizon, dtype=self.dtype_general),
+                self.rollout_time_grid,
             )
         else:
             self.control_interp_matrix = None
@@ -138,8 +143,8 @@ class RolloutGenerator():
 
         self._dynamics_jacobian = jax.jit(
             jax.jacfwd(
-                lambda state, inputs: self.model.integrate_rollout_single(
-                    state, inputs, self.dt
+                lambda state, inputs, step_dt: self.model.integrate_rollout_single(
+                    state, inputs, step_dt
                 ),
                 argnums=(0, 1),
             )
@@ -293,13 +298,18 @@ class RolloutGenerator():
     def nominal_rollout_states(self, initial_state, control_variables):
         control_variables = self.interpolate_control(control_variables)
 
-        def rollout_step(curr_state, curr_input):
+        def rollout_step(curr_state, rollout_input):
+            curr_input, step_dt = rollout_input
             next_state = self.model.integrate_rollout_single(
-                curr_state, curr_input, self.dt
+                curr_state, curr_input, step_dt
             )
             return next_state, next_state
 
-        _, next_states = jax.lax.scan(rollout_step, initial_state, control_variables)
+        _, next_states = jax.lax.scan(
+            rollout_step,
+            initial_state,
+            (control_variables, self.dt_array),
+        )
         states = jnp.concatenate([initial_state[jnp.newaxis, :], next_states], axis=0)
         return states, control_variables
 
@@ -327,8 +337,9 @@ class RolloutGenerator():
             state_t = jnp.asarray(states[idx], dtype=self.dtype_general)
             input_t = jnp.asarray(control_sequence[idx], dtype=self.dtype_general)
             reference_t = jnp.asarray(reference[idx], dtype=self.dtype_general)
+            step_dt = jnp.asarray(self.dt_array[idx], dtype=self.dtype_general)
 
-            a_t, b_t = self._dynamics_jacobian(state_t, input_t)
+            a_t, b_t = self._dynamics_jacobian(state_t, input_t, step_dt)
             dynamics_jacobians.append(
                 (
                     np.asarray(jax.block_until_ready(a_t), dtype=np.float64),

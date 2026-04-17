@@ -114,6 +114,33 @@ class PandaPregraspPlanner:
         )
         self.reference_vec = self.reference.as_vector()
 
+    @staticmethod
+    def step_durations(
+        horizon: int,
+        dt: float | jax.Array,
+        dt_schedule: list[tuple[int, float]] | None = None,
+    ) -> jax.Array:
+        """Return the per-step rollout durations for scalar- or schedule-based MPC."""
+        if dt_schedule is not None:
+            dt_list: list[float] = []
+            base_dt = float(dt)
+            for n_steps, multiplier in dt_schedule:
+                dt_list.extend([base_dt * float(multiplier)] * int(n_steps))
+            if len(dt_list) != horizon:
+                raise ValueError(
+                    f"dt_schedule expands to {len(dt_list)} steps, expected {horizon}."
+                )
+            return jnp.asarray(dt_list, dtype=jnp.float32)
+
+        dt_array = jnp.asarray(dt, dtype=jnp.float32)
+        if dt_array.ndim == 0:
+            return jnp.full((horizon,), dt_array, dtype=jnp.float32)
+        if dt_array.shape != (horizon,):
+            raise ValueError(
+                f"dt must be a scalar or have shape ({horizon},), got {dt_array.shape}."
+            )
+        return dt_array.astype(jnp.float32)
+
     def _load_mujoco_defaults(self) -> tuple[jax.Array, jax.Array, jax.Array, float]:
         mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
         key_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -258,15 +285,21 @@ class PandaPregraspPlanner:
         v_start: jax.Array,
         q_goal: jax.Array,
         horizon: int,
-        dt: float,
+        dt: float | jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Cubic joint trajectory with current velocity and zero terminal velocity."""
         q_start = jnp.asarray(q_start, dtype=jnp.float32)
         v_start = jnp.asarray(v_start, dtype=jnp.float32)
         q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
-        dt = jnp.asarray(dt, dtype=jnp.float32)
-        t_final = jnp.maximum(jnp.asarray((horizon - 1), dtype=jnp.float32) * dt, 1e-6)
-        time = (jnp.arange(horizon, dtype=jnp.float32) * dt)[:, jnp.newaxis]
+        dt_array = self.step_durations(horizon, dt)
+        time = jnp.concatenate(
+            [
+                jnp.zeros((1,), dtype=jnp.float32),
+                jnp.cumsum(dt_array[:-1]),
+            ],
+            axis=0,
+        )[:, jnp.newaxis]
+        t_final = jnp.maximum(time[-1, 0], 1e-6)
 
         v_goal = jnp.zeros_like(v_start)
         delta_q = q_goal - q_start
@@ -281,7 +314,7 @@ class PandaPregraspPlanner:
         return q.astype(jnp.float32), v.astype(jnp.float32), ddq.astype(jnp.float32)
 
     def nominal_torque_sequence_from_state(
-        self, state: jax.Array, horizon: int, dt: float
+        self, state: jax.Array, horizon: int, dt: float | jax.Array
     ) -> jax.Array:
         """Receding inverse-dynamics seed from the current arm state to PREGRASP."""
         return self.nominal_torque_sequence_to_goal(state, self.goal_q, horizon, dt)
@@ -291,7 +324,7 @@ class PandaPregraspPlanner:
         state: jax.Array,
         goal_q: jax.Array,
         horizon: int,
-        dt: float,
+        dt: float | jax.Array,
     ) -> jax.Array:
         """Receding inverse-dynamics seed from the current arm state to a goal pose."""
         state = jnp.asarray(state, dtype=jnp.float32)
@@ -312,7 +345,9 @@ class PandaPregraspPlanner:
         tau = jnp.asarray(tau, dtype=jnp.float32)
         return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(jnp.float32)
 
-    def nominal_torque_sequence(self, horizon: int, dt: float) -> jax.Array:
+    def nominal_torque_sequence(
+        self, horizon: int, dt: float | jax.Array
+    ) -> jax.Array:
         """Smooth inverse-dynamics seed from home to the PREGRASP IK pose."""
         state = jnp.concatenate(
             [self.home_q, jnp.zeros(self.nv, dtype=jnp.float32)],
@@ -466,20 +501,24 @@ def make_panda_pregrasp_config(
     config.MPC.smoothing = "Spline"
     config.MPC.gains = gains
     if gains:
-        config.MPC.dt_schedule = [(4, 1), (4, 4)]  # 4×0.02s + 4×0.08s = 0.40s look-ahead, h=8
-        config.MPC.num_parallel_computations = 2048
-        config.MPC.num_control_points = 8   # cp=horizon: no spline artifacts in FD gains
+        config.MPC.horizon = 8
+        config.MPC.num_parallel_computations = 1024
+        config.MPC.num_control_points = 8
         config.MPC.gain_method = "finite_difference"
         config.MPC.gain_fd_scheme = "forward"
         config.MPC.gain_fd_epsilon = 1e-3
-        config.MPC.gain_fd_num_samples = 256  # FD uses 256 samples; MPPI uses 2048
+        config.MPC.gain_fd_num_samples = 256
     else:
-        config.MPC.dt_schedule = [(8, 1), (8, 4)]  # 8×0.02s + 8×0.08s = 0.80s look-ahead, h=16
+        config.MPC.horizon = 16
         config.MPC.num_parallel_computations = 32
         config.MPC.num_control_points = 4
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
-        config.MPC.dt,
+        planner.step_durations(
+            config.MPC.horizon,
+            config.MPC.dt,
+            config.MPC.dt_schedule,
+        ),
     )
 
     config.solver_dynamics = DynamicsModel.CUSTOM

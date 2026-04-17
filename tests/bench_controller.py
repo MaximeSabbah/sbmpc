@@ -50,16 +50,51 @@ N_TRIALS = 100
 N_QUALITY = 60   # simulation steps for convergence / gain-stability check
 
 
-def _block_command(controller, state, ref):
+def _seed_dt_argument(planner, config):
+    return planner.step_durations(
+        config.MPC.horizon,
+        config.MPC.dt,
+        config.MPC.dt_schedule,
+    )
+
+
+def _reset_initial_guess(planner, config):
+    config.MPC.initial_guess = planner.nominal_torque_sequence(
+        config.MPC.horizon,
+        _seed_dt_argument(planner, config),
+    )
+
+
+def _block_command(controller, state, ref, *, step_idx=0, gain_update_freq=1):
     """Run one command step and block until all GPU work is done."""
-    result = controller.command(state, ref, num_steps=1)
-    jax.block_until_ready(result)
-    if controller.gains_obj.compute_gains:
-        jax.block_until_ready(controller.gains_obj.cur_gains)
+    skip_gains = (
+        gain_update_freq > 1
+        and (step_idx % gain_update_freq != 0)
+        and controller.gains_obj.compute_gains
+    )
+    if skip_gains:
+        saved_gains = controller.gains_obj.cur_gains
+        controller.gains_obj.compute_gains = False
+    try:
+        result = controller.command(state, ref, num_steps=1)
+        jax.block_until_ready(result)
+        if controller.gains_obj.compute_gains:
+            jax.block_until_ready(controller.gains_obj.cur_gains)
+    finally:
+        if skip_gains:
+            controller.gains_obj.compute_gains = True
+            controller.gains_obj.cur_gains = saved_gains
     return result
 
 
-def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
+def _run_headless(
+    planner,
+    objective,
+    config,
+    n_trials=N_TRIALS,
+    label="",
+    gain_update_freq=1,
+):
     """
     Timing benchmark: controller.command() on a fixed state.
     Mimics bench_dynamics.py: JIT time + average over n_trials blocked calls.
@@ -77,15 +112,33 @@ def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
 
     # build_all already fired one warm-up; measure remaining JIT/XLA work.
     t_jit = time.perf_counter()
-    _block_command(sim.controller, state, ref)
+    _block_command(
+        sim.controller,
+        state,
+        ref,
+        step_idx=0,
+        gain_update_freq=gain_update_freq,
+    )
     jit_ms = (time.perf_counter() - t_jit) * 1000.0
 
-    for _ in range(N_WARMUP - 1):
-        _block_command(sim.controller, state, ref)
+    for step_idx in range(1, N_WARMUP):
+        _block_command(
+            sim.controller,
+            state,
+            ref,
+            step_idx=step_idx,
+            gain_update_freq=gain_update_freq,
+        )
 
     t0 = time.perf_counter()
-    for _ in range(n_trials):
-        _block_command(sim.controller, state, ref)
+    for step_idx in range(N_WARMUP, N_WARMUP + n_trials):
+        _block_command(
+            sim.controller,
+            state,
+            ref,
+            step_idx=step_idx,
+            gain_update_freq=gain_update_freq,
+        )
     mean_ms = (time.perf_counter() - t0) / n_trials * 1000.0
 
     ok = mean_ms < TARGET_MS
@@ -98,7 +151,7 @@ def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
     return row, jit_ms, mean_ms, ok
 
 
-def _run_quality(planner, objective, config, n_steps=N_QUALITY):
+def _run_quality(planner, objective, config, n_steps=N_QUALITY, gain_update_freq=1):
     """
     Quality + gain-stability check with real state evolution.
 
@@ -113,8 +166,11 @@ def _run_quality(planner, objective, config, n_steps=N_QUALITY):
         obstacles=False,
     )
     sim.warm_start_fn = lambda state: planner.nominal_torque_sequence_from_state(
-        state, config.MPC.horizon, float(config.MPC.dt)
+        state,
+        config.MPC.horizon,
+        _seed_dt_argument(planner, config),
     )
+    sim.gain_update_freq = gain_update_freq
 
     errors = []
     gain_norms = []
@@ -226,7 +282,7 @@ def _is_viable(timing_ok, q_result, config):
     return True
 
 
-def run_visual(planner, objective, config):
+def run_visual(planner, objective, config, *, gain_update_freq=1):
     """Open MuJoCo viewer and run until window closes."""
     sim = build_all(
         config,
@@ -236,8 +292,11 @@ def run_visual(planner, objective, config):
         obstacles=False,
     )
     sim.warm_start_fn = lambda state: planner.nominal_torque_sequence_from_state(
-        state, config.MPC.horizon, float(config.MPC.dt)
+        state,
+        config.MPC.horizon,
+        _seed_dt_argument(planner, config),
     )
+    sim.gain_update_freq = gain_update_freq
 
     def post_update(s):
         state = s.current_state_vec()
@@ -259,7 +318,9 @@ def run_visual(planner, objective, config):
     print(f"\nJAX backend: {jax.default_backend()}, devices: {jax.devices()}")
     print(
         f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
-        f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}"
+        f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
+        f"fd={config.MPC.gain_fd_num_samples}  gf={gain_update_freq}  "
+        f"dt_schedule={config.MPC.dt_schedule}"
     )
     sim.simulate()
 
@@ -274,16 +335,26 @@ def main():
     parser.add_argument("--steps", type=int, default=N_TRIALS, help="Timing trials per config")
     parser.add_argument("--quality-steps", type=int, default=N_QUALITY,
                         help="Simulation steps for quality check")
+    parser.add_argument("--disable-dt-schedule", action="store_true",
+                        help="Force a constant-dt rollout even if the config defines a dt_schedule.")
+    parser.add_argument("--gain-fd-samples", type=int, default=None,
+                        help="Override MPC.gain_fd_num_samples for finite-difference gains.")
+    parser.add_argument("--gain-update-freq", type=int, default=1,
+                        help="Only recompute gains every N control cycles when timing/quality benchmarking.")
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--samples", type=int, default=None)
     parser.add_argument("--control-points", type=int, default=None)
     args = parser.parse_args()
+    if args.gain_update_freq <= 0:
+        raise ValueError("--gain-update-freq must be strictly positive.")
 
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner)
 
     if args.visual:
         config = make_panda_pregrasp_config(planner, visualize=True, gains=args.gains)
+        if args.disable_dt_schedule:
+            config.MPC.dt_schedule = None
         if args.horizon is not None:
             config.MPC.dt_schedule = None
             config.MPC.horizon = args.horizon
@@ -291,11 +362,16 @@ def main():
             config.MPC.num_parallel_computations = args.samples
         if args.control_points is not None:
             config.MPC.num_control_points = args.control_points
-        if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
-            config.MPC.initial_guess = planner.nominal_torque_sequence(
-                config.MPC.horizon, config.MPC.dt
-            )
-        run_visual(planner, objective, config)
+        if args.gain_fd_samples is not None:
+            config.MPC.gain_fd_num_samples = args.gain_fd_samples
+        if any(v is not None for v in (args.horizon, args.samples, args.control_points)) or args.disable_dt_schedule:
+            _reset_initial_guess(planner, config)
+        run_visual(
+            planner,
+            objective,
+            config,
+            gain_update_freq=args.gain_update_freq,
+        )
         return
 
     print(f"\nJAX backend: {jax.default_backend()},  devices: {jax.devices()}")
@@ -324,14 +400,30 @@ def main():
                     config.MPC.horizon = h
                     config.MPC.num_parallel_computations = s
                     config.MPC.num_control_points = cp
-                    config.MPC.initial_guess = planner.nominal_torque_sequence(h, config.MPC.dt)
-                    label = f"h={h:2d} n={s:4d} cp={cp}"
+                    if args.gain_fd_samples is not None:
+                        config.MPC.gain_fd_num_samples = args.gain_fd_samples
+                    _reset_initial_guess(planner, config)
+                    label = (
+                        f"h={h:2d} n={s:4d} cp={cp} "
+                        f"fd={config.MPC.gain_fd_num_samples} gf={args.gain_update_freq}"
+                    )
                     t_row, _, mean_ms, t_ok = _run_headless(
-                        planner, objective, config, args.steps, label
+                        planner,
+                        objective,
+                        config,
+                        args.steps,
+                        label,
+                        gain_update_freq=args.gain_update_freq,
                     )
                     print(t_row)
                     if run_qual:
-                        q = _run_quality(planner, objective, config, args.quality_steps)
+                        q = _run_quality(
+                            planner,
+                            objective,
+                            config,
+                            args.quality_steps,
+                            gain_update_freq=args.gain_update_freq,
+                        )
                         print(_quality_row(q, config))
                         if _is_viable(t_ok, q, config):
                             viable.append((h, s, cp, mean_ms))
@@ -345,6 +437,8 @@ def main():
 
     # ── Single-config benchmark ──────────────────────────────────────────────
     config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
+    if args.disable_dt_schedule:
+        config.MPC.dt_schedule = None
     if args.horizon is not None:
         config.MPC.dt_schedule = None
         config.MPC.horizon = args.horizon
@@ -352,16 +446,24 @@ def main():
         config.MPC.num_parallel_computations = args.samples
     if args.control_points is not None:
         config.MPC.num_control_points = args.control_points
-    if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
-        config.MPC.initial_guess = planner.nominal_torque_sequence(
-            config.MPC.horizon, config.MPC.dt
-        )
+    if args.gain_fd_samples is not None:
+        config.MPC.gain_fd_num_samples = args.gain_fd_samples
+    if any(v is not None for v in (args.horizon, args.samples, args.control_points)) or args.disable_dt_schedule:
+        _reset_initial_guess(planner, config)
 
     label = (
         f"h={config.MPC.horizon} n={config.MPC.num_parallel_computations} "
-        f"cp={config.MPC.num_control_points} gains={config.MPC.gains}"
+        f"cp={config.MPC.num_control_points} gains={config.MPC.gains} "
+        f"fd={config.MPC.gain_fd_num_samples} gf={args.gain_update_freq}"
     )
-    t_row, _, mean_ms, t_ok = _run_headless(planner, objective, config, args.steps, label)
+    t_row, _, mean_ms, t_ok = _run_headless(
+        planner,
+        objective,
+        config,
+        args.steps,
+        label,
+        gain_update_freq=args.gain_update_freq,
+    )
     print(t_row)
 
     # Gains overhead: compare to same config with gains disabled
@@ -373,9 +475,7 @@ def main():
             config_ng.MPC.horizon = config.MPC.horizon
         config_ng.MPC.num_parallel_computations = config.MPC.num_parallel_computations
         config_ng.MPC.num_control_points = config.MPC.num_control_points
-        config_ng.MPC.initial_guess = planner.nominal_torque_sequence(
-            config_ng.MPC.horizon, config_ng.MPC.dt
-        )
+        _reset_initial_guess(planner, config_ng)
         label_ng = (
             f"h={config_ng.MPC.horizon} n={config_ng.MPC.num_parallel_computations} "
             f"cp={config_ng.MPC.num_control_points} gains=False"
@@ -386,7 +486,13 @@ def main():
     # Quality + gain-stability check
     if args.quality or args.gains:
         print(f"\n--- Quality check ({args.quality_steps} steps of state evolution) ---")
-        q = _run_quality(planner, objective, config, args.quality_steps)
+        q = _run_quality(
+            planner,
+            objective,
+            config,
+            args.quality_steps,
+            gain_update_freq=args.gain_update_freq,
+        )
         print(_quality_row(q, config))
 
         if args.gains and q.get("errors"):
