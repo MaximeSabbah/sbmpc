@@ -10,8 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sbmpc import PandaPickAndPlaceController
-from sbmpc.panda_pick_and_place import (
+from sbmpc.examples.franka_emika_panda.planner_api import PandaPickAndPlaceController
+from sbmpc.examples.franka_emika_panda.panda_pick_and_place import (
     PandaPickAndPlacePlanner,
     Phase,
     make_panda_pick_and_place_config,
@@ -63,12 +63,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--name", default="case", help="Label used in the output.")
     parser.add_argument(
         "--mode",
-        choices=("ff", "fd", "exact", "local_lqr"),
+        choices=("ff", "fd", "exact"),
         default="exact",
-        help=(
-            "Benchmark feedforward only, finite-difference gains, exact gains, "
-            "or the temporary local-LQR fallback."
-        ),
+        help="Benchmark feedforward only, finite-difference gains, or exact gains.",
     )
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--samples", type=int, default=14)
@@ -115,8 +112,6 @@ def _build_controller(args: argparse.Namespace) -> tuple[PandaPickAndPlacePlanne
     gains_enabled = args.mode != "ff"
     if args.mode == "exact":
         gain_method = "exact"
-    elif args.mode == "local_lqr":
-        gain_method = "local_lqr"
     else:
         gain_method = "finite_difference"
 
@@ -208,12 +203,6 @@ def _profile_command(
                 raw_samples_delta,
                 samples,
                 costs,
-            )
-        elif gains_obj.compute_gains and rollout_gen.gain_method == "local_lqr":
-            new_gains = rollout_gen.local_lqr_gain(
-                state,
-                reference,
-                optimal_samples,
             )
         else:
             new_gains = gains_obj.gains_computation(costs, samples, gradients)
@@ -352,8 +341,6 @@ def _benchmark(args: argparse.Namespace) -> BenchmarkResult:
     gains_enabled = args.mode != "ff"
     if args.mode == "exact":
         gain_method = "exact"
-    elif args.mode == "local_lqr":
-        gain_method = "local_lqr"
     else:
         gain_method = "finite_difference"
 

@@ -7,20 +7,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sbmpc.panda_pick_and_place import (
+from sbmpc.settings import Config
+from sbmpc.simulation import build_model_and_solver
+
+from .panda_pick_and_place import (
     Phase,
     PandaPickAndPlaceObjective,
     PandaPickAndPlacePlanner,
     PandaPickAndPlaceReference,
     make_panda_pick_and_place_config,
 )
-from sbmpc.panda_pregrasp import (
+from .panda_pregrasp import (
     PandaPregraspObjective,
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
 )
-from sbmpc.settings import Config
-from sbmpc.simulation import build_model_and_solver
 
 
 @dataclass(frozen=True)
@@ -417,15 +418,10 @@ class PandaPregraspController:
         return predicted[: self.planner.nq], predicted[self.planner.nq :]
 
     def _seed_nominal_solution(self, state: jax.Array) -> None:
-        dt_arg = self.planner.step_durations(
-            self.config.MPC.horizon,
-            self.config.MPC.dt,
-            self.config.MPC.dt_schedule,
-        )
         self.controller.sampler.optimal_samples = self.planner.nominal_torque_sequence_from_state(
             state,
             self.config.MPC.horizon,
-            dt_arg,
+            self.config.MPC.dt,
         )
         self.controller.gains_obj.cur_gains = jnp.zeros(
             (self.planner.nu, self.planner.nx),

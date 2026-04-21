@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from sbmpc.panda_pregrasp import (
+from sbmpc.examples.franka_emika_panda.panda_pregrasp import (
     PandaPregraspObjective,
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
@@ -38,13 +38,3 @@ def test_panda_pregrasp_solver_step() -> None:
     assert gains.shape == (planner.nu, planner.nx)
     assert jnp.all(jnp.isfinite(control_sequence))
     assert jnp.all(jnp.isfinite(gains))
-
-
-def test_panda_pregrasp_nominal_seed_supports_dt_schedule() -> None:
-    planner = PandaPregraspPlanner()
-    dt_array = planner.step_durations(8, 0.02, [(4, 1), (4, 4)])
-    control_sequence = planner.nominal_torque_sequence(8, dt_array)
-
-    assert dt_array.shape == (8,)
-    assert control_sequence.shape == (8, planner.nu)
-    assert jnp.all(jnp.isfinite(control_sequence))

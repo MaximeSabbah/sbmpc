@@ -15,7 +15,7 @@ from sbmpc.settings import Config, DynamicsModel, RobotConfig
 from sbmpc.solvers import BaseObjective
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 PANDA_SCENE_PATH = ROOT / "examples" / "panda_pick_place" / "scene.xml"
 PANDA_XML_PATH = ROOT / "examples" / "panda_pick_place" / "panda.xml"
 PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{i}" for i in range(1, 8))
@@ -113,33 +113,6 @@ class PandaPregraspPlanner:
             goal_tau=self.goal_tau,
         )
         self.reference_vec = self.reference.as_vector()
-
-    @staticmethod
-    def step_durations(
-        horizon: int,
-        dt: float | jax.Array,
-        dt_schedule: list[tuple[int, float]] | None = None,
-    ) -> jax.Array:
-        """Return the per-step rollout durations for scalar- or schedule-based MPC."""
-        if dt_schedule is not None:
-            dt_list: list[float] = []
-            base_dt = float(dt)
-            for n_steps, multiplier in dt_schedule:
-                dt_list.extend([base_dt * float(multiplier)] * int(n_steps))
-            if len(dt_list) != horizon:
-                raise ValueError(
-                    f"dt_schedule expands to {len(dt_list)} steps, expected {horizon}."
-                )
-            return jnp.asarray(dt_list, dtype=jnp.float32)
-
-        dt_array = jnp.asarray(dt, dtype=jnp.float32)
-        if dt_array.ndim == 0:
-            return jnp.full((horizon,), dt_array, dtype=jnp.float32)
-        if dt_array.shape != (horizon,):
-            raise ValueError(
-                f"dt must be a scalar or have shape ({horizon},), got {dt_array.shape}."
-            )
-        return dt_array.astype(jnp.float32)
 
     def _load_mujoco_defaults(self) -> tuple[jax.Array, jax.Array, jax.Array, float]:
         mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
@@ -285,20 +258,13 @@ class PandaPregraspPlanner:
         v_start: jax.Array,
         q_goal: jax.Array,
         horizon: int,
-        dt: float | jax.Array,
+        dt: float,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Cubic joint trajectory with current velocity and zero terminal velocity."""
         q_start = jnp.asarray(q_start, dtype=jnp.float32)
         v_start = jnp.asarray(v_start, dtype=jnp.float32)
         q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
-        dt_array = self.step_durations(horizon, dt)
-        time = jnp.concatenate(
-            [
-                jnp.zeros((1,), dtype=jnp.float32),
-                jnp.cumsum(dt_array[:-1]),
-            ],
-            axis=0,
-        )[:, jnp.newaxis]
+        time = (jnp.arange(horizon, dtype=jnp.float32) * jnp.float32(dt))[:, jnp.newaxis]
         t_final = jnp.maximum(time[-1, 0], 1e-6)
 
         v_goal = jnp.zeros_like(v_start)
@@ -324,7 +290,7 @@ class PandaPregraspPlanner:
         state: jax.Array,
         goal_q: jax.Array,
         horizon: int,
-        dt: float | jax.Array,
+        dt: float,
     ) -> jax.Array:
         """Receding inverse-dynamics seed from the current arm state to a goal pose."""
         state = jnp.asarray(state, dtype=jnp.float32)
@@ -516,11 +482,7 @@ def make_panda_pregrasp_config(
         config.MPC.num_control_points = 4
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
-        planner.step_durations(
-            config.MPC.horizon,
-            config.MPC.dt,
-            config.MPC.dt_schedule,
-        ),
+        config.MPC.dt,
     )
 
     config.solver_dynamics = DynamicsModel.CUSTOM

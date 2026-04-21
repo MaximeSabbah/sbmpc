@@ -142,7 +142,6 @@ class RobotConfig:
 class MPCConfig:
     def __init__(self, config: RobotConfig):
         self._dt = 0.0
-        self._dt_schedule = None  # [(n_steps, multiplier), ...], e.g. [(30,1),(20,2)]
         self._horizon = 1
         self._num_parallel_computations = 1000
         self._lambda_mpc = 1.0
@@ -173,18 +172,6 @@ class MPCConfig:
         self._dt = value
 
     @property
-    def dt_schedule(self):
-        return self._dt_schedule
-
-    @dt_schedule.setter
-    def dt_schedule(self, value):
-        if value is not None:
-            if not all(isinstance(n, int) and n > 0 and m > 0 for n, m in value):
-                raise ValueError("dt_schedule must be a list of (n_steps: int, multiplier: number) pairs")
-            self._horizon = sum(n for n, _ in value)
-        self._dt_schedule = value
-
-    @property
     def horizon(self):
         return self._horizon
 
@@ -195,7 +182,6 @@ class MPCConfig:
         if not value > 0:
             raise ValueError("must be greater than zero")
         self._horizon = value
-        self._dt_schedule = None
 
     @property
     def num_parallel_computations(self):
@@ -272,7 +258,7 @@ class MPCConfig:
     def gain_method(self, value):
         if not isinstance(value, str):
             raise ValueError("str type is expected")
-        supported_methods = ["exact", "finite_difference", "local_lqr"]
+        supported_methods = ["exact", "finite_difference"]
         if value not in supported_methods:
             raise ValueError(f"gain_method not supported. Choose from {supported_methods}")
         self._gain_method = value

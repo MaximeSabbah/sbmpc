@@ -8,9 +8,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sbmpc.panda_pregrasp import PandaPregraspPlanner
 from sbmpc.settings import Config, DynamicsModel, RobotConfig
 from sbmpc.solvers import BaseObjective
+
+from .panda_pregrasp import PandaPregraspPlanner
 
 
 class Phase(IntEnum):

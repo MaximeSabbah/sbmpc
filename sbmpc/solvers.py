@@ -5,7 +5,6 @@ from sbmpc.gains import Gains
 
 import jax.numpy as jnp
 import jax
-import numpy as np
 
 from functools import partial
 
@@ -74,24 +73,8 @@ class RolloutGenerator():
 
         # Sampling time for discrete time model
         self.dt = jnp.asarray(config.MPC.dt, dtype=self.dtype_general)
-        # Variable-dt schedule: expand [(n_steps, multiplier), ...] into per-step array
-        schedule = config.MPC.dt_schedule
-        if schedule is not None:
-            dt_list = []
-            for n_steps, mult in schedule:
-                dt_list.extend([float(config.MPC.dt) * mult] * n_steps)
-            self.dt_array = jnp.array(dt_list, dtype=self.dtype_general)
-            self.horizon = len(dt_list)
-        else:
-            self.horizon = config.MPC.horizon
-            self.dt_array = jnp.full(self.horizon, config.MPC.dt, dtype=self.dtype_general)
-        self.rollout_time_grid = jnp.concatenate(
-            [
-                jnp.zeros((1,), dtype=self.dtype_general),
-                jnp.cumsum(self.dt_array[:-1]),
-            ],
-            axis=0,
-        )
+        self.horizon = config.MPC.horizon
+        self.rollout_time_grid = jnp.arange(self.horizon, dtype=self.dtype_general) * self.dt
         # Control horizon of the MPC (steps)
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel 
         # check if we need to move it
@@ -141,29 +124,8 @@ class RolloutGenerator():
         self.cost_and_constraints = self.objective.cost_and_constraints
         self.final_cost_and_constraints = self.objective.final_cost_and_constraints
 
-        self._dynamics_jacobian = jax.jit(
-            jax.jacfwd(
-                lambda state, inputs, step_dt: self.model.integrate_rollout_single(
-                    state, inputs, step_dt
-                ),
-                argnums=(0, 1),
-            )
-        )
-        self._running_cost_hessian_xx = jax.jit(
-            jax.hessian(self.cost_and_constraints, argnums=0)
-        )
-        self._running_cost_hessian_uu = jax.jit(
-            jax.hessian(self.cost_and_constraints, argnums=1)
-        )
-        self._running_cost_hessian_ux = jax.jit(
-            jax.jacfwd(jax.grad(self.cost_and_constraints, argnums=1), argnums=0)
-        )
-        self._final_cost_hessian_xx = jax.jit(
-            jax.hessian(self.final_cost_and_constraints, argnums=0)
-        )
-        
-    
-    
+
+
     @partial(jax.vmap, in_axes=(None, 0), out_axes=0)
     def clip_input(self, control_variables):
         return jnp.clip(control_variables, self.input_min_full_horizon, self.input_max_full_horizon)
@@ -197,15 +159,14 @@ class RolloutGenerator():
         
         def cost_and_state_rollout(idx, cost_and_state):
             cost, curr_state = cost_and_state
-            step_dt = self.dt_array[idx]
-            cost += step_dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
-            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], step_dt)
+            cost += self.dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
+            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], self.dt)
 
             return cost, next_state
 
         cost, final_state = jax.lax.fori_loop(0, self.horizon, cost_and_state_rollout, (cost, curr_state))
 
-        cost += self.dt_array[-1]*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
+        cost += self.dt*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
 
@@ -239,15 +200,14 @@ class RolloutGenerator():
 
         def cost_and_state_rollout(idx, cost_and_state):
             cost, curr_state = cost_and_state
-            step_dt = self.dt_array[idx]
-            cost += step_dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
-            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], step_dt)
+            cost += self.dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
+            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], self.dt)
 
             return cost, next_state
 
         cost, final_state = jax.lax.fori_loop(0, self.horizon, cost_and_state_rollout, (cost, curr_state))
 
-        cost += self.dt_array[-1]*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
+        cost += self.dt*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
 
@@ -314,125 +274,7 @@ class RolloutGenerator():
         samples_delta_clipped = (control_action - optimal_samples)
         return samples_delta_clipped
 
-    @partial(jax.jit, static_argnums=(0,))
-    def nominal_rollout_states(self, initial_state, control_variables):
-        control_variables = self.interpolate_control(control_variables)
 
-        def rollout_step(curr_state, rollout_input):
-            curr_input, step_dt = rollout_input
-            next_state = self.model.integrate_rollout_single(
-                curr_state, curr_input, step_dt
-            )
-            return next_state, next_state
-
-        _, next_states = jax.lax.scan(
-            rollout_step,
-            initial_state,
-            (control_variables, self.dt_array),
-        )
-        states = jnp.concatenate([initial_state[jnp.newaxis, :], next_states], axis=0)
-        return states, control_variables
-
-    def local_lqr_gain(self, initial_state, reference, control_variables):
-        if reference.ndim == 1:
-            reference = jnp.tile(reference, (self.horizon + 1, 1))
-
-        if self.config.MPC.smoothing == "Spline" and control_variables.shape[0] == self.horizon:
-            control_variables = control_variables[self.control_spline_indices, :]
-
-        states, control_sequence = self.nominal_rollout_states(
-            initial_state, control_variables
-        )
-        states = np.asarray(jax.block_until_ready(states), dtype=np.float64)
-        control_sequence = np.asarray(
-            jax.block_until_ready(control_sequence), dtype=np.float64
-        )
-        reference = np.asarray(jax.block_until_ready(reference), dtype=np.float64)
-
-        dynamics_jacobians = []
-        running_hessian_xx = []
-        running_hessian_uu = []
-        running_hessian_ux = []
-        for idx in range(self.horizon):
-            state_t = jnp.asarray(states[idx], dtype=self.dtype_general)
-            input_t = jnp.asarray(control_sequence[idx], dtype=self.dtype_general)
-            reference_t = jnp.asarray(reference[idx], dtype=self.dtype_general)
-            step_dt = jnp.asarray(self.dt_array[idx], dtype=self.dtype_general)
-
-            a_t, b_t = self._dynamics_jacobian(state_t, input_t, step_dt)
-            dynamics_jacobians.append(
-                (
-                    np.asarray(jax.block_until_ready(a_t), dtype=np.float64),
-                    np.asarray(jax.block_until_ready(b_t), dtype=np.float64),
-                )
-            )
-            running_hessian_xx.append(
-                np.asarray(
-                    jax.block_until_ready(
-                        self._running_cost_hessian_xx(state_t, input_t, reference_t)
-                    ),
-                    dtype=np.float64,
-                )
-            )
-            running_hessian_uu.append(
-                np.asarray(
-                    jax.block_until_ready(
-                        self._running_cost_hessian_uu(state_t, input_t, reference_t)
-                    ),
-                    dtype=np.float64,
-                )
-            )
-            running_hessian_ux.append(
-                np.asarray(
-                    jax.block_until_ready(
-                        self._running_cost_hessian_ux(state_t, input_t, reference_t)
-                    ),
-                    dtype=np.float64,
-                )
-            )
-
-        final_hessian_xx = np.asarray(
-            jax.block_until_ready(
-                self._final_cost_hessian_xx(
-                    jnp.asarray(states[-1], dtype=self.dtype_general),
-                    jnp.asarray(reference[-1], dtype=self.dtype_general),
-                )
-            ),
-            dtype=np.float64,
-        )
-
-        gains = [None] * self.horizon
-        value_hessian = self._symmetrize(final_hessian_xx)
-        regularization = 1e-6
-        for idx in range(self.horizon - 1, -1, -1):
-            a_t, b_t = dynamics_jacobians[idx]
-            l_xx = self._symmetrize(running_hessian_xx[idx])
-            l_uu = self._symmetrize(running_hessian_uu[idx])
-            l_ux = running_hessian_ux[idx]
-
-            q_xx = self._symmetrize(l_xx + a_t.T @ value_hessian @ a_t)
-            q_uu = self._symmetrize(l_uu + b_t.T @ value_hessian @ b_t)
-            q_ux = l_ux + b_t.T @ value_hessian @ a_t
-
-            q_uu = self._project_to_pd(q_uu, min_eigenvalue=regularization)
-            gains[idx] = -np.linalg.solve(q_uu, q_ux)
-            value_hessian = self._symmetrize(
-                q_xx - q_ux.T @ np.linalg.solve(q_uu, q_ux)
-            )
-
-        return jnp.asarray(gains[0], dtype=self.dtype_general)
-
-    @staticmethod
-    def _symmetrize(matrix):
-        return 0.5 * (matrix + matrix.T)
-
-    @staticmethod
-    def _project_to_pd(matrix, min_eigenvalue):
-        eigvals, eigvecs = np.linalg.eigh(matrix)
-        eigvals = np.maximum(eigvals, min_eigenvalue)
-        return (eigvecs * eigvals) @ eigvecs.T
-    
-    
 class Controller:
     def __init__(self, rollout_gen : RolloutGenerator, sampler : Sampler, gains_obj: Gains):
 
@@ -462,12 +304,6 @@ class Controller:
                     raw_samples_delta,
                     samples,
                     costs,
-                )
-            elif self.gains_obj.compute_gains and self.rollout_gen.gain_method == "local_lqr":
-                self.gains_obj.cur_gains = self.rollout_gen.local_lqr_gain(
-                    state,
-                    reference,
-                    optimal_samples,
                 )
             else:
                 self.gains_obj.cur_gains = self.gains_obj.gains_computation(costs, samples, gradients)

@@ -7,7 +7,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from sbmpc.panda_pick_and_place import (
+from sbmpc.examples.franka_emika_panda.panda_pick_and_place import (
     Phase,
     PandaPickAndPlaceObjective,
     PandaPickAndPlacePlanner,

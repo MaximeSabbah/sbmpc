@@ -13,6 +13,8 @@ the Python bridge computes the next SB-MPC command.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import time
 
 import jax
@@ -24,7 +26,7 @@ FRANKA_ARM_VELOCITY_LIMITS = np.array(
     dtype=np.float64,
 )
 
-from sbmpc.panda_pregrasp import (
+from sbmpc.examples.franka_emika_panda.panda_pregrasp import (
     PandaPregraspObjective,
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
@@ -32,19 +34,11 @@ from sbmpc.panda_pregrasp import (
 from sbmpc.simulation import build_all, construct_mj_visualizer_from_model
 
 
-def _step_durations(planner, config):
-    return planner.step_durations(
-        config.MPC.horizon,
-        config.MPC.dt,
-        config.MPC.dt_schedule,
-    )
-
-
 def _reset_guess(sim, planner, config, state) -> None:
     sim.controller.sampler.optimal_samples = planner.nominal_torque_sequence_from_state(
         state,
         config.MPC.horizon,
-        _step_durations(planner, config),
+        config.MPC.dt,
     )
 
 
@@ -58,7 +52,6 @@ def _build_lfc_sim(args: argparse.Namespace):
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner)
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
-    config.MPC.dt_schedule = None
     config.MPC.gain_method = args.gain_method
     config.MPC.gain_fd_epsilon = args.gain_fd_epsilon
     config.MPC.gain_fd_scheme = args.gain_fd_scheme
@@ -69,7 +62,7 @@ def _build_lfc_sim(args: argparse.Namespace):
     config.MPC.num_control_points = args.control_points
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
-        _step_durations(planner, config),
+        config.MPC.dt,
     )
 
     sim = build_all(
@@ -334,6 +327,8 @@ def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
         "tail_joint_spans": np.ptp(q[tail], axis=0),
         "joint_velocity_abs_max": float(np.max(np.abs(v), initial=0.0)),
         "joint_velocity_rms_mean": float(np.mean(np.sqrt(np.mean(v * v, axis=1)))),
+        "q_history": q,
+        "v_history": v,
     }
 
 
@@ -378,6 +373,72 @@ def run_lfc_visual(args: argparse.Namespace) -> None:
                     time.sleep(sleep_time)
     finally:
         visualizer.close()
+
+
+def _joint_vel_hf_energy(v: np.ndarray, dt: float, f_lo: float = 5.0, f_hi: float = 50.0) -> float:
+    """Peak-per-joint spectral magnitude in the [f_lo, f_hi] Hz band, normalised.
+
+    Used as a scalar oscillation metric: a steady hold should be near 0, a
+    controller ringing in the 5-50 Hz band produces a larger value.
+    """
+    if len(v) < 4:
+        return 0.0
+    v_centered = v - np.mean(v, axis=0, keepdims=True)
+    window = np.hanning(len(v_centered))[:, np.newaxis]
+    spectrum = np.fft.rfft(v_centered * window, axis=0)
+    freqs = np.fft.rfftfreq(len(v_centered), d=dt)
+    band = (freqs >= f_lo) & (freqs <= f_hi)
+    if not np.any(band):
+        return 0.0
+    magnitude = np.abs(spectrum[band])
+    norm = np.sum(window) * 0.5
+    return float(np.max(magnitude) / max(norm, 1e-12))
+
+
+def _emit_reference(args: argparse.Namespace, result: dict[str, object], path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    plan_times_ms = np.asarray(result["plan_times_ms"], dtype=np.float64)
+    errors = np.asarray(result["errors"], dtype=np.float64)
+    v = np.asarray(result["v_history"], dtype=np.float64)
+    tail_start = len(v) // 2
+    tail_v = v[tail_start:]
+    hf_energy = _joint_vel_hf_energy(tail_v, args.dt)
+    payload = {
+        "config": {
+            "gain_method": args.gain_method,
+            "dt": float(args.dt),
+            "horizon": int(args.horizon),
+            "samples": int(args.samples),
+            "control_points": int(args.control_points),
+            "substeps": int(args.substeps),
+            "timing_mode": args.timing_mode,
+            "steps": int(args.steps),
+            "backend": jax.default_backend(),
+        },
+        "errors": errors.tolist(),
+        "gain_norms": np.asarray(result["gain_norms"], dtype=np.float64).tolist(),
+        "feedback_peaks": np.asarray(result["feedback_peaks"], dtype=np.float64).tolist(),
+        "plan_times_ms": plan_times_ms.tolist(),
+        "tail_joint_spans": np.asarray(result["tail_joint_spans"], dtype=np.float64).tolist(),
+        "summary": {
+            "error_initial": float(errors[0]),
+            "error_final": float(errors[-1]),
+            "error_min": float(np.min(errors)),
+            "tail_error_mean": float(np.mean(errors[tail_start:])),
+            "tail_error_std": float(np.std(errors[tail_start:])),
+            "plan_ms_p50": float(np.percentile(plan_times_ms, 50)),
+            "plan_ms_p95": float(np.percentile(plan_times_ms, 95)),
+            "plan_ms_p99": float(np.percentile(plan_times_ms, 99)),
+            "joint_velocity_abs_max": float(result["joint_velocity_abs_max"]),
+            "joint_velocity_rms_mean": float(result["joint_velocity_rms_mean"]),
+            "joint_vel_hf_energy": hf_energy,
+            "gain_norm_final": float(np.asarray(result["gain_norms"])[-1]),
+            "feedback_peak_max": float(np.max(np.asarray(result["feedback_peaks"]))),
+        },
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"wrote reference -> {path}")
 
 
 def _print_summary(result: dict[str, object]) -> None:
@@ -426,7 +487,7 @@ def main() -> None:
     parser.add_argument("--desired-state-mode", choices=("base", "midpoint", "next"), default="base")
     parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--clip-velocity", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--gain-method", choices=("exact", "finite_difference", "local_lqr"), default="exact")
+    parser.add_argument("--gain-method", choices=("exact", "finite_difference"), default="exact")
     parser.add_argument("--gain-fd-epsilon", type=float, default=1e-3)
     parser.add_argument("--gain-fd-scheme", choices=("forward", "central"), default="forward")
     parser.add_argument("--gain-fd-samples", type=int, default=256)
@@ -434,6 +495,12 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--samples", type=int, default=1024)
     parser.add_argument("--control-points", type=int, default=8)
+    parser.add_argument(
+        "--emit-reference",
+        type=str,
+        default=None,
+        help="Write MuJoCo baseline JSON (error trajectory + solve-time + stability) to this path.",
+    )
     args = parser.parse_args()
     if args.steps <= 0:
         raise ValueError("--steps must be positive.")
@@ -457,6 +524,8 @@ def main() -> None:
     else:
         result = run_lfc_validation(args)
         _print_summary(result)
+        if args.emit_reference is not None:
+            _emit_reference(args, result, args.emit_reference)
 
 
 if __name__ == "__main__":

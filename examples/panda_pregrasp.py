@@ -3,7 +3,7 @@ import argparse
 import jax
 import jax.numpy as jnp
 
-from sbmpc.panda_pregrasp import (
+from sbmpc.examples.franka_emika_panda.panda_pregrasp import (
     PandaPregraspObjective,
     PandaPregraspPlanner,
     make_panda_pregrasp_config,

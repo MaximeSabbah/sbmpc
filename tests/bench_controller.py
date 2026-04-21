@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sbmpc.panda_pregrasp import (
+from sbmpc.examples.franka_emika_panda.panda_pregrasp import (
     PandaPregraspObjective,
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
@@ -50,18 +50,10 @@ N_TRIALS = 100
 N_QUALITY = 60   # simulation steps for convergence / gain-stability check
 
 
-def _seed_dt_argument(planner, config):
-    return planner.step_durations(
-        config.MPC.horizon,
-        config.MPC.dt,
-        config.MPC.dt_schedule,
-    )
-
-
 def _reset_initial_guess(planner, config):
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
-        _seed_dt_argument(planner, config),
+        config.MPC.dt,
     )
 
 
@@ -320,8 +312,8 @@ def run_visual(planner, objective, config, *, gain_update_freq=1):
         f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
         f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
         f"fd={config.MPC.gain_fd_num_samples}  gf={gain_update_freq}  "
-        f"dt_schedule={config.MPC.dt_schedule}"
-    )
+        f
+)
     sim.simulate()
 
 
@@ -335,8 +327,6 @@ def main():
     parser.add_argument("--steps", type=int, default=N_TRIALS, help="Timing trials per config")
     parser.add_argument("--quality-steps", type=int, default=N_QUALITY,
                         help="Simulation steps for quality check")
-    parser.add_argument("--disable-dt-schedule", action="store_true",
-                        help="Force a constant-dt rollout even if the config defines a dt_schedule.")
     parser.add_argument("--gain-fd-samples", type=int, default=None,
                         help="Override MPC.gain_fd_num_samples for finite-difference gains.")
     parser.add_argument("--gain-update-freq", type=int, default=1,
@@ -353,10 +343,7 @@ def main():
 
     if args.visual:
         config = make_panda_pregrasp_config(planner, visualize=True, gains=args.gains)
-        if args.disable_dt_schedule:
-            config.MPC.dt_schedule = None
         if args.horizon is not None:
-            config.MPC.dt_schedule = None
             config.MPC.horizon = args.horizon
         if args.samples is not None:
             config.MPC.num_parallel_computations = args.samples
@@ -364,7 +351,7 @@ def main():
             config.MPC.num_control_points = args.control_points
         if args.gain_fd_samples is not None:
             config.MPC.gain_fd_num_samples = args.gain_fd_samples
-        if any(v is not None for v in (args.horizon, args.samples, args.control_points)) or args.disable_dt_schedule:
+        if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
             _reset_initial_guess(planner, config)
         run_visual(
             planner,
@@ -396,7 +383,6 @@ def main():
             for s in samples_list:
                 for cp in valid_cp:
                     config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
-                    config.MPC.dt_schedule = None
                     config.MPC.horizon = h
                     config.MPC.num_parallel_computations = s
                     config.MPC.num_control_points = cp
@@ -437,10 +423,7 @@ def main():
 
     # ── Single-config benchmark ──────────────────────────────────────────────
     config = make_panda_pregrasp_config(planner, visualize=False, gains=args.gains)
-    if args.disable_dt_schedule:
-        config.MPC.dt_schedule = None
     if args.horizon is not None:
-        config.MPC.dt_schedule = None
         config.MPC.horizon = args.horizon
     if args.samples is not None:
         config.MPC.num_parallel_computations = args.samples
@@ -448,7 +431,7 @@ def main():
         config.MPC.num_control_points = args.control_points
     if args.gain_fd_samples is not None:
         config.MPC.gain_fd_num_samples = args.gain_fd_samples
-    if any(v is not None for v in (args.horizon, args.samples, args.control_points)) or args.disable_dt_schedule:
+    if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
         _reset_initial_guess(planner, config)
 
     label = (
@@ -469,9 +452,6 @@ def main():
     # Gains overhead: compare to same config with gains disabled
     if args.gains:
         config_ng = make_panda_pregrasp_config(planner, visualize=False, gains=False)
-        if config.MPC.dt_schedule is not None:
-            config_ng.MPC.dt_schedule = config.MPC.dt_schedule
-        else:
             config_ng.MPC.horizon = config.MPC.horizon
         config_ng.MPC.num_parallel_computations = config.MPC.num_parallel_computations
         config_ng.MPC.num_control_points = config.MPC.num_control_points
