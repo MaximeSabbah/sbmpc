@@ -24,7 +24,7 @@ from sbmpc.panda_pregrasp import (
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
 )
-from sbmpc.simulation import build_all
+from sbmpc.simulation import build_all, construct_mj_visualizer_from_model
 
 
 def _step_durations(planner, config):
@@ -49,7 +49,7 @@ def _ee_error(planner, state: np.ndarray) -> float:
     return float(np.linalg.norm(ee_pos - np.asarray(planner.goal_pos)))
 
 
-def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
+def _build_lfc_sim(args: argparse.Namespace):
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner)
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
@@ -73,8 +73,68 @@ def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
         custom_dynamics_fn=planner.dynamics,
         obstacles=False,
     )
+    return planner, config, sim
 
+
+def _compile_controller(sim, planner, config) -> None:
+    state = sim.current_state_vec()
+    _reset_guess(sim, planner, config, state)
+    warm = sim.controller.command(state, sim.const_reference, num_steps=1)
+    jax.block_until_ready(warm)
+    jax.block_until_ready(sim.controller.gains)
+
+
+def _lfc_step(sim, planner, config, args: argparse.Namespace) -> dict[str, float]:
     low_dt = config.MPC.dt / args.substeps
+    torque_limits = np.asarray(planner.torque_limits, dtype=np.float64)
+
+    desired = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
+    _reset_guess(sim, planner, config, jnp.asarray(desired, dtype=jnp.float32))
+
+    start = time.perf_counter()
+    input_sequence = sim.controller.command(
+        jnp.asarray(desired, dtype=jnp.float32),
+        sim.const_reference,
+        num_steps=1,
+    )
+    jax.block_until_ready(input_sequence)
+    K_sbmpc = np.asarray(jax.block_until_ready(sim.controller.gains), dtype=np.float64)
+    tau_ff = np.asarray(input_sequence[0], dtype=np.float64)
+    planning_ms = (time.perf_counter() - start) * 1000.0
+
+    # Same convention as the ROS bridge: SB-MPC exposes du/dx_measured,
+    # while LFC multiplies (desired - measured).
+    K_lfc = -K_sbmpc
+    feedback_peak = 0.0
+    for _substep in range(args.substeps):
+        measured = np.asarray(
+            jax.block_until_ready(sim.current_state_vec()),
+            dtype=np.float64,
+        )
+        feedback = K_lfc @ (desired - measured)
+        feedback_peak = max(
+            feedback_peak,
+            float(np.max(np.abs(feedback), initial=0.0)),
+        )
+        tau = np.clip(tau_ff + feedback, -torque_limits, torque_limits)
+        sim.current_state = sim.model.integrate_sim(
+            sim.current_state,
+            jnp.asarray(tau, dtype=jnp.float32),
+            low_dt,
+        )
+
+    state_np = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
+    return {
+        "error": _ee_error(planner, state_np),
+        "gain_norm": float(np.linalg.norm(K_sbmpc)),
+        "feedback_peak": feedback_peak,
+        "planning_ms": planning_ms,
+        "state": state_np,
+    }
+
+
+def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
+    planner, config, sim = _build_lfc_sim(args)
     errors: list[float] = []
     gain_norms: list[float] = []
     feedback_peaks: list[float] = []
@@ -82,54 +142,15 @@ def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
     q_history: list[np.ndarray] = []
     v_history: list[np.ndarray] = []
 
-    # Compile before recording metrics.
-    state = sim.current_state_vec()
-    _reset_guess(sim, planner, config, state)
-    warm = sim.controller.command(state, sim.const_reference, num_steps=1)
-    jax.block_until_ready(warm)
-    jax.block_until_ready(sim.controller.gains)
+    _compile_controller(sim, planner, config)
 
-    torque_limits = np.asarray(planner.torque_limits, dtype=np.float64)
     for _ in range(args.steps):
-        desired = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
-        _reset_guess(sim, planner, config, jnp.asarray(desired, dtype=jnp.float32))
-
-        start = time.perf_counter()
-        input_sequence = sim.controller.command(
-            jnp.asarray(desired, dtype=jnp.float32),
-            sim.const_reference,
-            num_steps=1,
-        )
-        jax.block_until_ready(input_sequence)
-        K_sbmpc = np.asarray(jax.block_until_ready(sim.controller.gains), dtype=np.float64)
-        tau_ff = np.asarray(input_sequence[0], dtype=np.float64)
-        plan_times_ms.append((time.perf_counter() - start) * 1000.0)
-
-        # Same convention as the ROS bridge: SB-MPC exposes du/dx_measured,
-        # while LFC multiplies (desired - measured).
-        K_lfc = -K_sbmpc
-        feedback_peak = 0.0
-        for _substep in range(args.substeps):
-            measured = np.asarray(
-                jax.block_until_ready(sim.current_state_vec()),
-                dtype=np.float64,
-            )
-            feedback = K_lfc @ (desired - measured)
-            feedback_peak = max(
-                feedback_peak,
-                float(np.max(np.abs(feedback), initial=0.0)),
-            )
-            tau = np.clip(tau_ff + feedback, -torque_limits, torque_limits)
-            sim.current_state = sim.model.integrate_sim(
-                sim.current_state,
-                jnp.asarray(tau, dtype=jnp.float32),
-                low_dt,
-            )
-
-        state_np = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
-        errors.append(_ee_error(planner, state_np))
-        gain_norms.append(float(np.linalg.norm(K_sbmpc)))
-        feedback_peaks.append(feedback_peak)
+        metrics = _lfc_step(sim, planner, config, args)
+        state_np = metrics["state"]
+        errors.append(metrics["error"])
+        gain_norms.append(metrics["gain_norm"])
+        feedback_peaks.append(metrics["feedback_peak"])
+        plan_times_ms.append(metrics["planning_ms"])
         q_history.append(state_np[: planner.nq])
         v_history.append(state_np[planner.nq : planner.nq + planner.nv])
 
@@ -145,6 +166,39 @@ def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
         "joint_velocity_abs_max": float(np.max(np.abs(v), initial=0.0)),
         "joint_velocity_rms_mean": float(np.mean(np.sqrt(np.mean(v * v, axis=1)))),
     }
+
+
+def run_lfc_visual(args: argparse.Namespace) -> None:
+    planner, config, sim = _build_lfc_sim(args)
+    _compile_controller(sim, planner, config)
+    visualizer = construct_mj_visualizer_from_model(sim.model, config)
+
+    try:
+        for step_idx in range(args.steps):
+            if not visualizer.is_running():
+                break
+
+            step_start = time.perf_counter()
+            metrics = _lfc_step(sim, planner, config, args)
+            state_np = metrics["state"]
+            visualizer.set_qpos(state_np[: planner.nq])
+
+            if step_idx % args.print_every == 0:
+                print(
+                    f"step={step_idx:04d} "
+                    f"err={metrics['error']:.4f}m "
+                    f"|K|={metrics['gain_norm']:.3f} "
+                    f"fb_peak={metrics['feedback_peak']:.3f}Nm "
+                    f"plan={metrics['planning_ms']:.1f}ms"
+                )
+
+            if args.realtime:
+                elapsed = time.perf_counter() - step_start
+                sleep_time = config.MPC.dt - elapsed
+                if sleep_time > 0.0:
+                    time.sleep(sleep_time)
+    finally:
+        visualizer.close()
 
 
 def _print_summary(result: dict[str, object]) -> None:
@@ -183,6 +237,9 @@ def _print_summary(result: dict[str, object]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--visual", action="store_true", help="Open MuJoCo viewer.")
+    parser.add_argument("--realtime", action="store_true", help="Sleep to roughly match the 50 Hz control period when possible.")
+    parser.add_argument("--print-every", type=int, default=1)
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--substeps", type=int, default=20)
     parser.add_argument("--gain-method", choices=("exact", "finite_difference", "local_lqr"), default="exact")
@@ -197,14 +254,19 @@ def main() -> None:
         raise ValueError("--steps must be positive.")
     if args.substeps <= 0:
         raise ValueError("--substeps must be positive.")
+    if args.print_every <= 0:
+        raise ValueError("--print-every must be positive.")
 
     print(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
     print(
         f"h={args.horizon} samples={args.samples} cp={args.control_points} "
         f"gain_method={args.gain_method} substeps={args.substeps}"
     )
-    result = run_lfc_validation(args)
-    _print_summary(result)
+    if args.visual:
+        run_lfc_visual(args)
+    else:
+        result = run_lfc_validation(args)
+        _print_summary(result)
 
 
 if __name__ == "__main__":
