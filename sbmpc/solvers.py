@@ -130,7 +130,7 @@ class RolloutGenerator():
         # self.ctrl_sens_to_state = jax.jit(jax.jacfwd(self.compute_control_mppi, argnums=0, has_aux=True), device=self.device)
         if self.compute_exact_gains:
             self.rollout_sens_to_state = jax.vmap(
-                jax.value_and_grad(self.rollout_single, argnums=0, has_aux=True),
+                self.rollout_single_with_state_gradient,
                 in_axes=(None, None, 0),
                 out_axes=(0, 0),
             )
@@ -208,6 +208,26 @@ class RolloutGenerator():
         cost += self.dt_array[-1]*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
+
+    def rollout_single_with_state_gradient(self, initial_state, reference, control_variables):
+        """Rollout cost plus dJ/dx using forward-mode AD.
+
+        This is the Feedback-MPPI gain path from the original implementation,
+        but computed with forward sensitivities so MJX dynamics remain
+        differentiable. Reverse-mode AD through MJX's internal solver while
+        loops is not supported by JAX.
+        """
+        cost_and_control = self.rollout_single(initial_state, reference, control_variables)
+
+        def cost_from_state(state):
+            cost, _ = self.rollout_single(state, reference, control_variables)
+            return cost
+
+        basis = jnp.eye(self.model.nx, dtype=self.dtype_general)
+        gradient = jax.vmap(
+            lambda tangent: jax.jvp(cost_from_state, (initial_state,), (tangent,))[1]
+        )(basis)
+        return cost_and_control, gradient
 
 
     def rollout_single_with_sensitivity(self, initial_state, reference, control_variables):
