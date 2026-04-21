@@ -5,9 +5,9 @@ This intentionally differs from bench_controller.py: it applies
     tau = tau_ff + K_lfc @ (x_desired - x_measured)
 
 inside each control period, with K_lfc using the same sign convention as the
-ROS linear_feedback_controller bridge. The simulation only advances after the
-controller output is ready, so this isolates gain correctness from ROS/Gazebo
-wall-clock scheduling.
+ROS linear_feedback_controller bridge. Use ``--timing-mode gazebo`` to include
+the ROS/Gazebo timing semantics where the previous control remains active while
+the Python bridge computes the next SB-MPC command.
 """
 
 from __future__ import annotations
@@ -18,6 +18,11 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+FRANKA_ARM_VELOCITY_LIMITS = np.array(
+    [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61],
+    dtype=np.float64,
+)
 
 from sbmpc.panda_pregrasp import (
     PandaPregraspObjective,
@@ -58,6 +63,7 @@ def _build_lfc_sim(args: argparse.Namespace):
     config.MPC.gain_fd_epsilon = args.gain_fd_epsilon
     config.MPC.gain_fd_scheme = args.gain_fd_scheme
     config.MPC.gain_fd_num_samples = args.gain_fd_samples
+    config.MPC.dt = args.dt
     config.MPC.horizon = args.horizon
     config.MPC.num_parallel_computations = args.samples
     config.MPC.num_control_points = args.control_points
@@ -84,16 +90,101 @@ def _compile_controller(sim, planner, config) -> None:
     jax.block_until_ready(sim.controller.gains)
 
 
-def _lfc_step(sim, planner, config, args: argparse.Namespace) -> dict[str, float]:
-    low_dt = config.MPC.dt / args.substeps
-    torque_limits = np.asarray(planner.torque_limits, dtype=np.float64)
+def _apply_lfc_control(
+    sim,
+    planner,
+    control: dict[str, np.ndarray] | None,
+    duration_sec: float,
+    substeps_per_control_period: int,
+    control_period_sec: float,
+    *,
+    clip_torque: bool,
+    clip_velocity: bool,
+) -> float:
+    if control is None or duration_sec <= 0.0:
+        return 0.0
 
-    desired = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
-    _reset_guess(sim, planner, config, jnp.asarray(desired, dtype=jnp.float32))
+    substep_dt = control_period_sec / substeps_per_control_period
+    substeps = max(1, int(np.ceil(duration_sec / substep_dt)))
+    torque_limits = np.asarray(planner.torque_limits, dtype=np.float64)
+    feedback_peak = 0.0
+
+    for substep in range(substeps):
+        dt = min(substep_dt, duration_sec - substep * substep_dt)
+        if dt <= 0.0:
+            break
+        measured = np.asarray(
+            jax.block_until_ready(sim.current_state_vec()),
+            dtype=np.float64,
+        )
+        feedback = control["K_lfc"] @ (control["desired"] - measured)
+        feedback_peak = max(
+            feedback_peak,
+            float(np.max(np.abs(feedback), initial=0.0)),
+        )
+        tau = control["tau_ff"] + feedback
+        if clip_torque:
+            tau = np.clip(tau, -torque_limits, torque_limits)
+        next_state = sim.model.integrate_sim(
+            sim.current_state,
+            jnp.asarray(tau, dtype=jnp.float32),
+            dt,
+        )
+        if clip_velocity:
+            velocity_limits = jnp.asarray(FRANKA_ARM_VELOCITY_LIMITS, dtype=jnp.float32)
+            next_state = next_state.at[planner.nq : planner.nq + planner.nv].set(
+                jnp.clip(
+                    next_state[planner.nq : planner.nq + planner.nv],
+                    -velocity_limits,
+                    velocity_limits,
+                )
+            )
+        sim.current_state = next_state
+
+    return feedback_peak
+
+
+def _predict_state(sim, state: np.ndarray, tau: np.ndarray, dt: float) -> np.ndarray:
+    predicted = sim.model.integrate_sim(
+        jnp.asarray(state, dtype=jnp.float32),
+        jnp.asarray(tau, dtype=jnp.float32),
+        dt,
+    )
+    return np.asarray(jax.block_until_ready(predicted), dtype=np.float64)
+
+
+def _desired_state_for_control(
+    sim,
+    args: argparse.Namespace,
+    base_state: np.ndarray,
+    tau_ff: np.ndarray,
+    control_period_sec: float,
+) -> np.ndarray:
+    if args.desired_state_mode == "base":
+        return base_state
+    if args.desired_state_mode == "midpoint":
+        return _predict_state(
+            sim,
+            base_state,
+            tau_ff,
+            0.5 * control_period_sec,
+        )
+    if args.desired_state_mode == "next":
+        return _predict_state(
+            sim,
+            base_state,
+            tau_ff,
+            control_period_sec,
+        )
+    raise ValueError(f"unsupported desired_state_mode={args.desired_state_mode!r}")
+
+
+def _plan_control(sim, planner, config, args: argparse.Namespace, state: np.ndarray):
+    _reset_guess(sim, planner, config, jnp.asarray(state, dtype=jnp.float32))
 
     start = time.perf_counter()
     input_sequence = sim.controller.command(
-        jnp.asarray(desired, dtype=jnp.float32),
+        jnp.asarray(state, dtype=jnp.float32),
         sim.const_reference,
         num_steps=1,
     )
@@ -102,35 +193,103 @@ def _lfc_step(sim, planner, config, args: argparse.Namespace) -> dict[str, float
     tau_ff = np.asarray(input_sequence[0], dtype=np.float64)
     planning_ms = (time.perf_counter() - start) * 1000.0
 
-    # Same convention as the ROS bridge: SB-MPC exposes du/dx_measured,
-    # while LFC multiplies (desired - measured).
-    K_lfc = -K_sbmpc
+    return {
+        "tau_ff": tau_ff,
+        # Same convention as the ROS bridge: SB-MPC exposes du/dx_measured,
+        # while LFC multiplies (desired - measured).
+        "K_lfc": -K_sbmpc,
+        "gain_norm": float(np.linalg.norm(K_sbmpc)),
+        "planning_ms": planning_ms,
+    }
+
+
+def _lfc_step(
+    sim,
+    planner,
+    config,
+    args: argparse.Namespace,
+    previous_control: dict[str, np.ndarray] | None,
+    previous_planning_ms: float,
+) -> tuple[dict[str, float], dict[str, np.ndarray]]:
+    control_period_sec = config.MPC.dt
+    timer_to_publish_delay_sec = previous_planning_ms * 1e-3
+
+    if args.timing_mode == "gazebo":
+        # In ROS, the previous control remains active from the last publish
+        # until the next timer tick, then also while the new plan is computing.
+        pre_timer_duration = max(0.0, control_period_sec - timer_to_publish_delay_sec)
+        _apply_lfc_control(
+            sim,
+            planner,
+            previous_control,
+            pre_timer_duration,
+            args.substeps,
+            control_period_sec,
+            clip_torque=args.clip_torque,
+            clip_velocity=args.clip_velocity,
+        )
+
+    planning_state = np.asarray(
+        jax.block_until_ready(sim.current_state_vec()),
+        dtype=np.float64,
+    )
+    planned_control = _plan_control(sim, planner, config, args, planning_state)
+
     feedback_peak = 0.0
-    for _substep in range(args.substeps):
-        measured = np.asarray(
-            jax.block_until_ready(sim.current_state_vec()),
-            dtype=np.float64,
+    if args.timing_mode == "gazebo":
+        feedback_peak = _apply_lfc_control(
+            sim,
+            planner,
+            previous_control,
+            planned_control["planning_ms"] * 1e-3,
+            args.substeps,
+            control_period_sec,
+            clip_torque=args.clip_torque,
+            clip_velocity=args.clip_velocity,
         )
-        feedback = K_lfc @ (desired - measured)
-        feedback_peak = max(
-            feedback_peak,
-            float(np.max(np.abs(feedback), initial=0.0)),
+        desired_base = (
+            np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
+            if args.retime_initial_state
+            else planning_state
         )
-        tau = np.clip(tau_ff + feedback, -torque_limits, torque_limits)
-        sim.current_state = sim.model.integrate_sim(
-            sim.current_state,
-            jnp.asarray(tau, dtype=jnp.float32),
-            low_dt,
+    else:
+        desired_base = planning_state
+
+    desired = _desired_state_for_control(
+        sim,
+        args,
+        desired_base,
+        planned_control["tau_ff"],
+        control_period_sec,
+    )
+
+    current_control = {
+        "tau_ff": planned_control["tau_ff"],
+        "K_lfc": planned_control["K_lfc"],
+        "desired": desired,
+    }
+
+    if args.timing_mode == "immediate":
+        feedback_peak = _apply_lfc_control(
+            sim,
+            planner,
+            current_control,
+            control_period_sec,
+            args.substeps,
+            control_period_sec,
+            clip_torque=args.clip_torque,
+            clip_velocity=args.clip_velocity,
         )
 
     state_np = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
-    return {
+    metrics = {
         "error": _ee_error(planner, state_np),
-        "gain_norm": float(np.linalg.norm(K_sbmpc)),
+        "gain_norm": planned_control["gain_norm"],
         "feedback_peak": feedback_peak,
-        "planning_ms": planning_ms,
+        "planning_ms": planned_control["planning_ms"],
         "state": state_np,
     }
+    return metrics, current_control
 
 
 def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
@@ -141,11 +300,21 @@ def run_lfc_validation(args: argparse.Namespace) -> dict[str, object]:
     plan_times_ms: list[float] = []
     q_history: list[np.ndarray] = []
     v_history: list[np.ndarray] = []
+    previous_control: dict[str, np.ndarray] | None = None
+    previous_planning_ms = 0.0
 
     _compile_controller(sim, planner, config)
 
     for _ in range(args.steps):
-        metrics = _lfc_step(sim, planner, config, args)
+        metrics, previous_control = _lfc_step(
+            sim,
+            planner,
+            config,
+            args,
+            previous_control,
+            previous_planning_ms,
+        )
+        previous_planning_ms = metrics["planning_ms"]
         state_np = metrics["state"]
         errors.append(metrics["error"])
         gain_norms.append(metrics["gain_norm"])
@@ -174,12 +343,22 @@ def run_lfc_visual(args: argparse.Namespace) -> None:
     visualizer = construct_mj_visualizer_from_model(sim.model, config)
 
     try:
+        previous_control: dict[str, np.ndarray] | None = None
+        previous_planning_ms = 0.0
         for step_idx in range(args.steps):
             if not visualizer.is_running():
                 break
 
             step_start = time.perf_counter()
-            metrics = _lfc_step(sim, planner, config, args)
+            metrics, previous_control = _lfc_step(
+                sim,
+                planner,
+                config,
+                args,
+                previous_control,
+                previous_planning_ms,
+            )
+            previous_planning_ms = metrics["planning_ms"]
             state_np = metrics["state"]
             visualizer.set_qpos(state_np[: planner.nq])
 
@@ -242,10 +421,16 @@ def main() -> None:
     parser.add_argument("--print-every", type=int, default=1)
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--substeps", type=int, default=20)
+    parser.add_argument("--timing-mode", choices=("immediate", "gazebo"), default="gazebo")
+    parser.add_argument("--retime-initial-state", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--desired-state-mode", choices=("base", "midpoint", "next"), default="base")
+    parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--clip-velocity", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gain-method", choices=("exact", "finite_difference", "local_lqr"), default="exact")
     parser.add_argument("--gain-fd-epsilon", type=float, default=1e-3)
     parser.add_argument("--gain-fd-scheme", choices=("forward", "central"), default="forward")
     parser.add_argument("--gain-fd-samples", type=int, default=256)
+    parser.add_argument("--dt", type=float, default=0.02)
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--samples", type=int, default=1024)
     parser.add_argument("--control-points", type=int, default=8)
@@ -254,13 +439,18 @@ def main() -> None:
         raise ValueError("--steps must be positive.")
     if args.substeps <= 0:
         raise ValueError("--substeps must be positive.")
+    if args.dt <= 0.0:
+        raise ValueError("--dt must be positive.")
     if args.print_every <= 0:
         raise ValueError("--print-every must be positive.")
 
     print(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
     print(
-        f"h={args.horizon} samples={args.samples} cp={args.control_points} "
-        f"gain_method={args.gain_method} substeps={args.substeps}"
+        f"dt={args.dt} h={args.horizon} samples={args.samples} cp={args.control_points} "
+        f"gain_method={args.gain_method} substeps={args.substeps} "
+        f"timing={args.timing_mode} retime={args.retime_initial_state} "
+        f"desired={args.desired_state_mode} clip_torque={args.clip_torque} "
+        f"clip_velocity={args.clip_velocity}"
     )
     if args.visual:
         run_lfc_visual(args)

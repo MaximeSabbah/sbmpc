@@ -401,6 +401,21 @@ class PandaPregraspController:
             diagnostics=diagnostics,
         )
 
+    def predict_state(
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        tau: np.ndarray,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        q = PandaPickAndPlaceController._joint_vector(q, self.planner.nq, "q")
+        v = PandaPickAndPlaceController._joint_vector(v, self.planner.nv, "v")
+        tau = PandaPickAndPlaceController._joint_vector(tau, self.planner.nu, "tau")
+        state = jnp.concatenate([q, v], axis=0)
+        predicted = self.model.integrate_sim(state, tau, float(dt))
+        predicted = np.asarray(jax.block_until_ready(predicted), dtype=np.float32)
+        return predicted[: self.planner.nq], predicted[self.planner.nq :]
+
     def _seed_nominal_solution(self, state: jax.Array) -> None:
         dt_arg = self.planner.step_durations(
             self.config.MPC.horizon,
