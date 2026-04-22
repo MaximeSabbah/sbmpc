@@ -37,6 +37,7 @@ dev = [
     "ruff>=0.15",
 ]
 panda = [
+    "frax==0.0.2",
     "jaxsim>=0.8.1",
     "robot_descriptions>=1.17.0",
 ]
@@ -68,6 +69,7 @@ build = "hatch build"
 sbmpc = { path = ".", editable = true, extras = ["dev", "panda"] }
 hatch-vcs = "*"
 hatch = "*"
+jaxadi = "*"
 
 # CUDA feature (Linux only)
 [tool.pixi.feature.cuda]
