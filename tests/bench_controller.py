@@ -160,7 +160,7 @@ def _run_quality(planner, objective, config, n_steps=N_QUALITY, gain_update_freq
     sim.warm_start_fn = lambda state: planner.nominal_torque_sequence_from_state(
         state,
         config.MPC.horizon,
-        _seed_dt_argument(planner, config),
+        config.MPC.dt,
     )
     sim.gain_update_freq = gain_update_freq
 
@@ -286,7 +286,7 @@ def run_visual(planner, objective, config, *, gain_update_freq=1):
     sim.warm_start_fn = lambda state: planner.nominal_torque_sequence_from_state(
         state,
         config.MPC.horizon,
-        _seed_dt_argument(planner, config),
+        config.MPC.dt,
     )
     sim.gain_update_freq = gain_update_freq
 
@@ -312,8 +312,7 @@ def run_visual(planner, objective, config, *, gain_update_freq=1):
         f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
         f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
         f"fd={config.MPC.gain_fd_num_samples}  gf={gain_update_freq}  "
-        f
-)
+    )
     sim.simulate()
 
 
@@ -342,17 +341,13 @@ def main():
     objective = PandaPregraspObjective(planner)
 
     if args.visual:
-        config = make_panda_pregrasp_config(planner, visualize=True, gains=args.gains)
-        if args.horizon is not None:
-            config.MPC.horizon = args.horizon
-        if args.samples is not None:
-            config.MPC.num_parallel_computations = args.samples
-        if args.control_points is not None:
-            config.MPC.num_control_points = args.control_points
+        config = make_panda_pregrasp_config(planner, visualize=True, gains=True)
+        config.MPC.horizon = args.horizon if args.horizon is not None else 8
+        config.MPC.num_parallel_computations = args.samples if args.samples is not None else 1024
+        config.MPC.num_control_points = args.control_points if args.control_points is not None else 8
         if args.gain_fd_samples is not None:
             config.MPC.gain_fd_num_samples = args.gain_fd_samples
-        if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
-            _reset_initial_guess(planner, config)
+        _reset_initial_guess(planner, config)
         run_visual(
             planner,
             objective,
@@ -452,7 +447,7 @@ def main():
     # Gains overhead: compare to same config with gains disabled
     if args.gains:
         config_ng = make_panda_pregrasp_config(planner, visualize=False, gains=False)
-            config_ng.MPC.horizon = config.MPC.horizon
+        config_ng.MPC.horizon = config.MPC.horizon
         config_ng.MPC.num_parallel_computations = config.MPC.num_parallel_computations
         config_ng.MPC.num_control_points = config.MPC.num_control_points
         _reset_initial_guess(planner, config_ng)
