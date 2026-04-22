@@ -395,26 +395,13 @@ def _joint_vel_hf_energy(v: np.ndarray, dt: float, f_lo: float = 5.0, f_hi: floa
     return float(np.max(magnitude) / max(norm, 1e-12))
 
 
-def _emit_reference(args: argparse.Namespace, result: dict[str, object], path: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+def _build_reference_panel(args: argparse.Namespace, result: dict[str, object]) -> dict:
     plan_times_ms = np.asarray(result["plan_times_ms"], dtype=np.float64)
     errors = np.asarray(result["errors"], dtype=np.float64)
     v = np.asarray(result["v_history"], dtype=np.float64)
     tail_start = len(v) // 2
-    tail_v = v[tail_start:]
-    hf_energy = _joint_vel_hf_energy(tail_v, args.dt)
-    payload = {
-        "config": {
-            "gain_method": args.gain_method,
-            "dt": float(args.dt),
-            "horizon": int(args.horizon),
-            "samples": int(args.samples),
-            "control_points": int(args.control_points),
-            "substeps": int(args.substeps),
-            "timing_mode": args.timing_mode,
-            "steps": int(args.steps),
-            "backend": jax.default_backend(),
-        },
+    hf_energy = _joint_vel_hf_energy(v[tail_start:], args.dt)
+    return {
         "errors": errors.tolist(),
         "gain_norms": np.asarray(result["gain_norms"], dtype=np.float64).tolist(),
         "feedback_peaks": np.asarray(result["feedback_peaks"], dtype=np.float64).tolist(),
@@ -436,9 +423,40 @@ def _emit_reference(args: argparse.Namespace, result: dict[str, object], path: s
             "feedback_peak_max": float(np.max(np.asarray(result["feedback_peaks"]))),
         },
     }
+
+
+def _emit_reference(args: argparse.Namespace, path: str) -> None:
+    """Run both timing modes and write a two-panel reference JSON.
+
+    The `immediate` panel is the controller-correctness gate (no publish delay).
+    The `gazebo` panel models the ROS publish delay that the real robot will see,
+    and is what Gazebo recordings should be compared against.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    panels: dict[str, dict] = {}
+    for mode in ("immediate", "gazebo"):
+        args.timing_mode = mode
+        print(f"--- emit-reference: running timing_mode={mode} ---")
+        result = run_lfc_validation(args)
+        _print_summary(result)
+        panels[mode] = _build_reference_panel(args, result)
+    payload = {
+        "config": {
+            "gain_method": args.gain_method,
+            "dt": float(args.dt),
+            "horizon": int(args.horizon),
+            "samples": int(args.samples),
+            "control_points": int(args.control_points),
+            "substeps": int(args.substeps),
+            "steps": int(args.steps),
+            "backend": jax.default_backend(),
+        },
+        "immediate": panels["immediate"],
+        "gazebo": panels["gazebo"],
+    }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"wrote reference -> {path}")
+    print(f"wrote two-panel reference -> {path}")
 
 
 def _print_summary(result: dict[str, object]) -> None:
@@ -482,10 +500,10 @@ def main() -> None:
     parser.add_argument("--print-every", type=int, default=1)
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--substeps", type=int, default=20)
-    parser.add_argument("--timing-mode", choices=("immediate", "gazebo"), default="gazebo")
+    parser.add_argument("--timing-mode", choices=("immediate", "gazebo"), default="immediate")
     parser.add_argument("--retime-initial-state", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--desired-state-mode", choices=("base", "midpoint", "next"), default="base")
-    parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--clip-velocity", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gain-method", choices=("exact", "finite_difference"), default="exact")
     parser.add_argument("--gain-fd-epsilon", type=float, default=1e-3)
@@ -521,11 +539,11 @@ def main() -> None:
     )
     if args.visual:
         run_lfc_visual(args)
+    elif args.emit_reference is not None:
+        _emit_reference(args, args.emit_reference)
     else:
         result = run_lfc_validation(args)
         _print_summary(result)
-        if args.emit_reference is not None:
-            _emit_reference(args, result, args.emit_reference)
 
 
 if __name__ == "__main__":
