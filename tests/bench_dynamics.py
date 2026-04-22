@@ -7,33 +7,30 @@ The model includes the Panda hand (mass 0.73 kg) attached as a fixed end-effecto
 matching real deployment conditions.
 
 The Feedback-MPPI gains require:
-    jax.vmap(jax.value_and_grad(rollout_single, argnums=0))
-which backpropagates through the integrator and dynamics. Therefore ALL backends
-must be JAX-differentiable. This eliminates CusADi (CUDA kernels), MJX-Warp (no
+    jax.vmap(jax.jvp(cost_from_state, ...))
+through the rollout, integrator, and dynamics. Therefore ALL backends must be
+JAX-differentiable. This eliminates CusADi (CUDA kernels), MJX-Warp (no
 autodiff), and GRiD (C++/CUDA).
 
 Backends tested:
-  A) JaxSim ABA — build() inside JIT            [CURRENT CODE]
-  D) MJX-JAX — mjx.forward, full Panda w/ hand  [CANDIDATE]
-  E) Pinocchio + CasADi + Jaxadi                [SYMBOLIC → JAX, fwd only]
-  F) ADAM-JAX — CRBA + RNEA forward dynamics    [CANDIDATE]
+  A) JaxSim ABA — build() inside JIT             [CURRENT CODE]
+  B) MJX-JAX — mjx.forward, harmonized URDF      [CANDIDATE]
+  C) Pinocchio + CasADi + Jaxadi                 [SYMBOLIC -> JAX, fwd only]
+  D) Frax — CRBA + RNEA forward dynamics         [CANDIDATE]
 
 MODEL CONSISTENCY:
   All backends use the same physical model: 7-DoF Panda arm + hand (fixed).
-  - JaxSim / ADAM: build from panda.urdf (robot_descriptions), reduce to 7 arm
-    joints — the hand+fingers inertia is lumped into panda_link7.
-  - Pinocchio: same URDF, lock finger joints (hand stays via fixed joints).
-  - MJX: panda.xml (7 arm joints + 2 finger joints). Fingers are locked at
-    q=0, qd=0, τ=0 internally — the hand body is present with correct mass.
-  Minor residuals between methods (< 5 rad/s²) are expected because JaxSim
-  lumps the hand into link7 while Pinocchio/MJX keep it as a separate body.
+  The benchmark writes one harmonized URDF with visual/collision geometry
+  stripped and the two gripper joints converted to fixed joints.  JaxSim,
+  MJX, Pinocchio/Jaxadi, and Frax all load that same file, so the hand and
+  fingers are fused into the arm chain before timing or correctness checks.
 
-FAIRNESS FIXES (panda.xml):
+FAIRNESS FIXES (MuJoCo model):
   Zeroed: actuator gainprm/biasprm (PD gains were injecting −4500q−450qd),
           dof_damping (XML=1 vs URDF≈0.003), dof_armature (XML=0.1).
 
 Gradient benchmark:
-  E (Pinocchio+Jaxadi) is excluded — it is ~30× slower than others and adds
+  C (Pinocchio+Jaxadi) is excluded — it is ~30× slower than others and adds
   no information beyond the forward comparison.
 
 Usage:
@@ -42,12 +39,12 @@ Usage:
     pixi run -e cuda python tests/bench_dynamics.py --skip-grad
     pixi run -e cuda python tests/bench_dynamics.py --skip-mjx
     pixi run -e cuda python tests/bench_dynamics.py --skip-jaxadi
-    pixi run -e cuda python tests/bench_dynamics.py --skip-adam
+    pixi run -e cuda python tests/bench_dynamics.py --skip-frax
 
 Dependencies beyond sbmpc:
-    jaxsim robot-descriptions mujoco-mjx           # A, D
-    pinocchio casadi jaxadi                        # E  (in pixi cuda env)
-    adam-robotics[jax]                             # F  (add to pyproject.toml)
+    jaxsim robot-descriptions mujoco-mjx           # A, B
+    pinocchio casadi jaxadi                        # C  (in pixi cuda env)
+    frax                                           # D
 """
 from __future__ import annotations
 
@@ -55,17 +52,19 @@ import argparse
 import dataclasses
 import time
 import traceback
-from pathlib import Path
 from typing import NamedTuple
 
 import jax
+
+# Frax recommends double precision for high-accuracy dynamics checks.
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import numpy as np
 
 import jaxsim.api as js
 import jaxsim.parsers.rod as rodp
 from robot_descriptions.panda_description import URDF_PATH
-from robot_descriptions.panda_mj_description import MJCF_PATH
 import xml.etree.ElementTree as ET
 
 import casadi as cs
@@ -74,14 +73,15 @@ import pinocchio.casadi as cpin
 from jaxadi import convert
 import mujoco
 from mujoco import mjx
-import jaxsim.api as js
 
 # ── Configuration ──────────────────────────────────────────────────────────
 DEFAULT_BATCH_SIZES = [32, 512, 2048]
 N_WARMUP = 10
 N_TRIALS = 300
-NQ = NQ_MJX = 9     # panda.xml has 7 arm + 2 finger joints
+NQ = 7
 DT = 0.02
+PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{i}" for i in range(1, NQ + 1))
+PANDA_GRIPPER_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
 
 
 class BenchResult(NamedTuple):
@@ -132,40 +132,64 @@ def make_state_and_tau(key, K=None):
 # JaxSim shared helpers
 # ══════════════════════════════════════════════════════════════════════════
 
-def _make_stripped_urdf(urdf_path: str) -> str:
-    """
-    Write a copy of the URDF with <visual> and <collision> blocks removed,
-    and a <mujoco><compiler.../></mujoco> tag injected so MuJoCo's URDF
-    loader can parse it without needing the mesh files.  All three backends
-    (JaxSim, Pinocchio, MuJoCo/MJX) then read the *same* file, so every
-    mass / inertia / joint-axis / body-pose is byte-identical.  This is the
-    only way to get the three engines to agree to machine precision.
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
-    Notes:
-      * Pinocchio and JaxSim parse the URDF and collapse fixed joints
-        (panda_joint8, panda_hand_joint, panda_hand_tcp_joint).  This
-        merges panda_link7 + panda_link8 + panda_hand into a single inertia
-        on joint7 (mass 1.46552 kg, i.e. 0.73552 + 0.73).
-      * MuJoCo's URDF loader also collapses fixed joints, so it produces
-        the same merged body.  Confirmed empirically: after the strip,
-        `body_mass[panda_link7] == 1.465522`, matching Pinocchio exactly.
+
+def _make_harmonized_urdf(urdf_path: str) -> str:
     """
-    import re, tempfile
-    txt = open(urdf_path).read()
-    txt = re.sub(r'<visual>.*?</visual>',      '', txt, flags=re.S)
-    txt = re.sub(r'<collision>.*?</collision>', '', txt, flags=re.S)
-    # Inject compile hints right after <robot ...>
-    txt = re.sub(
-        r'(<robot[^>]*>)',
-        r'\1\n  <mujoco>\n'
-        r'    <compiler balanceinertia="true" discardvisual="false"/>\n'
-        r'  </mujoco>\n',
-        txt, count=1,
+    Write one benchmark URDF shared by every backend.
+
+    Visual/collision blocks are stripped so MuJoCo does not need mesh assets.
+    The two finger joints are converted to fixed joints before parsing, which
+    follows Frax's README recommendation for uncontrolled gripper joints and
+    matches the 7-DoF arm dynamics used by the sbmpc Panda controller.
+    """
+    import tempfile
+
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+
+    for parent in root.iter():
+        for child in list(parent):
+            if _local_name(child.tag) in {"visual", "collision"}:
+                parent.remove(child)
+
+    fixed_joint_children = {
+        "axis",
+        "calibration",
+        "dynamics",
+        "limit",
+        "mimic",
+        "safety_controller",
+    }
+    for joint in root.iter():
+        if _local_name(joint.tag) != "joint":
+            continue
+        if joint.attrib.get("name") not in PANDA_GRIPPER_JOINT_NAMES:
+            continue
+        joint.set("type", "fixed")
+        for child in list(joint):
+            if _local_name(child.tag) in fixed_joint_children:
+                joint.remove(child)
+
+    mujoco_tag = ET.Element("mujoco")
+    ET.SubElement(
+        mujoco_tag,
+        "compiler",
+        {
+            "balanceinertia": "true",
+            "discardvisual": "false",
+        },
     )
+    root.insert(0, mujoco_tag)
+    ET.indent(tree, space="  ")
+
     tmp = tempfile.NamedTemporaryFile(
         mode='w', suffix='_harmonized.urdf', delete=False,
     )
-    tmp.write(txt); tmp.close()
+    tree.write(tmp, encoding="unicode", xml_declaration=False)
+    tmp.close()
     return tmp.name
 
 
@@ -248,9 +272,8 @@ def _build_models():
          gravity pointing UP).  Leaving this default makes qacc come out
          as the exact negative of Pinocchio's.  Confirmed by reading
          `jaxsim.rbda.utils`:  `W_g = [0, 0, standard_gravity, 0, 0, 0]`.
-      2. All three backends read the *same* URDF, so the 1.8e-5 inertia
-         drift we had between example-robot-data's URDF and
-         mujoco_menagerie's MJCF is eliminated by construction.
+      2. All backends read the *same* harmonized URDF, so model-file drift is
+         eliminated by construction.
       3. MuJoCo's per-body inertial parameters are overwritten with
          Pinocchio's values to eliminate the ~7 rad/s² disagreement
          caused by MuJoCo's URDF loader merging fixed joints into link7
@@ -259,7 +282,7 @@ def _build_models():
     """
     import jaxsim.math as _jsm
 
-    harmonized_urdf = _make_stripped_urdf(URDF_PATH)
+    harmonized_urdf = _make_harmonized_urdf(URDF_PATH)
 
     # JaxSim — pass gravity=-STANDARD_GRAVITY to get a PHYSICAL (downward)
     # gravity vector instead of JaxSim's default +9.81 upward.
@@ -279,9 +302,17 @@ def _build_models():
 
 def _js_reorder(js_model):
     names = tuple(js_model.joint_names())
-    e2j = jnp.array([names.index(n) for n in js_model.joint_names()], dtype=jnp.int32)
-    j2e = jnp.array(np.argsort(np.array(e2j)), dtype=jnp.int32)
-    return e2j, j2e
+    if set(names) != set(PANDA_ARM_JOINT_NAMES):
+        raise ValueError(f"Unexpected JaxSim joints: {names}")
+    js_to_external = jnp.array(
+        [PANDA_ARM_JOINT_NAMES.index(n) for n in names],
+        dtype=jnp.int32,
+    )
+    external_to_js = jnp.array(
+        [names.index(n) for n in PANDA_ARM_JOINT_NAMES],
+        dtype=jnp.int32,
+    )
+    return js_to_external, external_to_js
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -289,24 +320,24 @@ def _js_reorder(js_model):
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_A(js_model):
-    e2j, j2e = _js_reorder(js_model)
+    js_to_external, external_to_js = _js_reorder(js_model)
 
     def aba(q, qd, tau):
         data = js.data.JaxSimModelData.build(
             model=js_model,
-            joint_positions=jnp.take(q, j2e, axis=-1),
-            joint_velocities=jnp.take(qd, j2e, axis=-1),
+            joint_positions=jnp.take(q, js_to_external, axis=-1),
+            joint_velocities=jnp.take(qd, js_to_external, axis=-1),
         )
         _, ddq = js.model.forward_dynamics_aba(
             model=js_model, data=data,
-            joint_forces=jnp.take(tau, j2e, axis=-1),
+            joint_forces=jnp.take(tau, js_to_external, axis=-1),
         )
-        return jnp.take(ddq, e2j, axis=-1)
+        return jnp.take(ddq, external_to_js, axis=-1)
     return jax.jit(aba)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# B: MJX-JAX — mjx.forward, full Panda model WITH hand
+# B: MJX-JAX — mjx.forward, harmonized URDF
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_B(mj_model):
@@ -319,10 +350,8 @@ def build_B(mj_model):
     not run (no while_loop → reverse-mode AD still works).
 
     Works with both the harmonized URDF (no actuators/tendons/equalities
-    are present) and the menagerie MJCF (everything is present and gets
-    zeroed).  The original code assumed NQ == NQ_MJX == 9 and padded
-    inputs; with the harmonized URDF there is no padding to do because
-    all three backends share the same DoF count.
+    are present) and the 7-DoF fixed-gripper model used here. There is no
+    padding to do because all backends share the same DoF count.
     """
     mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
     mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONSTRAINT
@@ -334,10 +363,12 @@ def build_B(mj_model):
     mj_model.dof_frictionloss[:] = 0.0
     mj_model.dof_armature[:]     = 0.0
 
+    nq = int(mj_model.nq)
+    if nq != NQ or int(mj_model.nv) != NQ:
+        raise ValueError(f"MuJoCo loaded nq={mj_model.nq}, nv={mj_model.nv}; expected {NQ}")
+
     mjx_model    = mjx.put_model(mj_model)
     mjx_data_tpl = mjx.make_data(mj_model)
-
-    nq = int(mj_model.nq)
 
     def fwd(q, qd, tau):
         data = mjx_data_tpl.replace(qpos=q, qvel=qd, qfrc_applied=tau)
@@ -359,6 +390,10 @@ def build_C(pin_model):
     to get a plain (NQ,) JAX array.
     """
 
+    pin_joint_names = tuple(pin_model.names[1:])
+    if pin_joint_names != PANDA_ARM_JOINT_NAMES:
+        raise ValueError(f"Unexpected Pinocchio joints: {pin_joint_names}")
+
     cmodel = cpin.Model(pin_model)
     cdata = cmodel.createData()
 
@@ -379,50 +414,28 @@ def build_C(pin_model):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# D: ADAM-JAX — CRBA + RNEA forward dynamics (not working yet)
+# D: Frax — CRBA + RNEA forward dynamics
 # ══════════════════════════════════════════════════════════════════════════
 
-# def build_D(urdf_path: str, joints_name_list: list[str]):
-#     """
-#     ADAM (Automatic Differentiation for rigid-body dynamics Algorithm in
-#     Multi-body systems) JAX backend. 
-#     """
-#     try:
-#         from adam.jax import KinDynComputations
-#         from adam import Representations
-#     except ImportError as exc:
-#         raise ImportError(
-#             "ADAM not installed.  Add to pyproject.toml:\n"
-#             "then run: pixi install"
-#         ) from exc
-        
-#     comp = KinDynComputations(
-#         urdf_path,
-#         joints_name_list=joints_name_list,
-#         # Fixed-base: gravity vector can be optionally specified
-#         gravity=jnp.array([0, 0, -9.80665, 0, 0, 0])
-#     )
-    
-#     # Set velocity representation
-#     comp.set_frame_velocity_representation(Representations.MIXED_REPRESENTATION)
+def build_D(urdf_path: str):
+    try:
+        import frax
+    except ImportError as exc:
+        raise ImportError(
+            "Frax not installed. Run: pixi install"
+        ) from exc
 
-#     # Fixed-base constants (traced once into the JIT graph)
-#     H_b = jnp.eye(4)     # base homogeneous transform: identity = fixed at world
-#     vB  = jnp.zeros(6)   # base spatial velocity = 0
+    robot = frax.Robot(
+        urdf_path,
+        joint_ordering=list(PANDA_ARM_JOINT_NAMES),
+    )
+    if robot.num_joints != NQ:
+        raise ValueError(f"Frax loaded {robot.num_joints} joints, expected {NQ}")
 
-#     def aba(q, qd, tau):
-#         qdd = comp.aba(
-#             base_transform=H_b,
-#             joint_positions=q,
-#             base_velocity=vB,
-#             joint_velocities=qd,
-#             joint_torques=tau
-#         )
-#         # The return value is a 1D array: [base_acceleration (6), joint_accelerations (n)]
-#         # For a fixed-base robot, we only need the joint part.
-#         return qdd[6:]
+    def aba(q, qd, tau):
+        return robot.forward_dynamics(q, qd, tau, fext=None)
 
-#     return jax.jit(aba)
+    return jax.jit(aba), robot
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -440,11 +453,19 @@ def make_si_euler(aba_fn):
     return step
 
 
-def make_grad_step(integrator_fn):
-    """grad(cost_of_one_step) w.r.t. state — Feedback-MPPI atomic unit."""
+def make_state_gradient_step(integrator_fn):
+    """d cost/d state via the same vmap(jvp) pattern used by exact gains."""
+    basis = jnp.eye(2 * NQ)
+
     def loss(state, tau):
         return jnp.sum(jnp.square(integrator_fn(state, tau)))
-    return jax.jit(jax.grad(loss, argnums=0))
+
+    def state_gradient(state, tau):
+        return jax.vmap(
+            lambda tangent: jax.jvp(lambda x: loss(x, tau), (state,), (tangent,))[1]
+        )(basis)
+
+    return jax.jit(state_gradient)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -455,12 +476,11 @@ def check_mjx_vs_native_mujoco(mj_model):
     """
     Acid test for MJX: compare MJX.forward to the native MuJoCo C++ engine
     (mujoco.mj_forward) on the SAME MjModel.  If these two agree, MJX is
-    computing the right thing *for this MJCF* and any remaining residual vs
-    JaxSim/Pinocchio (which read the URDF) is a model-file difference, not
-    an MJX bug.  If they disagree, the MJX glue code is wrong.
+    computing the right thing for the harmonized URDF.  If they disagree,
+    the MJX glue code is wrong.
     """
     print(f"\n{'='*75}")
-    print("  MJX vs native MuJoCo (same MJCF) — validates MJX itself")
+    print("  MJX vs native MuJoCo (same harmonized model) — validates MJX itself")
     print(f"{'='*75}")
 
     # Rebuild the MJX callable inline so we don't depend on build_B's fn dict.
@@ -513,66 +533,38 @@ def check_mjx_vs_native_mujoco(mj_model):
 
     if max(err0, err1) < 1e-4:
         print("  → MJX agrees with native MuJoCo.  MJX is computing the right")
-        print("    thing for this MJCF.  Residuals vs JaxSim/Pinocchio come")
-        print("    from URDF-vs-MJCF model differences, not an MJX bug.")
+        print("    thing for this harmonized MuJoCo model.")
     else:
         print("  → MJX disagrees with native MuJoCo — MJX usage is broken.")
         print("    Likely causes: stale Data field (qacc_warmstart, qfrc_passive),")
         print("    missing/forgotten disableflags, or incorrect field replace().")
 
 
-def check_correctness(aba_fns: dict, mj_model=None):
+def check_correctness(aba_fns: dict):
     """
     Call every available backend at the same (q, qd, tau) and compare qacc
     against A (JaxSim ABA) as the reference.
 
-    NOTE: A non-trivial residual between A (JaxSim/URDF), B (MJX/MJCF) and
-    C (Pinocchio/URDF) is EXPECTED with the current setup because:
-
-      * A and C read the Panda URDF from `robot_descriptions.panda_description`
-        (Gepetto/example-robot-data → franka_description).
-      * B reads the Panda MJCF from `robot_descriptions.panda_mj_description`
-        (google-deepmind/mujoco_menagerie).
-
-      These two descriptions are MAINTAINED INDEPENDENTLY and differ in:
-        - tiny inertia-tensor rounding (mujoco_menagerie lightly re-tunes
-          off-diagonal terms to stabilise the MuJoCo integrator),
-        - treatment of the two finger joints: the URDF declares
-          `panda_finger_joint2` as `<mimic joint="panda_finger_joint1"/>`,
-          the MJCF declares them as two independent slide joints coupled by
-          an <equality> (which we DISABLE via mjDSBL_CONSTRAINT for fairness).
-          With the equality off and mimic ignored by Pinocchio/JaxSim, all
-          three treat the fingers as two independent DoFs, so this cancels
-          on its own — but the random input below drives fingers to |q|=2m,
-          which is 50× beyond their 0.04m joint limit, so any per-body
-          parameter difference at the end of the kinematic chain gets
-          massively amplified.
-
-    To decide whether MJX is WRONG or just COMPUTING A (SLIGHTLY) DIFFERENT
-    MODEL, use `check_mjx_vs_native_mujoco()` — MJX vs the reference C++
-    MuJoCo on the *same* MJCF.  That is the real correctness test.
-
-    For URDF-vs-MJCF parameter drift, run `tests/debug_dynamics_diff.py`.
+    All backends load the same harmonized 7-DoF URDF. Any large residual is
+    therefore a backend glue bug or an inertial-parameter parsing difference.
     """
     print(f"\n{'='*75}")
     print("  CORRECTNESS CHECK — qacc agreement across backends")
-    print("  Reference: A (JaxSim ABA, URDF)")
+    print("  Reference: A (JaxSim ABA, harmonized URDF)")
     print(f"{'='*75}")
 
     if "A" not in aba_fns:
         print("  Reference A not available — skipping.")
         return
 
-    # ── Test 1: purely gravitational qacc (q=0, qd=0, tau=0). ──
-    #   Removes unphysical inputs.  Residuals here reflect only gravity +
-    #   inertia-matrix differences between URDF and MJCF.
+    backend_labels = [label for label in sorted(aba_fns) if label != "A"]
+
+    # Test 1: purely gravitational qacc (q=0, qd=0, tau=0).
     zq = jnp.zeros(NQ)
     a_A0 = np.asarray(jax.device_get(aba_fns["A"](zq, zq, zq)))
     print(f"\n  [TEST 1 — gravity only, q=qd=tau=0]")
     print(f"       A qacc: {np.round(a_A0, 4)}")
-    for label in ["B", "C", "D"]:
-        if label not in aba_fns:
-            continue
+    for label in backend_labels:
         try:
             out = np.asarray(jax.device_get(aba_fns[label](zq, zq, zq)))
             diff    = out - a_A0
@@ -582,7 +574,7 @@ def check_correctness(aba_fns: dict, mj_model=None):
         except Exception:
             print(f"       {label}: FAILED\n{traceback.format_exc()}")
 
-    # ── Test 2: the original random input (may be unphysical for fingers). ──
+    # Test 2: random arm state and torque.
     q_ref, qd_ref, tau_ref = make_inputs(jax.random.PRNGKey(0))
     ref = np.asarray(jax.device_get(aba_fns["A"](q_ref, qd_ref, tau_ref)))
     print(f"\n  [TEST 2 — random input, seed=0]")
@@ -591,13 +583,9 @@ def check_correctness(aba_fns: dict, mj_model=None):
     print(f"       tau : {np.round(tau_ref, 3)}")
     print(f"       A qacc: {np.round(ref, 4)}")
 
-    # ≤10 rad/s² tolerates lumped-vs-explicit hand difference.
-    # >> 10 signals a real model mismatch (wrong params or missing body).
-    THRESH = 10.0
+    THRESH = 1e-3
     all_ok = True
-    for label in ["B", "C", "D"]:
-        if label not in aba_fns:
-            continue
+    for label in backend_labels:
         try:
             out = np.asarray(jax.device_get(aba_fns[label](q_ref, qd_ref, tau_ref)))
             diff    = out - ref
@@ -615,35 +603,12 @@ def check_correctness(aba_fns: dict, mj_model=None):
         except Exception:
             print(f"       {label}: FAILED\n{traceback.format_exc()}")
 
-    # ── Test 3: SAME random input but with finger DoFs zeroed. ──
-    #   Fingers at |q|=2 m (vs 0.04 m joint limit) put their mass ~2 m away
-    #   from the hand.  Any small per-body inertia difference between URDF
-    #   and MJCF is amplified by r² ≈ 4 m².  If residuals shrink a lot when
-    #   fingers are zeroed, the mismatch is just model-drift being
-    #   amplified, not a real dynamics bug.
-    if NQ >= 9:
-        q0   = q_ref.at[7:].set(0.0)
-        qd0  = qd_ref.at[7:].set(0.0)
-        tau0 = tau_ref.at[7:].set(0.0)
-        refF = np.asarray(jax.device_get(aba_fns["A"](q0, qd0, tau0)))
-        print(f"\n  [TEST 3 — same input, finger DoFs zeroed]")
-        for label in ["B", "C", "D"]:
-            if label not in aba_fns:
-                continue
-            try:
-                out = np.asarray(jax.device_get(aba_fns[label](q0, qd0, tau0)))
-                max_abs = float(np.max(np.abs(out - refF)))
-                print(f"       {label} max|Δ vs A| = {max_abs:.3e}")
-            except Exception:
-                print(f"       {label}: FAILED")
-
     if all_ok:
         print("\n  All backends agree within threshold (test 2).")
     else:
-        print("\n  WARNING: test 2 disagrees beyond threshold.  This is almost")
-        print("  certainly a URDF-vs-MJCF model-parameter drift, amplified by")
-        print("  the out-of-range finger inputs.  Run `check_mjx_vs_native_mujoco`")
-        print("  and/or `tests/debug_dynamics_diff.py` to confirm.")
+        print(f"\n  WARNING: test 2 disagrees beyond {THRESH:.1e}.")
+        print("  Since all backends load the same fixed-gripper URDF, inspect the")
+        print("  reported qacc diff before trusting the timing table.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -678,13 +643,13 @@ def print_summary(title, results, batch_sizes):
     print(f"\n{'='*75}")
     print(f"  {title}")
     print(f"{'='*75}")
-    header = f"  {'Method':<42} {'JIT':>7}"
+    header = f"  {'Method':<42} {'JIT ms':>8}"
     for K in batch_sizes:
         header += f" K={K:<6}"
     print(header)
-    print(f"  {'─'*42} {'─'*7}" + " ───────" * len(batch_sizes))
+    print(f"  {'─'*42} {'─'*8}" + " ───────" * len(batch_sizes))
     for r in results:
-        row = f"  {r.name:<42} {r.jit_time_ms:6.0f}s"
+        row = f"  {r.name:<42} {r.jit_time_ms:7.0f}"
         for K in batch_sizes:
             row += f" {r.batch_ms.get(K, float('nan')):6.3f}"
         print(row)
@@ -710,7 +675,7 @@ def main():
     parser.add_argument("--skip-grad",    action="store_true")
     parser.add_argument("--skip-mjx",     action="store_true")
     parser.add_argument("--skip-jaxadi",  action="store_true")
-    parser.add_argument("--skip-adam",    action="store_true")
+    parser.add_argument("--skip-frax",    action="store_true")
     args = parser.parse_args()
 
     n_trials = args.trials
@@ -727,7 +692,13 @@ def main():
         print(f"  GPU:            {jax.devices('gpu')[0]}")
     print(f"  Precision:      {'f64' if jax.config.jax_enable_x64 else 'f32'}")
     print(f"  Batch sizes:    {bs}")
-    print(f"  Gradient test:  {'OFF' if args.skip_grad else 'ON (A, B)'}")
+    grad_labels = "A, B" + ("" if args.skip_frax else ", D")
+    gradient_test = "OFF" if args.skip_grad else f"ON ({grad_labels})"
+    print(f"  Gradient test:  {gradient_test}")
+    if not args.skip_frax:
+        print("  Frax tips:      x64 enabled; use JAX_PLATFORMS=cpu to test")
+        print("                  single-robot CPU latency; JAX 0.4.30 is the")
+        print(f"                  Frax README CPU recommendation (current {jax.__version__}).")
 
     key = jax.random.PRNGKey(42)
     fwd_results, grad_results = [], []
@@ -737,13 +708,13 @@ def main():
     print(f"\n  Building models...")
     js_model, mj_model, pin_model, urdf_path = _build_models()
     print(f"  JaxSim joints : {list(js_model.joint_names())}")
-    
+
     mj_joint_names = [
         mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_JOINT, i)
         for i in range(mj_model.njnt)
     ]
     print(f"  Mujoco joints : {mj_joint_names}")
-    
+
     pin_joint_names = []
     for joint_id in range(1, pin_model.njoints):
         joint_name = pin_model.names[joint_id]
@@ -766,7 +737,7 @@ def main():
     # B: MJX
     if not args.skip_mjx:
         try:
-            print(f"\n  Building MJX model (panda.xml, contacts disabled)...")
+            print(f"\n  Building MJX model (harmonized URDF, contacts disabled)...")
             fn_b = build_B(mj_model)
             aba_fns["B"] = fn_b
             fwd_results.append(bench(
@@ -785,23 +756,24 @@ def main():
         except Exception:
             print(f"  C FAILED:\n{traceback.format_exc()}")
 
-    # D: ADAM-JAX
-    # if not args.skip_adam:
-    #     try:
-    #         print(f"\n  Building ADAM-JAX model...")
-    #         fn_d = build_D(urdf_path, pin_joint_names)
-    #         aba_fns["D"] = fn_d
-    #         fwd_results.append(bench(
-    #             "D: ADAM-JAX", fn_d, make_inputs, key, bs, n_trials))
-    #     except Exception:
-    #         print(f"  D FAILED:\n{traceback.format_exc()}")
+    # D: Frax
+    if not args.skip_frax:
+        try:
+            print(f"\n  Building Frax model...")
+            fn_d, frax_robot = build_D(urdf_path)
+            print(f"  Frax joints : {list(frax_robot.joint_names)}")
+            aba_fns["D"] = fn_d
+            fwd_results.append(bench(
+                "D: Frax forward_dynamics", fn_d, make_inputs, key, bs, n_trials))
+        except Exception:
+            print(f"  D FAILED:\n{traceback.format_exc()}")
 
     if fwd_results:
         print_summary("FORWARD DYNAMICS — vmap(aba)(q, qd, tau)", fwd_results, bs)
 
     # ── Correctness check (before gradient, while aba_fns are still warm) ──
     if aba_fns:
-        check_correctness(aba_fns, mj_model=mj_model)
+        check_correctness(aba_fns)
 
     # ── MJX-vs-native-MuJoCo acid test: is MJX itself computing correctly? ──
     if not args.skip_mjx:
@@ -817,28 +789,29 @@ def main():
 
     if not args.skip_grad:
         print(f"\n\n{'='*75}")
-        print("  GRADIENT THROUGHPUT — vmap(grad(si_euler_step)) w.r.t. state")
-        print("  This is the backward pass that Feedback-MPPI needs for gains.")
+        print("  GRADIENT THROUGHPUT — vmap(jvp(si_euler_step)) w.r.t. state")
+        print("  This is the state-gradient pass that Feedback-MPPI needs for gains.")
         print(f"{'='*75}")
 
         name_map = {
             "A": "A: JaxSim build() GRAD",
             "B": "B: MJX-JAX GRAD",
+            "D": "D: Frax GRAD",
         }
         # C is excluded (Pinocchio+Jaxadi grad is ~30× slower and impractical)
-        for label in ["A", "B"]:
+        for label in ["A", "B", "D"]:
             if label not in aba_fns:
                 continue
             try:
                 step_fn = make_si_euler(aba_fns[label])
-                grad_fn = make_grad_step(step_fn)
+                grad_fn = make_state_gradient_step(step_fn)
                 grad_results.append(bench(
                     name_map[label], grad_fn, make_state_and_tau, key, bs, n_trials))
             except Exception:
                 print(f"  {label} GRAD FAILED:\n{traceback.format_exc()}")
 
         if grad_results:
-            print_summary("GRADIENT — backward through dynamics", grad_results, bs)
+            print_summary("GRADIENT — exact-gain state derivative", grad_results, bs)
 
     # ═══════════════════════════════════════════════════════
     #  INTERPRETATION GUIDE
@@ -852,20 +825,22 @@ def main():
 
   MODEL:
     All backends use the 7-DoF Panda arm WITH the hand (0.73 kg end-effector)
-    attached.  This matches real deployment.  Small residuals in the
-    correctness check (< 5 rad/s²) are expected because JaxSim lumps the
-    hand inertia into link7 while Pinocchio/MJX keep it as a separate body.
+    attached as fixed joints.  The benchmark follows Frax's README advice by
+    fixing the uncontrolled gripper joints before every backend parses the
+    URDF, and it enables x64 for high-accuracy dynamics comparison.
 
   FORWARD TABLE:
     A vs B  → JaxSim vs MJX-JAX.  B faster → MJX is the better engine.
     A vs C  → JaxSim vs Pinocchio symbolic.  C slow → CasADi→XLA overhead.
-    A vs D  → JaxSim vs ADAM.  Reveals CRBA+solve vs ABA tradeoff.
+    A vs D  → JaxSim vs Frax.  Reveals CRBA+solve vs ABA tradeoff.
 
   GRADIENT TABLE (THE number for Feedback-MPPI):
-    This is what dominates controller loop time.
+    This uses the same vmap(jvp) state-gradient pattern as sbmpc exact gains
+    and is what dominates controller loop time.
     Some backends have much worse fwd/bwd ratios.
-    MJX-JAX grad requires contacts OFF (CG solver uses while_loop,
-    no reverse-mode AD through it).
+    MJX-JAX grad is tested with contacts OFF because contact constraints are
+    outside this no-contact Panda dynamics benchmark.  Frax is pure JAX and
+    supports the same differentiated rollout path as the current exact-gain code.
 
   TOTAL COST per Feedback-MPPI iteration:
     total_ms ~ (fwd_K_time + grad_K_time) × horizon
