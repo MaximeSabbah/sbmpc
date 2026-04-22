@@ -485,7 +485,7 @@ def main() -> None:
     parser.add_argument("--timing-mode", choices=("immediate", "gazebo"), default="gazebo")
     parser.add_argument("--retime-initial-state", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--desired-state-mode", choices=("base", "midpoint", "next"), default="base")
-    parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--clip-velocity", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gain-method", choices=("exact", "finite_difference"), default="exact")
     parser.add_argument("--gain-fd-epsilon", type=float, default=1e-3)
