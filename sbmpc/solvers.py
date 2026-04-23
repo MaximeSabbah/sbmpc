@@ -348,7 +348,7 @@ class Controller:
             optimal_samples = self.sampler.update(previous_optimal_samples, samples, costs)
             # update gains
             if self.gains_obj.compute_gains and self.rollout_gen.gain_method == "finite_difference":
-                self.gains_obj.cur_gains = self._finite_difference_gains(
+                new_gains = self._finite_difference_gains(
                     state,
                     reference,
                     previous_optimal_samples,
@@ -357,14 +357,15 @@ class Controller:
                     costs,
                 )
             elif self._gain_buffered and self.gains_obj.compute_gains and self.rollout_gen.gain_method == "exact":
-                self.gains_obj.cur_gains = self._buffered_exact_gains(
+                new_gains = self._buffered_exact_gains(
                     state,
                     reference,
                     previous_optimal_samples,
                     raw_samples_delta,
                 )
             else:
-                self.gains_obj.cur_gains = self.gains_obj.gains_computation(costs, samples, gradients)
+                new_gains = self.gains_obj.gains_computation(costs, samples, gradients)
+            self.gains_obj.cur_gains = new_gains
        
         # update sampler best control vars
         if shift_guess:
@@ -434,6 +435,15 @@ class Controller:
         return self.gains_obj.cur_gains
 
     @partial(jax.jit, static_argnums=(0,))
+    def _fd_sample_indices(self, nominal_costs):
+        del nominal_costs
+        total = self.rollout_gen.num_parallel_computations
+        subset_size = self.rollout_gen.gain_fd_num_samples
+        if subset_size is None or subset_size >= total:
+            return jnp.arange(total, dtype=jnp.int32)
+        return jnp.arange(subset_size, dtype=jnp.int32)
+
+    @partial(jax.jit, static_argnums=(0,))
     def _finite_difference_gains(
         self,
         state,
@@ -458,27 +468,19 @@ class Controller:
         if reference.ndim == 1:
             reference = jnp.tile(reference, (rollout_gen.horizon + 1, 1))
 
-        # Subsample for FD if gain_fd_num_samples is set — reduces nx×N_fd rollouts
-        n_fd = rollout_gen.gain_fd_num_samples
-        if n_fd is not None and n_fd < control_vars_all.shape[0]:
-            control_vars_fd = control_vars_all[:n_fd]
-            optimal_fd = optimal_samples[:n_fd]
-            delta_fd = samples_delta_clipped[:n_fd]
-            costs_fd = nominal_costs[:n_fd]
-        else:
-            control_vars_fd = control_vars_all
-            optimal_fd = optimal_samples
-            delta_fd = samples_delta_clipped
-            costs_fd = nominal_costs
+        sample_indices = self._fd_sample_indices(nominal_costs)
+        control_vars_fd = control_vars_all[sample_indices]
+        delta_fd = samples_delta_clipped[sample_indices]
+        costs_fd = nominal_costs[sample_indices]
 
         nominal_action = self.sampler.compute_action(
-            optimal_fd, delta_fd, costs_fd
+            optimal_samples, delta_fd, costs_fd
         )[0]
 
         def first_action_for_state(perturbed_state):
             costs, _ = rollout_gen.rollout_all(perturbed_state, reference, control_vars_fd)
             return self.sampler.compute_action(
-                optimal_fd, delta_fd, costs
+                optimal_samples, delta_fd, costs
             )[0]
 
         plus_actions = jax.vmap(first_action_for_state)(state + eps * eye)

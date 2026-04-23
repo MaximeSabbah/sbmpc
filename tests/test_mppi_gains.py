@@ -60,6 +60,7 @@ def build_solver(
     num_parallel_computations=3000,
     gain_samples_per_cycle=None,
     gain_buffer_size=None,
+    gain_fd_num_samples=None,
 ):
     robot_config = settings.RobotConfig()
     robot_config.nq = 1
@@ -80,6 +81,7 @@ def build_solver(
     config.MPC.gain_buffer_size = gain_buffer_size
     config.MPC.gain_fd_scheme = "central"
     config.MPC.gain_fd_epsilon = 1e-3
+    config.MPC.gain_fd_num_samples = gain_fd_num_samples
     config.solver_dynamics = settings.DynamicsModel.CUSTOM
     config.sim_dynamics = settings.DynamicsModel.CUSTOM
 
@@ -142,3 +144,17 @@ def test_buffered_exact_gain_path_skips_full_batch_exact_rollout():
     assert gains.shape == (2, 2)
     assert jnp.all(jnp.isfinite(gains))
 
+
+def test_finite_difference_gain_subset_uses_configured_prefix():
+    _, terminal_cost = lqr_seed()
+    solver = build_solver(
+        "finite_difference",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_fd_num_samples=4,
+    )
+
+    costs = jnp.array([10.0, 2.0, 6.0, 1.0, 8.0, 3.0, 9.0, 4.0], dtype=jnp.float32)
+    indices = tuple(map(int, solver._fd_sample_indices(costs).tolist()))
+
+    assert indices == (0, 1, 2, 3)
