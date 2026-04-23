@@ -27,6 +27,11 @@ class RobotConfig:
         self._nu = None
         self._nx = 0
 
+        # MJX solver options passed through to ModelMjx (whitelisted there).
+        # None / empty dict = use MuJoCo defaults. Example:
+        # {"iterations": 2, "ls_iterations": 1, "tolerance": 1e-4}
+        self.mjx_opts: dict | None = None
+
         self._input_min = None
         self._input_max = None
         self._q_init = None
@@ -151,6 +156,12 @@ class MPCConfig:
         self._gain_fd_epsilon = 1e-3
         self._gain_fd_scheme = "central"
         self._gain_fd_num_samples = None
+        # Buffered-gain (exact path) knobs. None/None = single-shot on all samples (current behavior).
+        #   gain_samples_per_cycle: how many of the N MPPI samples to backprop per cycle
+        #   gain_buffer_size:       accumulate this many samples across cycles before issuing a K update
+        # Constraint: gain_buffer_size must be a positive multiple of gain_samples_per_cycle.
+        self._gain_samples_per_cycle = None
+        self._gain_buffer_size = None
         self._sensitivity = False
         self._smoothing = None
         self._augmented_reference = None
@@ -297,6 +308,26 @@ class MPCConfig:
         if value is not None and (not isinstance(value, int) or value < 1):
             raise ValueError("gain_fd_num_samples must be a positive int or None")
         self._gain_fd_num_samples = value
+
+    @property
+    def gain_samples_per_cycle(self):
+        return self._gain_samples_per_cycle
+
+    @gain_samples_per_cycle.setter
+    def gain_samples_per_cycle(self, value):
+        if value is not None and (not isinstance(value, int) or value < 1):
+            raise ValueError("gain_samples_per_cycle must be a positive int or None")
+        self._gain_samples_per_cycle = value
+
+    @property
+    def gain_buffer_size(self):
+        return self._gain_buffer_size
+
+    @gain_buffer_size.setter
+    def gain_buffer_size(self, value):
+        if value is not None and (not isinstance(value, int) or value < 1):
+            raise ValueError("gain_buffer_size must be a positive int or None")
+        self._gain_buffer_size = value
 
     @property
     def sensitivity(self):

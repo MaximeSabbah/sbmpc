@@ -53,7 +53,14 @@ def lqr_seed():
     return controls, s
 
 
-def build_solver(gain_method, terminal_cost):
+def build_solver(
+    gain_method,
+    terminal_cost,
+    *,
+    num_parallel_computations=3000,
+    gain_samples_per_cycle=None,
+    gain_buffer_size=None,
+):
     robot_config = settings.RobotConfig()
     robot_config.nq = 1
     robot_config.nv = 1
@@ -64,11 +71,13 @@ def build_solver(gain_method, terminal_cost):
     config.MPC.dt = DT
     config.MPC.horizon = HORIZON
     config.MPC.std_dev_mppi = jnp.array([0.5, 0.0], dtype=jnp.float32)
-    config.MPC.num_parallel_computations = 3000
+    config.MPC.num_parallel_computations = num_parallel_computations
     config.MPC.lambda_mpc = 2.0
     config.MPC.num_control_points = config.MPC.horizon
     config.MPC.gains = True
     config.MPC.gain_method = gain_method
+    config.MPC.gain_samples_per_cycle = gain_samples_per_cycle
+    config.MPC.gain_buffer_size = gain_buffer_size
     config.MPC.gain_fd_scheme = "central"
     config.MPC.gain_fd_epsilon = 1e-3
     config.solver_dynamics = settings.DynamicsModel.CUSTOM
@@ -103,4 +112,33 @@ def test_finite_difference_mppi_gains_match_exact_ad_gains():
     assert jnp.all(jnp.isfinite(finite_difference))
     assert jnp.linalg.norm(finite_difference - exact, ord=jnp.inf) < 2e-2
 
+
+def test_buffered_exact_gain_path_skips_full_batch_exact_rollout():
+    seed, terminal_cost = lqr_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=64,
+        gain_samples_per_cycle=8,
+        gain_buffer_size=16,
+    )
+    solver.sampler.optimal_samples = seed
+
+    assert solver.rollout_gen.buffered_exact_gains
+    assert not solver.rollout_gen.compute_exact_gains
+    assert solver.rollout_gen.rollout_sens_to_state is not None
+
+    state = jnp.array([0.0, 0.0], dtype=jnp.float32)
+    reference = jnp.array([0.5, 0.0], dtype=jnp.float32)
+    for _ in range(2):
+        solver.command(
+            state,
+            reference,
+            shift_guess=False,
+            num_steps=1,
+        ).block_until_ready()
+
+    gains = jax.block_until_ready(solver.gains)
+    assert gains.shape == (2, 2)
+    assert jnp.all(jnp.isfinite(gains))
 

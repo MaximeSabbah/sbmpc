@@ -242,21 +242,11 @@ class Simulation(Simulator):
         if getattr(self, "warm_start_fn", None) is not None:
             self.controller.sampler.optimal_samples = self.warm_start_fn(state_vec)
 
-        # Skip FD gains on non-update steps; restore saved gains so MPPI reuses them.
-        gain_freq = getattr(self, "gain_update_freq", 1)
-        skip_gains = gain_freq > 1 and (self.iter % gain_freq != 0) and self.controller.gains_obj.compute_gains
-        if skip_gains:
-            saved_gains = self.controller.gains_obj.cur_gains
-            self.controller.gains_obj.compute_gains = False
-
         time_start = time.time_ns()
         input_sequence = self.controller.command(state_vec, self.const_reference, num_steps=1).block_until_ready()
         ctrl = input_sequence[0, :].block_until_ready()
         self.last_command_time_ms = 1e-6 * (time.time_ns() - time_start)
 
-        if skip_gains:
-            self.controller.gains_obj.compute_gains = True
-            self.controller.gains_obj.cur_gains = saved_gains
         if self.verbose:
             print("computation time: {:.3f} [ms]".format(self.last_command_time_ms))
 
@@ -276,7 +266,11 @@ def build_custom_model(custom_dynamics_fn: Callable, nq: int, nv: int, nu: int, 
 
 
 def build_mjx_model(config) -> Tuple[BaseModel, jnp.array, jnp.array]:
-    system = ModelMjx(config.robot.robot_scene_path, config.robot.mjx_kinematic)
+    system = ModelMjx(
+        config.robot.robot_scene_path,
+        config.robot.mjx_kinematic,
+        mjx_opts=getattr(config.robot, "mjx_opts", None),
+    )
     system.set_qpos(config.robot.q_init)
     q_init = system.data.qpos
     if not config.robot.mjx_kinematic:

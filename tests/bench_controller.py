@@ -57,36 +57,16 @@ def _reset_initial_guess(planner, config):
     )
 
 
-def _block_command(controller, state, ref, *, step_idx=0, gain_update_freq=1):
+def _block_command(controller, state, ref):
     """Run one command step and block until all GPU work is done."""
-    skip_gains = (
-        gain_update_freq > 1
-        and (step_idx % gain_update_freq != 0)
-        and controller.gains_obj.compute_gains
-    )
-    if skip_gains:
-        saved_gains = controller.gains_obj.cur_gains
-        controller.gains_obj.compute_gains = False
-    try:
-        result = controller.command(state, ref, num_steps=1)
-        jax.block_until_ready(result)
-        if controller.gains_obj.compute_gains:
-            jax.block_until_ready(controller.gains_obj.cur_gains)
-    finally:
-        if skip_gains:
-            controller.gains_obj.compute_gains = True
-            controller.gains_obj.cur_gains = saved_gains
+    result = controller.command(state, ref, num_steps=1)
+    jax.block_until_ready(result)
+    if controller.gains_obj.compute_gains:
+        jax.block_until_ready(controller.gains_obj.cur_gains)
     return result
 
 
-def _run_headless(
-    planner,
-    objective,
-    config,
-    n_trials=N_TRIALS,
-    label="",
-    gain_update_freq=1,
-):
+def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
     """
     Timing benchmark: controller.command() on a fixed state.
     Mimics bench_dynamics.py: JIT time + average over n_trials blocked calls.
@@ -104,33 +84,15 @@ def _run_headless(
 
     # build_all already fired one warm-up; measure remaining JIT/XLA work.
     t_jit = time.perf_counter()
-    _block_command(
-        sim.controller,
-        state,
-        ref,
-        step_idx=0,
-        gain_update_freq=gain_update_freq,
-    )
+    _block_command(sim.controller, state, ref)
     jit_ms = (time.perf_counter() - t_jit) * 1000.0
 
-    for step_idx in range(1, N_WARMUP):
-        _block_command(
-            sim.controller,
-            state,
-            ref,
-            step_idx=step_idx,
-            gain_update_freq=gain_update_freq,
-        )
+    for _ in range(1, N_WARMUP):
+        _block_command(sim.controller, state, ref)
 
     t0 = time.perf_counter()
-    for step_idx in range(N_WARMUP, N_WARMUP + n_trials):
-        _block_command(
-            sim.controller,
-            state,
-            ref,
-            step_idx=step_idx,
-            gain_update_freq=gain_update_freq,
-        )
+    for _ in range(N_WARMUP, N_WARMUP + n_trials):
+        _block_command(sim.controller, state, ref)
     mean_ms = (time.perf_counter() - t0) / n_trials * 1000.0
 
     ok = mean_ms < TARGET_MS
@@ -143,7 +105,7 @@ def _run_headless(
     return row, jit_ms, mean_ms, ok
 
 
-def _run_quality(planner, objective, config, n_steps=N_QUALITY, gain_update_freq=1):
+def _run_quality(planner, objective, config, n_steps=N_QUALITY):
     """
     Quality + gain-stability check with real state evolution.
 
@@ -162,7 +124,6 @@ def _run_quality(planner, objective, config, n_steps=N_QUALITY, gain_update_freq
         config.MPC.horizon,
         config.MPC.dt,
     )
-    sim.gain_update_freq = gain_update_freq
 
     errors = []
     gain_norms = []
@@ -274,7 +235,7 @@ def _is_viable(timing_ok, q_result, config):
     return True
 
 
-def run_visual(planner, objective, config, *, gain_update_freq=1):
+def run_visual(planner, objective, config):
     """Open MuJoCo viewer and run until window closes."""
     sim = build_all(
         config,
@@ -288,7 +249,6 @@ def run_visual(planner, objective, config, *, gain_update_freq=1):
         config.MPC.horizon,
         config.MPC.dt,
     )
-    sim.gain_update_freq = gain_update_freq
 
     def post_update(s):
         state = s.current_state_vec()
@@ -311,7 +271,9 @@ def run_visual(planner, objective, config, *, gain_update_freq=1):
     print(
         f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
         f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
-        f"fd={config.MPC.gain_fd_num_samples}  gf={gain_update_freq}  "
+        f"fd={config.MPC.gain_fd_num_samples}  "
+        f"gK={config.MPC.gain_samples_per_cycle}  gM={config.MPC.gain_buffer_size}  "
+        f"mjx={config.robot.mjx_opts}"
     )
     sim.simulate()
 
@@ -328,14 +290,39 @@ def main():
                         help="Simulation steps for quality check")
     parser.add_argument("--gain-fd-samples", type=int, default=None,
                         help="Override MPC.gain_fd_num_samples for finite-difference gains.")
-    parser.add_argument("--gain-update-freq", type=int, default=1,
-                        help="Only recompute gains every N control cycles when timing/quality benchmarking.")
+    parser.add_argument("--gain-method", choices=("exact", "finite_difference"), default=None,
+                        help="Override MPC.gain_method. Required to benchmark exact buffered gains.")
+    parser.add_argument("--gain-samples-per-cycle", type=int, default=None,
+                        help="Buffered-gain: how many of the MPPI samples to backprop per cycle.")
+    parser.add_argument("--gain-buffer-size", type=int, default=None,
+                        help="Buffered-gain: total accumulated samples before a K update; must be a multiple of --gain-samples-per-cycle.")
+    parser.add_argument("--mjx-iterations", type=int, default=None)
+    parser.add_argument("--mjx-ls-iterations", type=int, default=None)
+    parser.add_argument("--mjx-tolerance", type=float, default=None)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--samples", type=int, default=None)
     parser.add_argument("--control-points", type=int, default=None)
     args = parser.parse_args()
-    if args.gain_update_freq <= 0:
-        raise ValueError("--gain-update-freq must be strictly positive.")
+
+    mjx_opts = {}
+    if args.mjx_iterations is not None:
+        mjx_opts["iterations"] = args.mjx_iterations
+    if args.mjx_ls_iterations is not None:
+        mjx_opts["ls_iterations"] = args.mjx_ls_iterations
+    if args.mjx_tolerance is not None:
+        mjx_opts["tolerance"] = args.mjx_tolerance
+    args.mjx_opts = mjx_opts or None
+
+    def _apply_gain_knobs(config):
+        if args.gain_method is not None:
+            config.MPC.gain_method = args.gain_method
+        if args.gain_fd_samples is not None:
+            config.MPC.gain_fd_num_samples = args.gain_fd_samples
+        if args.gain_samples_per_cycle is not None:
+            config.MPC.gain_samples_per_cycle = args.gain_samples_per_cycle
+        if args.gain_buffer_size is not None:
+            config.MPC.gain_buffer_size = args.gain_buffer_size
+        config.robot.mjx_opts = args.mjx_opts
 
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner)
@@ -345,15 +332,9 @@ def main():
         config.MPC.horizon = args.horizon if args.horizon is not None else 8
         config.MPC.num_parallel_computations = args.samples if args.samples is not None else 1024
         config.MPC.num_control_points = args.control_points if args.control_points is not None else 8
-        if args.gain_fd_samples is not None:
-            config.MPC.gain_fd_num_samples = args.gain_fd_samples
+        _apply_gain_knobs(config)
         _reset_initial_guess(planner, config)
-        run_visual(
-            planner,
-            objective,
-            config,
-            gain_update_freq=args.gain_update_freq,
-        )
+        run_visual(planner, objective, config)
         return
 
     print(f"\nJAX backend: {jax.default_backend()},  devices: {jax.devices()}")
@@ -381,12 +362,13 @@ def main():
                     config.MPC.horizon = h
                     config.MPC.num_parallel_computations = s
                     config.MPC.num_control_points = cp
-                    if args.gain_fd_samples is not None:
-                        config.MPC.gain_fd_num_samples = args.gain_fd_samples
+                    _apply_gain_knobs(config)
                     _reset_initial_guess(planner, config)
                     label = (
                         f"h={h:2d} n={s:4d} cp={cp} "
-                        f"fd={config.MPC.gain_fd_num_samples} gf={args.gain_update_freq}"
+                        f"fd={config.MPC.gain_fd_num_samples} "
+                        f"gK={config.MPC.gain_samples_per_cycle} gM={config.MPC.gain_buffer_size} "
+                        f"mjx={config.robot.mjx_opts}"
                     )
                     t_row, _, mean_ms, t_ok = _run_headless(
                         planner,
@@ -394,7 +376,6 @@ def main():
                         config,
                         args.steps,
                         label,
-                        gain_update_freq=args.gain_update_freq,
                     )
                     print(t_row)
                     if run_qual:
@@ -403,7 +384,6 @@ def main():
                             objective,
                             config,
                             args.quality_steps,
-                            gain_update_freq=args.gain_update_freq,
                         )
                         print(_quality_row(q, config))
                         if _is_viable(t_ok, q, config):
@@ -424,15 +404,16 @@ def main():
         config.MPC.num_parallel_computations = args.samples
     if args.control_points is not None:
         config.MPC.num_control_points = args.control_points
-    if args.gain_fd_samples is not None:
-        config.MPC.gain_fd_num_samples = args.gain_fd_samples
+    _apply_gain_knobs(config)
     if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
         _reset_initial_guess(planner, config)
 
     label = (
         f"h={config.MPC.horizon} n={config.MPC.num_parallel_computations} "
         f"cp={config.MPC.num_control_points} gains={config.MPC.gains} "
-        f"fd={config.MPC.gain_fd_num_samples} gf={args.gain_update_freq}"
+        f"fd={config.MPC.gain_fd_num_samples} "
+        f"gK={config.MPC.gain_samples_per_cycle} gM={config.MPC.gain_buffer_size} "
+        f"mjx={config.robot.mjx_opts}"
     )
     t_row, _, mean_ms, t_ok = _run_headless(
         planner,
@@ -440,7 +421,6 @@ def main():
         config,
         args.steps,
         label,
-        gain_update_freq=args.gain_update_freq,
     )
     print(t_row)
 
@@ -466,7 +446,6 @@ def main():
             objective,
             config,
             args.quality_steps,
-            gain_update_freq=args.gain_update_freq,
         )
         print(_quality_row(q, config))
 

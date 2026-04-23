@@ -143,12 +143,25 @@ class Model(ModelParametric):
 
 
 
+_MJX_OPT_KEYS = ("iterations", "ls_iterations", "tolerance", "ls_tolerance", "integrator")
+
+
 class ModelMjx(BaseModel):
-    def __init__(self, model_path, kinematic, input_bounds=(-jnp.inf, jnp.inf)):
+    def __init__(self, model_path, kinematic, input_bounds=(-jnp.inf, jnp.inf), mjx_opts=None):
         self.model_path = model_path
         self.kinematic = kinematic
         # Load the MuJoCo model
         self.mj_model = mujoco.MjModel.from_xml_path(filename=self.model_path)
+
+        # Apply MJX solver options BEFORE mjx.put_model, so they're baked into
+        # the JAX-side model. Whitelisted keys only — unknown keys raise.
+        if mjx_opts:
+            for key, value in mjx_opts.items():
+                if key not in _MJX_OPT_KEYS:
+                    raise ValueError(
+                        f"unsupported MJX option '{key}'. Supported: {_MJX_OPT_KEYS}"
+                    )
+                setattr(self.mj_model.opt, key, value)
 
         if self.kinematic and jnp.array_equal(input_bounds, (-jnp.inf, jnp.inf)):
             input_bounds = [-jnp.inf * jnp.ones(self.mj_model.nu, dtype=jnp.float32),

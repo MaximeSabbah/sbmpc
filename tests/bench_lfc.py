@@ -60,6 +60,9 @@ def _build_lfc_sim(args: argparse.Namespace):
     config.MPC.horizon = args.horizon
     config.MPC.num_parallel_computations = args.samples
     config.MPC.num_control_points = args.control_points
+    config.MPC.gain_samples_per_cycle = getattr(args, "gain_samples_per_cycle", None)
+    config.MPC.gain_buffer_size = getattr(args, "gain_buffer_size", None)
+    config.robot.mjx_opts = getattr(args, "mjx_opts", None)
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
         config.MPC.dt,
@@ -395,13 +398,37 @@ def _joint_vel_hf_energy(v: np.ndarray, dt: float, f_lo: float = 5.0, f_hi: floa
     return float(np.max(magnitude) / max(norm, 1e-12))
 
 
-def _build_reference_panel(args: argparse.Namespace, result: dict[str, object]) -> dict:
+def _emit_reference(args: argparse.Namespace, result: dict[str, object], path: str) -> None:
+    """Write the immediate-mode MuJoCo baseline JSON.
+
+    Only `--timing-mode immediate` is baselined today: `gazebo` mode currently
+    NaNs because planning_ms > dt, and is the subject of a separate
+    compute-reduction chunk. When that chunk lands and gazebo-mode stabilises,
+    this emit path will be extended to cover both modes.
+    """
+    if args.timing_mode != "immediate":
+        raise ValueError(
+            "--emit-reference is only supported for --timing-mode immediate "
+            "today. gazebo-mode does not converge yet."
+        )
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     plan_times_ms = np.asarray(result["plan_times_ms"], dtype=np.float64)
     errors = np.asarray(result["errors"], dtype=np.float64)
     v = np.asarray(result["v_history"], dtype=np.float64)
     tail_start = len(v) // 2
     hf_energy = _joint_vel_hf_energy(v[tail_start:], args.dt)
-    return {
+    payload = {
+        "config": {
+            "gain_method": args.gain_method,
+            "dt": float(args.dt),
+            "horizon": int(args.horizon),
+            "samples": int(args.samples),
+            "control_points": int(args.control_points),
+            "substeps": int(args.substeps),
+            "timing_mode": args.timing_mode,
+            "steps": int(args.steps),
+            "backend": jax.default_backend(),
+        },
         "errors": errors.tolist(),
         "gain_norms": np.asarray(result["gain_norms"], dtype=np.float64).tolist(),
         "feedback_peaks": np.asarray(result["feedback_peaks"], dtype=np.float64).tolist(),
@@ -423,40 +450,9 @@ def _build_reference_panel(args: argparse.Namespace, result: dict[str, object]) 
             "feedback_peak_max": float(np.max(np.asarray(result["feedback_peaks"]))),
         },
     }
-
-
-def _emit_reference(args: argparse.Namespace, path: str) -> None:
-    """Run both timing modes and write a two-panel reference JSON.
-
-    The `immediate` panel is the controller-correctness gate (no publish delay).
-    The `gazebo` panel models the ROS publish delay that the real robot will see,
-    and is what Gazebo recordings should be compared against.
-    """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    panels: dict[str, dict] = {}
-    for mode in ("immediate", "gazebo"):
-        args.timing_mode = mode
-        print(f"--- emit-reference: running timing_mode={mode} ---")
-        result = run_lfc_validation(args)
-        _print_summary(result)
-        panels[mode] = _build_reference_panel(args, result)
-    payload = {
-        "config": {
-            "gain_method": args.gain_method,
-            "dt": float(args.dt),
-            "horizon": int(args.horizon),
-            "samples": int(args.samples),
-            "control_points": int(args.control_points),
-            "substeps": int(args.substeps),
-            "steps": int(args.steps),
-            "backend": jax.default_backend(),
-        },
-        "immediate": panels["immediate"],
-        "gazebo": panels["gazebo"],
-    }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"wrote two-panel reference -> {path}")
+    print(f"wrote reference -> {path}")
 
 
 def _print_summary(result: dict[str, object]) -> None:
@@ -513,6 +509,13 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--samples", type=int, default=1024)
     parser.add_argument("--control-points", type=int, default=8)
+    parser.add_argument("--gain-samples-per-cycle", type=int, default=None,
+                        help="Buffered-gain: how many MPPI samples to backprop per cycle (None = all).")
+    parser.add_argument("--gain-buffer-size", type=int, default=None,
+                        help="Buffered-gain: total accumulated samples before a K update (must be a multiple of --gain-samples-per-cycle).")
+    parser.add_argument("--mjx-iterations", type=int, default=None)
+    parser.add_argument("--mjx-ls-iterations", type=int, default=None)
+    parser.add_argument("--mjx-tolerance", type=float, default=None)
     parser.add_argument(
         "--emit-reference",
         type=str,
@@ -529,21 +532,31 @@ def main() -> None:
     if args.print_every <= 0:
         raise ValueError("--print-every must be positive.")
 
+    mjx_opts = {}
+    if args.mjx_iterations is not None:
+        mjx_opts["iterations"] = args.mjx_iterations
+    if args.mjx_ls_iterations is not None:
+        mjx_opts["ls_iterations"] = args.mjx_ls_iterations
+    if args.mjx_tolerance is not None:
+        mjx_opts["tolerance"] = args.mjx_tolerance
+    args.mjx_opts = mjx_opts or None
+
     print(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
     print(
         f"dt={args.dt} h={args.horizon} samples={args.samples} cp={args.control_points} "
         f"gain_method={args.gain_method} substeps={args.substeps} "
         f"timing={args.timing_mode} retime={args.retime_initial_state} "
         f"desired={args.desired_state_mode} clip_torque={args.clip_torque} "
-        f"clip_velocity={args.clip_velocity}"
+        f"clip_velocity={args.clip_velocity} "
+        f"gK={args.gain_samples_per_cycle} gM={args.gain_buffer_size} mjx={args.mjx_opts}"
     )
     if args.visual:
         run_lfc_visual(args)
-    elif args.emit_reference is not None:
-        _emit_reference(args, args.emit_reference)
     else:
         result = run_lfc_validation(args)
         _print_summary(result)
+        if args.emit_reference is not None:
+            _emit_reference(args, result, args.emit_reference)
 
 
 if __name__ == "__main__":

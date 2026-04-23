@@ -82,7 +82,20 @@ class RolloutGenerator():
 
         self.compute_gains = config.MPC.gains
         self.gain_method = config.MPC.gain_method
-        self.compute_exact_gains = self.compute_gains and self.gain_method == "exact"
+        gain_samples_per_cycle = config.MPC.gain_samples_per_cycle
+        gain_buffer_size = config.MPC.gain_buffer_size
+        self.buffered_exact_gains = (
+            self.compute_gains
+            and self.gain_method == "exact"
+            and gain_samples_per_cycle is not None
+            and gain_buffer_size is not None
+            and gain_samples_per_cycle < self.num_parallel_computations
+        )
+        self.compute_exact_gains = (
+            self.compute_gains
+            and self.gain_method == "exact"
+            and not self.buffered_exact_gains
+        )
         self.gain_fd_epsilon = jnp.asarray(config.MPC.gain_fd_epsilon, dtype=self.dtype_general)
         self.gain_fd_scheme = config.MPC.gain_fd_scheme
         self.gain_fd_num_samples = config.MPC.gain_fd_num_samples  # None = use all samples
@@ -111,11 +124,14 @@ class RolloutGenerator():
 
         #self.gains = jnp.zeros((model.nu, model.nx))
         # self.ctrl_sens_to_state = jax.jit(jax.jacfwd(self.compute_control_mppi, argnums=0, has_aux=True), device=self.device)
-        if self.compute_exact_gains:
-            self.rollout_sens_to_state = jax.vmap(
-                self.rollout_single_with_state_gradient,
-                in_axes=(None, None, 0),
-                out_axes=(0, 0),
+        if self.compute_gains and self.gain_method == "exact":
+            self.rollout_sens_to_state = jax.jit(
+                jax.vmap(
+                    self.rollout_single_with_state_gradient,
+                    in_axes=(None, None, 0),
+                    out_axes=(0, 0),
+                ),
+                device=self.device,
             )
         else:
             self.rollout_sens_to_state = None
@@ -282,7 +298,42 @@ class Controller:
         self.objective = rollout_gen.objective
         self.sampler = sampler
         self.gains_obj = gains_obj
-           
+
+        # Buffered-gain state (exact path only). Activates when BOTH knobs are set and
+        # samples_per_cycle < total MPPI samples. The full MPPI batch still runs rollout-only;
+        # the exact sensitivity pass is restricted to the buffered subset below.
+        mpc = rollout_gen.config.MPC
+        K = mpc.gain_samples_per_cycle
+        M = mpc.gain_buffer_size
+        N = rollout_gen.num_parallel_computations
+        if (K is None) != (M is None):
+            raise ValueError(
+                "gain_samples_per_cycle and gain_buffer_size must be set together."
+            )
+        if K is not None and K > N:
+            raise ValueError(
+                f"gain_samples_per_cycle ({K}) cannot exceed the number of samples ({N})."
+            )
+        self._gain_buffered = rollout_gen.buffered_exact_gains
+        if self._gain_buffered:
+            if M % K != 0:
+                raise ValueError(
+                    f"gain_buffer_size ({M}) must be a positive multiple of "
+                    f"gain_samples_per_cycle ({K})."
+                )
+            nu = rollout_gen.model.nu
+            nx = rollout_gen.model.nx
+            dtype = rollout_gen.dtype_general
+            self._gain_K = int(K)
+            self._gain_M = int(M)
+            self._gain_stride = self._gain_M // self._gain_K
+            self._gain_buf_costs = jnp.zeros((self._gain_M,), dtype=dtype)
+            self._gain_buf_deltas = jnp.zeros((self._gain_M, nu), dtype=dtype)
+            self._gain_buf_grads = jnp.zeros((self._gain_M, nx), dtype=dtype)
+            self._gain_buf_fill = 0
+            self._gain_buf_idx = 0
+            self._gain_cycle = 0
+
     def command(self, state, reference, shift_guess=True, num_steps=1):
 
         optimal_samples = self.sampler.optimal_samples
@@ -305,6 +356,13 @@ class Controller:
                     samples,
                     costs,
                 )
+            elif self._gain_buffered and self.gains_obj.compute_gains and self.rollout_gen.gain_method == "exact":
+                self.gains_obj.cur_gains = self._buffered_exact_gains(
+                    state,
+                    reference,
+                    previous_optimal_samples,
+                    raw_samples_delta,
+                )
             else:
                 self.gains_obj.cur_gains = self.gains_obj.gains_computation(costs, samples, gradients)
        
@@ -316,6 +374,64 @@ class Controller:
         
         return optimal_samples
     
+
+    def _buffered_exact_gains(
+        self,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+    ):
+        """Exact-path gain with sub-sampled backprop accumulated into a FIFO buffer.
+
+        Each cycle backprops a rotating `gain_samples_per_cycle` subset (K) and appends
+        (cost, Δu[0], ∇J) to a ring buffer of capacity `gain_buffer_size` (M).
+        Once the buffer has filled and on every (M/K)-th cycle thereafter,
+        runs the paper gain formula over the full M-sized buffer and caches K.
+        Between ticks reuses the cached K.
+        """
+        rg = self.rollout_gen
+        K = self._gain_K
+        M = self._gain_M
+        stride = self._gain_stride
+
+        sample_indices = (
+            jnp.arange(K, dtype=jnp.int32) + self._gain_cycle * K
+        ) % rg.num_parallel_computations
+        raw_sub = raw_samples_delta[sample_indices]
+        if rg.config.MPC.smoothing == "Spline":
+            control_vars_sub = optimal_samples[rg.control_spline_indices, :] + raw_sub
+        else:
+            control_vars_sub = optimal_samples + raw_sub
+
+        if reference.ndim == 1:
+            reference_tiled = jnp.tile(reference, (rg.horizon + 1, 1))
+        else:
+            reference_tiled = reference
+
+        (costs_sub, control_vars_returned), grads_sub = rg.rollout_sens_to_state(
+            state, reference_tiled, control_vars_sub
+        )
+        deltas_sub = rg.compute_samples_delta(control_vars_returned, optimal_samples)
+        deltas_first = deltas_sub[:, 0, :]
+
+        idx = self._gain_buf_idx
+        self._gain_buf_costs = self._gain_buf_costs.at[idx:idx + K].set(costs_sub)
+        self._gain_buf_deltas = self._gain_buf_deltas.at[idx:idx + K].set(deltas_first)
+        self._gain_buf_grads = self._gain_buf_grads.at[idx:idx + K].set(grads_sub)
+
+        self._gain_buf_idx = (idx + K) % M
+        self._gain_buf_fill = min(M, self._gain_buf_fill + K)
+        self._gain_cycle += 1
+
+        # Update K on the stride tick once the buffer has filled at least once.
+        if self._gain_buf_fill >= M and (self._gain_cycle % stride == 0):
+            return self.gains_obj.gains_computation(
+                self._gain_buf_costs,
+                self._gain_buf_deltas[:, jnp.newaxis, :],
+                self._gain_buf_grads,
+            )
+        return self.gains_obj.cur_gains
 
     @partial(jax.jit, static_argnums=(0,))
     def _finite_difference_gains(
