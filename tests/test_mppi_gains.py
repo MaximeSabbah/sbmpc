@@ -1,9 +1,11 @@
 import control
 import jax
 import jax.numpy as jnp
+import time
 
 from sbmpc import BaseObjective
 import sbmpc.settings as settings
+from sbmpc.solvers import ProcessedGainBatch, RollingGainWindow
 from sbmpc.simulation import build_model_and_solver
 
 
@@ -143,6 +145,231 @@ def test_buffered_exact_gain_path_skips_full_batch_exact_rollout():
     gains = jax.block_until_ready(solver.gains)
     assert gains.shape == (2, 2)
     assert jnp.all(jnp.isfinite(gains))
+
+
+def test_buffered_exact_gain_path_allows_full_batch_promotion():
+    _, terminal_cost = lqr_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=8,
+        gain_buffer_size=8,
+    )
+
+    assert solver.rollout_gen.buffered_exact_gains
+    assert not solver.rollout_gen.compute_exact_gains
+
+
+def test_exact_gain_snapshot_keeps_nominal_and_lowest_cost_samples():
+    _, terminal_cost = lqr_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=3,
+        gain_buffer_size=6,
+    )
+
+    optimal_samples = jnp.arange(HORIZON * 2, dtype=jnp.float32).reshape(HORIZON, 2)
+    raw_samples_delta = jnp.arange(8 * HORIZON * 2, dtype=jnp.float32).reshape(8, HORIZON, 2)
+    samples_delta_clipped = raw_samples_delta + 1000.0
+    nominal_costs = jnp.array([8.0, 5.0, 2.0, 1.0, 6.0, 7.0, 4.0, 3.0], dtype=jnp.float32)
+    state = jnp.array([0.0, 0.0], dtype=jnp.float32)
+    reference = jnp.array([0.5, 0.0], dtype=jnp.float32)
+
+    context = solver._make_exact_gain_context(
+        1,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
+    )
+    indices = solver._select_exact_gain_sample_indices(
+        context.cycle_id,
+        context.nominal_costs,
+    )
+    snapshot = solver._pack_exact_gain_snapshot(context, indices)
+
+    assert tuple(map(int, indices.tolist())) == (0, 3, 2)
+    assert snapshot.reference.shape == (HORIZON + 1, 2)
+    assert jnp.allclose(snapshot.costs, jnp.array([8.0, 1.0, 2.0], dtype=jnp.float32))
+    assert jnp.allclose(snapshot.delta_u0, samples_delta_clipped[jnp.array([0, 3, 2]), 0, :])
+    assert jnp.allclose(
+        snapshot.control_variables,
+        optimal_samples + raw_samples_delta[jnp.array([0, 3, 2])],
+    )
+
+
+def test_rolling_gain_window_replaces_oldest_batch_when_full():
+    window = RollingGainWindow(
+        capacity=4,
+        batch_size=2,
+        nu=1,
+        nx=1,
+        dtype=jnp.float32,
+        publish_stride=1,
+    )
+    batch1 = ProcessedGainBatch(
+        cycle_id=0,
+        sample_indices=jnp.array([0, 1], dtype=jnp.int32),
+        costs=jnp.array([1.0, 2.0], dtype=jnp.float32),
+        delta_u0=jnp.array([[10.0], [20.0]], dtype=jnp.float32),
+        gradients=jnp.array([[100.0], [200.0]], dtype=jnp.float32),
+    )
+    batch2 = ProcessedGainBatch(
+        cycle_id=1,
+        sample_indices=jnp.array([2, 3], dtype=jnp.int32),
+        costs=jnp.array([3.0, 4.0], dtype=jnp.float32),
+        delta_u0=jnp.array([[30.0], [40.0]], dtype=jnp.float32),
+        gradients=jnp.array([[300.0], [400.0]], dtype=jnp.float32),
+    )
+    batch3 = ProcessedGainBatch(
+        cycle_id=2,
+        sample_indices=jnp.array([4, 5], dtype=jnp.int32),
+        costs=jnp.array([5.0, 6.0], dtype=jnp.float32),
+        delta_u0=jnp.array([[50.0], [60.0]], dtype=jnp.float32),
+        gradients=jnp.array([[500.0], [600.0]], dtype=jnp.float32),
+    )
+
+    window.append(batch1)
+    assert window.fill == 2
+    assert not window.ready_to_publish()
+
+    window.append(batch2)
+    assert window.fill == 4
+    assert window.ready_to_publish()
+    assert tuple(map(float, window.ordered_costs().tolist())) == (1.0, 2.0, 3.0, 4.0)
+
+    window.append(batch3)
+    assert window.fill == 4
+    assert tuple(map(float, window.ordered_costs().tolist())) == (3.0, 4.0, 5.0, 6.0)
+
+
+def test_phase0_exact_refresh_matches_sync_exact_when_k_equals_m():
+    seed, terminal_cost = lqr_seed()
+    state = jnp.array([0.0, 0.0], dtype=jnp.float32)
+    reference = jnp.array([0.5, 0.0], dtype=jnp.float32)
+
+    sync_solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=4,
+        gain_buffer_size=4,
+    )
+    sync_solver.sampler.optimal_samples = seed
+    sync_solver.command(state, reference, shift_guess=False, num_steps=1).block_until_ready()
+    sync_gains = jax.block_until_ready(sync_solver.gains)
+
+    probe_solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=4,
+        gain_buffer_size=4,
+    )
+    probe_solver.sampler.optimal_samples = seed
+    probe_solver.reset_phase0_exact_gain_probe(reset_published_gain=True)
+    probe_solver.command(
+        state,
+        reference,
+        shift_guess=False,
+        num_steps=1,
+        update_gains=False,
+        capture_gain_context=True,
+    ).block_until_ready()
+    refresh = probe_solver.phase0_refresh_exact_gains()
+    probe_gains = jax.block_until_ready(probe_solver.gains)
+
+    assert refresh["gain_published"]
+    assert jnp.allclose(probe_gains, sync_gains, atol=1e-6)
+
+
+def test_phase0_exact_probe_stays_open_loop_until_window_is_full():
+    seed, terminal_cost = lqr_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=2,
+        gain_buffer_size=4,
+    )
+    solver.sampler.optimal_samples = seed
+    solver.reset_phase0_exact_gain_probe(reset_published_gain=True)
+    state = jnp.array([0.0, 0.0], dtype=jnp.float32)
+    reference = jnp.array([0.5, 0.0], dtype=jnp.float32)
+
+    solver.command(
+        state,
+        reference,
+        shift_guess=False,
+        num_steps=1,
+        update_gains=False,
+        capture_gain_context=True,
+    ).block_until_ready()
+    refresh_0 = solver.phase0_refresh_exact_gains()
+    gains_0 = jax.block_until_ready(solver.gains)
+
+    solver.command(
+        state,
+        reference,
+        shift_guess=False,
+        num_steps=1,
+        update_gains=False,
+        capture_gain_context=True,
+    ).block_until_ready()
+    refresh_1 = solver.phase0_refresh_exact_gains()
+    gains_1 = jax.block_until_ready(solver.gains)
+
+    assert not refresh_0["gain_published"]
+    assert jnp.allclose(gains_0, jnp.zeros_like(gains_0))
+    assert refresh_1["gain_published"]
+    assert refresh_1["first_gain_ready_cycle"] == 1
+    assert jnp.all(jnp.isfinite(gains_1))
+
+
+def test_background_exact_gain_worker_publishes_after_window_is_full():
+    seed, terminal_cost = lqr_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=2,
+        gain_buffer_size=4,
+    )
+    solver.sampler.optimal_samples = seed
+    solver.start_async_exact_gain_worker(reset_published_gain=True)
+    state = jnp.array([0.0, 0.0], dtype=jnp.float32)
+    reference = jnp.array([0.5, 0.0], dtype=jnp.float32)
+
+    try:
+        for _ in range(2):
+            solver.command(
+                state,
+                reference,
+                shift_guess=False,
+                num_steps=1,
+                update_gains=False,
+                capture_gain_context=True,
+            ).block_until_ready()
+
+        deadline = time.perf_counter() + 10.0
+        status = solver.async_exact_gain_status()
+        while status["first_gain_ready_cycle"] is None and time.perf_counter() < deadline:
+            time.sleep(0.01)
+            status = solver.async_exact_gain_status()
+
+        gains = jax.block_until_ready(solver.gains)
+        assert status["first_gain_ready_cycle"] == 1
+        assert status["rolling_window_fill"] == 4
+        assert status["worker_error"] is None
+        assert jnp.all(jnp.isfinite(gains))
+        assert not jnp.allclose(gains, jnp.zeros_like(gains))
+    finally:
+        solver.stop_async_exact_gain_worker()
 
 
 def test_finite_difference_gain_subset_uses_configured_prefix():

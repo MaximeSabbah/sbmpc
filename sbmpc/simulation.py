@@ -22,7 +22,7 @@ class Visualizer(ABC):
         self.paused = False
 
     def toggle_paused(self):
-        self.paused != self.paused
+        self.paused = not self.paused
 
     def get_paused(self):
         return self.paused
@@ -62,6 +62,7 @@ class Visualizer(ABC):
 
 class MujocoVisualizer(Visualizer):
     def __init__(self, mj_model: mujoco.MjModel, mj_data: mujoco.MjData, step_mujoco: bool = True, show_left_ui: bool = True, show_right_ui: bool = False, num_iters: int = 100):
+        super().__init__()
         self.mj_data = mj_data
         self.mj_model = mj_model
         self.step_mujoco = step_mujoco
@@ -310,7 +311,8 @@ def build_model_and_solver(config: settings.Config, objective: BaseObjective, cu
 def build_all(config: settings.Config, objective: BaseObjective,
               reference: jnp.array,
               custom_dynamics_fn: Optional[Callable] = None,
-              obstacles: bool = True):
+              obstacles: bool = True,
+              warm_start_gains: bool = True):
     system, x_init, state_init = (None, None, None)
     solver_dynamics_model_setting = config.solver_dynamics
     sim_dynamics_model_setting = config.sim_dynamics
@@ -341,6 +343,11 @@ def build_all(config: settings.Config, objective: BaseObjective,
     sim = Simulation(sim_state_init, sim_dynamics_model, rollout_generator, sampler, gains, reference, config, visualizer_params, obstacles)
 
     # dummy for jitting
-    input_sequence = sim.controller.command(solver_x_init, reference, False).block_until_ready()
+    input_sequence = sim.controller.command(
+        solver_x_init,
+        reference,
+        False,
+        update_gains=warm_start_gains,
+    ).block_until_ready()
 
     return sim
