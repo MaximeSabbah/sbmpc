@@ -7,6 +7,9 @@ import jax.numpy as jnp
 import jax
 
 from functools import partial
+from dataclasses import dataclass
+import time
+import threading
 
 from abc import ABC, abstractmethod
 
@@ -46,6 +49,102 @@ class BaseObjective(ABC):
     def terminal_constraints(self, state, reference):
         return jnp.asarray(0.0, dtype=jnp.float32)
 
+
+
+@dataclass(frozen=True)
+class ExactGainPlanContext:
+    cycle_id: int
+    state: jax.Array
+    reference: jax.Array
+    optimal_samples: jax.Array
+    raw_samples_delta: jax.Array
+    samples_delta_clipped: jax.Array
+    nominal_costs: jax.Array
+
+
+@dataclass(frozen=True)
+class ExactGainSnapshot:
+    cycle_id: int
+    sample_indices: jax.Array
+    state: jax.Array
+    reference: jax.Array
+    optimal_samples: jax.Array
+    control_variables: jax.Array
+    costs: jax.Array
+    delta_u0: jax.Array
+
+
+@dataclass(frozen=True)
+class ProcessedGainBatch:
+    cycle_id: int
+    sample_indices: jax.Array
+    costs: jax.Array
+    delta_u0: jax.Array
+    gradients: jax.Array
+
+
+class RollingGainWindow:
+    def __init__(self, capacity, batch_size, nu, nx, dtype, publish_stride=1):
+        self.capacity = int(capacity)
+        self.batch_size = int(batch_size)
+        self.publish_stride = int(publish_stride)
+        self.costs = jnp.zeros((self.capacity,), dtype=dtype)
+        self.delta_u0 = jnp.zeros((self.capacity, nu), dtype=dtype)
+        self.gradients = jnp.zeros((self.capacity, nx), dtype=dtype)
+        self.fill = 0
+        self.cursor = 0
+        self.append_count = 0
+
+    def reset(self):
+        self.costs = jnp.zeros_like(self.costs)
+        self.delta_u0 = jnp.zeros_like(self.delta_u0)
+        self.gradients = jnp.zeros_like(self.gradients)
+        self.fill = 0
+        self.cursor = 0
+        self.append_count = 0
+
+    def _write_ring(self, target, values):
+        batch_size = values.shape[0]
+        start = self.cursor
+        end = start + batch_size
+        if end <= self.capacity:
+            return target.at[start:end].set(values)
+        split = self.capacity - start
+        target = target.at[start:].set(values[:split])
+        return target.at[: batch_size - split].set(values[split:])
+
+    def append(self, batch: ProcessedGainBatch):
+        if batch.costs.shape[0] != self.batch_size:
+            raise ValueError(
+                f"expected batch size {self.batch_size}, got {batch.costs.shape[0]}"
+            )
+        self.costs = self._write_ring(self.costs, batch.costs)
+        self.delta_u0 = self._write_ring(self.delta_u0, batch.delta_u0)
+        self.gradients = self._write_ring(self.gradients, batch.gradients)
+        self.cursor = (self.cursor + self.batch_size) % self.capacity
+        self.fill = min(self.capacity, self.fill + self.batch_size)
+        self.append_count += 1
+
+    def ready_to_publish(self):
+        return (
+            self.fill >= self.capacity
+            and self.append_count % self.publish_stride == 0
+        )
+
+    def compute_gain(self, gains_obj: Gains):
+        return gains_obj.gains_computation(
+            self.costs,
+            self.delta_u0[:, jnp.newaxis, :],
+            self.gradients,
+        )
+
+    def ordered_costs(self):
+        if self.fill < self.capacity:
+            return self.costs[: self.fill]
+        return jnp.concatenate(
+            (self.costs[self.cursor :], self.costs[: self.cursor]),
+            axis=0,
+        )
 
 
 class RolloutGenerator():
@@ -89,7 +188,7 @@ class RolloutGenerator():
             and self.gain_method == "exact"
             and gain_samples_per_cycle is not None
             and gain_buffer_size is not None
-            and gain_samples_per_cycle < self.num_parallel_computations
+            and gain_samples_per_cycle <= self.num_parallel_computations
         )
         self.compute_exact_gains = (
             self.compute_gains
@@ -298,10 +397,11 @@ class Controller:
         self.objective = rollout_gen.objective
         self.sampler = sampler
         self.gains_obj = gains_obj
+        self._zero_gains = jnp.zeros_like(self.gains_obj.cur_gains)
 
-        # Buffered-gain state (exact path only). Activates when BOTH knobs are set and
-        # samples_per_cycle < total MPPI samples. The full MPPI batch still runs rollout-only;
-        # the exact sensitivity pass is restricted to the buffered subset below.
+        # Buffered-gain state (exact path only). Activates when BOTH knobs are set.
+        # The full MPPI batch still runs rollout-only; the exact sensitivity pass is
+        # restricted to the promoted subset below.
         mpc = rollout_gen.config.MPC
         K = mpc.gain_samples_per_cycle
         M = mpc.gain_buffer_size
@@ -327,17 +427,93 @@ class Controller:
             self._gain_K = int(K)
             self._gain_M = int(M)
             self._gain_stride = self._gain_M // self._gain_K
-            self._gain_buf_costs = jnp.zeros((self._gain_M,), dtype=dtype)
-            self._gain_buf_deltas = jnp.zeros((self._gain_M, nu), dtype=dtype)
-            self._gain_buf_grads = jnp.zeros((self._gain_M, nx), dtype=dtype)
-            self._gain_buf_fill = 0
-            self._gain_buf_idx = 0
+            self._sync_exact_window = RollingGainWindow(
+                self._gain_M,
+                self._gain_K,
+                nu,
+                nx,
+                dtype,
+                publish_stride=1,
+            )
+            self._phase0_exact_window = RollingGainWindow(
+                self._gain_M,
+                self._gain_K,
+                nu,
+                nx,
+                dtype,
+                publish_stride=1,
+            )
             self._gain_cycle = 0
+            self._phase0_capture_cycle = 0
+            self._phase0_pending_context = None
+            self._phase0_dropped_snapshot_count = 0
+            self._phase0_queue_depth_max = 0
+            self._phase0_first_gain_ready_cycle = None
+            self._phase0_last_published_cycle = None
+            self._phase0_last_refresh = {}
+            self._async_exact_window = RollingGainWindow(
+                self._gain_M,
+                self._gain_K,
+                nu,
+                nx,
+                dtype,
+                publish_stride=1,
+            )
+            self._async_capture_cycle = 0
+            self._async_pending_context = None
+            self._async_dropped_snapshot_count = 0
+            self._async_queue_depth_max = 0
+            self._async_first_gain_ready_cycle = None
+            self._async_last_published_cycle = None
+            self._async_last_refresh = {}
+            self._async_completed_batch_count = 0
+            self._async_worker_error = None
+        else:
+            self._sync_exact_window = None
+            self._phase0_exact_window = None
+            self._async_exact_window = None
+            self._phase0_capture_cycle = 0
+            self._phase0_pending_context = None
+            self._phase0_dropped_snapshot_count = 0
+            self._phase0_queue_depth_max = 0
+            self._phase0_first_gain_ready_cycle = None
+            self._phase0_last_published_cycle = None
+            self._phase0_last_refresh = {}
+            self._async_capture_cycle = 0
+            self._async_pending_context = None
+            self._async_dropped_snapshot_count = 0
+            self._async_queue_depth_max = 0
+            self._async_first_gain_ready_cycle = None
+            self._async_last_published_cycle = None
+            self._async_last_refresh = {}
+            self._async_completed_batch_count = 0
+            self._async_worker_error = None
 
-    def command(self, state, reference, shift_guess=True, num_steps=1):
+        self._gain_lock = threading.Lock()
+        self._async_condition = threading.Condition()
+        self._async_thread = None
+        self._async_running = False
+
+    def _get_current_gains(self):
+        with self._gain_lock:
+            return self.gains_obj.cur_gains
+
+    def _set_current_gains(self, gains):
+        with self._gain_lock:
+            self.gains_obj.cur_gains = gains
+
+    def command(
+        self,
+        state,
+        reference,
+        shift_guess=True,
+        num_steps=1,
+        update_gains=True,
+        capture_gain_context=False,
+    ):
 
         optimal_samples = self.sampler.optimal_samples
-        gains = self.gains_obj.cur_gains
+        gains = self._get_current_gains()
 
         for i in range(num_steps):
             previous_optimal_samples = optimal_samples
@@ -346,8 +522,19 @@ class Controller:
                 state, reference, previous_optimal_samples, raw_samples_delta, gains
             )
             optimal_samples = self.sampler.update(previous_optimal_samples, samples, costs)
+            if capture_gain_context and self._gain_buffered and self.rollout_gen.gain_method == "exact":
+                self._capture_exact_gain_context(
+                    state,
+                    reference,
+                    previous_optimal_samples,
+                    raw_samples_delta,
+                    samples,
+                    costs,
+            )
             # update gains
-            if self.gains_obj.compute_gains and self.rollout_gen.gain_method == "finite_difference":
+            if not update_gains:
+                new_gains = None
+            elif self.gains_obj.compute_gains and self.rollout_gen.gain_method == "finite_difference":
                 new_gains = self._finite_difference_gains(
                     state,
                     reference,
@@ -362,10 +549,13 @@ class Controller:
                     reference,
                     previous_optimal_samples,
                     raw_samples_delta,
+                    samples,
+                    costs,
                 )
             else:
                 new_gains = self.gains_obj.gains_computation(costs, samples, gradients)
-            self.gains_obj.cur_gains = new_gains
+            if new_gains is not None:
+                self._set_current_gains(new_gains)
        
         # update sampler best control vars
         if shift_guess:
@@ -374,7 +564,418 @@ class Controller:
             self.sampler.optimal_samples = optimal_samples
         
         return optimal_samples
+
+    def _make_exact_gain_context(
+        self,
+        cycle_id,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
+    ):
+        return ExactGainPlanContext(
+            cycle_id=cycle_id,
+            state=state,
+            reference=reference,
+            optimal_samples=optimal_samples,
+            raw_samples_delta=raw_samples_delta,
+            samples_delta_clipped=samples_delta_clipped,
+            nominal_costs=nominal_costs,
+        )
+
+    def _select_exact_gain_sample_indices(self, cycle_id, costs=None):
+        del cycle_id
+        total = self.rollout_gen.num_parallel_computations
+        if self._gain_K >= total:
+            return jnp.arange(total, dtype=jnp.int32)
+        if costs is None:
+            return jnp.arange(self._gain_K, dtype=jnp.int32)
+        if self._gain_K == 1:
+            return jnp.zeros((1,), dtype=jnp.int32)
+
+        _, top_non_nominal = jax.lax.top_k(-costs[1:], self._gain_K - 1)
+        return jnp.concatenate(
+            (
+                jnp.zeros((1,), dtype=jnp.int32),
+                top_non_nominal.astype(jnp.int32) + 1,
+            ),
+            axis=0,
+        )
+
+    def _pack_exact_gain_snapshot(self, context: ExactGainPlanContext, sample_indices):
+        rg = self.rollout_gen
+        raw_sub = context.raw_samples_delta[sample_indices]
+        if rg.config.MPC.smoothing == "Spline":
+            control_variables = (
+                context.optimal_samples[rg.control_spline_indices, :] + raw_sub
+            )
+        else:
+            control_variables = context.optimal_samples + raw_sub
+
+        if context.reference.ndim == 1:
+            reference = jnp.tile(context.reference, (rg.horizon + 1, 1))
+        else:
+            reference = context.reference
+
+        samples_sub = context.samples_delta_clipped[sample_indices]
+        return ExactGainSnapshot(
+            cycle_id=context.cycle_id,
+            sample_indices=sample_indices,
+            state=context.state,
+            reference=reference,
+            optimal_samples=context.optimal_samples,
+            control_variables=control_variables,
+            costs=context.nominal_costs[sample_indices],
+            delta_u0=samples_sub[:, 0, :],
+        )
+
+    def _process_exact_gain_snapshot(self, snapshot: ExactGainSnapshot):
+        _, gradients = self.rollout_gen.rollout_sens_to_state(
+            snapshot.state,
+            snapshot.reference,
+            snapshot.control_variables,
+        )
+        return ProcessedGainBatch(
+            cycle_id=snapshot.cycle_id,
+            sample_indices=snapshot.sample_indices,
+            costs=snapshot.costs,
+            delta_u0=snapshot.delta_u0,
+            gradients=gradients,
+        )
+
+    def _refresh_exact_gain_context(self, context: ExactGainPlanContext, window: RollingGainWindow):
+        t_select = time.perf_counter()
+        sample_indices = self._select_exact_gain_sample_indices(
+            context.cycle_id,
+            context.nominal_costs,
+        )
+        jax.block_until_ready(sample_indices)
+        subset_select_ms = (time.perf_counter() - t_select) * 1000.0
+
+        t_pack = time.perf_counter()
+        snapshot = self._pack_exact_gain_snapshot(context, sample_indices)
+        jax.block_until_ready(snapshot.costs)
+        jax.block_until_ready(snapshot.delta_u0)
+        jax.block_until_ready(snapshot.control_variables)
+        snapshot_pack_ms = (time.perf_counter() - t_pack) * 1000.0
+
+        t_grad = time.perf_counter()
+        batch = self._process_exact_gain_snapshot(snapshot)
+        jax.block_until_ready(batch.gradients)
+        gain_grad_ms = (time.perf_counter() - t_grad) * 1000.0
+
+        window.append(batch)
+        gain_published = False
+        gain_synth_ms = 0.0
+        new_gains = None
+        if window.ready_to_publish():
+            t_synth = time.perf_counter()
+            new_gains = window.compute_gain(self.gains_obj)
+            jax.block_until_ready(new_gains)
+            gain_synth_ms = (time.perf_counter() - t_synth) * 1000.0
+            gain_published = True
+
+        return {
+            "subset_select_ms": subset_select_ms,
+            "snapshot_pack_ms": snapshot_pack_ms,
+            "gain_grad_ms": gain_grad_ms,
+            "gain_synth_ms": gain_synth_ms,
+            "gain_refresh_ms": subset_select_ms
+            + snapshot_pack_ms
+            + gain_grad_ms
+            + gain_synth_ms,
+            "gain_published": gain_published,
+            "source_cycle_id": context.cycle_id,
+        }, new_gains
+
+    def _empty_exact_gain_refresh_status(self):
+        return {
+            "subset_select_ms": 0.0,
+            "snapshot_pack_ms": 0.0,
+            "gain_grad_ms": 0.0,
+            "gain_synth_ms": 0.0,
+            "gain_refresh_ms": 0.0,
+            "gain_published": False,
+            "source_cycle_id": None,
+        }
+
+    def _capture_exact_gain_context(
+        self,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
+    ):
+        with self._async_condition:
+            async_running = self._async_running
+        if async_running:
+            self._enqueue_async_gain_context(
+                state,
+                reference,
+                optimal_samples,
+                raw_samples_delta,
+                samples_delta_clipped,
+                nominal_costs,
+            )
+        else:
+            self._capture_phase0_gain_context(
+                state,
+                reference,
+                optimal_samples,
+                raw_samples_delta,
+                samples_delta_clipped,
+                nominal_costs,
+            )
+
+    def _capture_phase0_gain_context(
+        self,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
+    ):
+        if self._phase0_pending_context is not None:
+            self._phase0_dropped_snapshot_count += 1
+        cycle_id = self._phase0_capture_cycle
+        self._phase0_capture_cycle += 1
+        self._phase0_pending_context = self._make_exact_gain_context(
+            cycle_id,
+            state,
+            reference,
+            optimal_samples,
+            raw_samples_delta,
+            samples_delta_clipped,
+            nominal_costs,
+        )
+        self._phase0_queue_depth_max = max(self._phase0_queue_depth_max, 1)
+
+    def reset_phase0_exact_gain_probe(self, reset_published_gain=True):
+        if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
+            return
+        self._phase0_exact_window.reset()
+        self._phase0_pending_context = None
+        self._phase0_dropped_snapshot_count = 0
+        self._phase0_queue_depth_max = 0
+        self._phase0_first_gain_ready_cycle = None
+        self._phase0_last_published_cycle = None
+        self._phase0_last_refresh = {}
+        self._phase0_capture_cycle = 0
+        if reset_published_gain:
+            self._set_current_gains(self._zero_gains)
+
+    def phase0_probe_status(self):
+        age_cycles = float("nan")
+        current_cycle = max(0, self._phase0_capture_cycle - 1)
+        if self._phase0_last_published_cycle is not None:
+            age_cycles = float(current_cycle - self._phase0_last_published_cycle)
+        return {
+            "first_gain_ready_cycle": self._phase0_first_gain_ready_cycle,
+            "published_gain_age_cycles": age_cycles,
+            "queue_depth_max": int(self._phase0_queue_depth_max),
+            "dropped_snapshot_count": int(self._phase0_dropped_snapshot_count),
+            "rolling_window_fill": int(
+                self._phase0_exact_window.fill
+                if self._phase0_exact_window is not None
+                else 0
+            ),
+        }
+
+    def phase0_refresh_exact_gains(self):
+        if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
+            raise ValueError("Phase 0 exact-gain probe requires buffered exact gains.")
+        if self._phase0_pending_context is None:
+            result = self.phase0_probe_status()
+            result.update(self._empty_exact_gain_refresh_status())
+            self._phase0_last_refresh = result
+            return result
+
+        context = self._phase0_pending_context
+        self._phase0_pending_context = None
+        refresh, new_gains = self._refresh_exact_gain_context(
+            context,
+            self._phase0_exact_window,
+        )
+        if refresh["gain_published"]:
+            self._set_current_gains(new_gains)
+            self._phase0_last_published_cycle = context.cycle_id
+            if self._phase0_first_gain_ready_cycle is None:
+                self._phase0_first_gain_ready_cycle = context.cycle_id
+
+        result = self.phase0_probe_status()
+        result.update(refresh)
+        self._phase0_last_refresh = result
+        return result
     
+    def start_async_exact_gain_worker(self, reset_published_gain=True):
+        if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
+            raise ValueError("Async exact-gain worker requires buffered exact gains.")
+        with self._async_condition:
+            if self._async_running:
+                return
+            self._async_exact_window.reset()
+            self._async_capture_cycle = 0
+            self._async_pending_context = None
+            self._async_dropped_snapshot_count = 0
+            self._async_queue_depth_max = 0
+            self._async_first_gain_ready_cycle = None
+            self._async_last_published_cycle = None
+            self._async_last_refresh = {}
+            self._async_completed_batch_count = 0
+            self._async_worker_error = None
+            self._async_running = True
+            if reset_published_gain:
+                self._set_current_gains(self._zero_gains)
+            self._async_thread = threading.Thread(
+                target=self._async_exact_gain_worker_loop,
+                name="sbmpc-exact-gain-worker",
+                daemon=True,
+            )
+            self._async_thread.start()
+
+    def stop_async_exact_gain_worker(self, wait=True):
+        with self._async_condition:
+            thread = self._async_thread
+            self._async_running = False
+            self._async_pending_context = None
+            self._async_condition.notify_all()
+        if wait and thread is not None:
+            thread.join()
+        with self._async_condition:
+            if self._async_thread is thread:
+                self._async_thread = None
+
+    def _enqueue_async_gain_context(
+        self,
+        state,
+        reference,
+        optimal_samples,
+        raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
+    ):
+        with self._async_condition:
+            cycle_id = self._async_capture_cycle
+            self._async_capture_cycle += 1
+            context = self._make_exact_gain_context(
+                cycle_id,
+                state,
+                reference,
+                optimal_samples,
+                raw_samples_delta,
+                samples_delta_clipped,
+                nominal_costs,
+            )
+            if self._async_pending_context is not None:
+                self._async_dropped_snapshot_count += 1
+            self._async_pending_context = context
+            self._async_queue_depth_max = max(self._async_queue_depth_max, 1)
+            self._async_condition.notify()
+
+    def _async_exact_gain_worker_loop(self):
+        while True:
+            with self._async_condition:
+                while self._async_running and self._async_pending_context is None:
+                    self._async_condition.wait()
+                if not self._async_running:
+                    return
+                context = self._async_pending_context
+                self._async_pending_context = None
+
+            try:
+                refresh, new_gains = self._refresh_exact_gain_context(
+                    context,
+                    self._async_exact_window,
+                )
+                if refresh["gain_published"]:
+                    self._set_current_gains(new_gains)
+
+                with self._async_condition:
+                    if refresh["gain_published"]:
+                        self._async_last_published_cycle = context.cycle_id
+                        if self._async_first_gain_ready_cycle is None:
+                            self._async_first_gain_ready_cycle = context.cycle_id
+                    status = self._async_probe_status_locked()
+                    status.update(refresh)
+                    self._async_completed_batch_count += 1
+                    status["completed_batch_count"] = self._async_completed_batch_count
+                    self._async_last_refresh = status
+                    self._async_condition.notify_all()
+            except BaseException as exc:
+                with self._async_condition:
+                    self._async_worker_error = repr(exc)
+                    self._async_running = False
+                    self._async_condition.notify_all()
+                return
+
+    def _async_probe_status_locked(self):
+        age_cycles = float("nan")
+        current_cycle = max(0, self._async_capture_cycle - 1)
+        if self._async_last_published_cycle is not None:
+            age_cycles = float(current_cycle - self._async_last_published_cycle)
+        return {
+            "first_gain_ready_cycle": self._async_first_gain_ready_cycle,
+            "published_gain_age_cycles": age_cycles,
+            "queue_depth_max": int(self._async_queue_depth_max),
+            "dropped_snapshot_count": int(self._async_dropped_snapshot_count),
+            "rolling_window_fill": int(
+                self._async_exact_window.fill
+                if self._async_exact_window is not None
+                else 0
+            ),
+            "completed_batch_count": int(self._async_completed_batch_count),
+            "worker_error": self._async_worker_error,
+        }
+
+    def async_exact_gain_status(self):
+        if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
+            result = self._empty_exact_gain_refresh_status()
+            result.update(
+                {
+                    "first_gain_ready_cycle": None,
+                    "published_gain_age_cycles": float("nan"),
+                    "queue_depth_max": 0,
+                    "dropped_snapshot_count": 0,
+                    "rolling_window_fill": 0,
+                    "completed_batch_count": 0,
+                    "worker_error": None,
+                }
+            )
+            return result
+        with self._async_condition:
+            result = self._async_probe_status_locked()
+            if self._async_last_refresh:
+                for key in (
+                    "subset_select_ms",
+                    "snapshot_pack_ms",
+                    "gain_grad_ms",
+                    "gain_synth_ms",
+                    "gain_refresh_ms",
+                    "gain_published",
+                    "source_cycle_id",
+                ):
+                    result[key] = self._async_last_refresh.get(key, 0.0)
+            else:
+                result.update(self._empty_exact_gain_refresh_status())
+            return result
+
+    def wait_for_async_exact_gain_batches(self, min_completed_batches, timeout_sec=10.0):
+        deadline = time.perf_counter() + timeout_sec
+        with self._async_condition:
+            while self._async_completed_batch_count < min_completed_batches:
+                if self._async_worker_error is not None:
+                    raise RuntimeError(self._async_worker_error)
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    return False
+                self._async_condition.wait(timeout=remaining)
+            return True
+
 
     def _buffered_exact_gains(
         self,
@@ -382,57 +983,30 @@ class Controller:
         reference,
         optimal_samples,
         raw_samples_delta,
+        samples_delta_clipped,
+        nominal_costs,
     ):
-        """Exact-path gain with sub-sampled backprop accumulated into a FIFO buffer.
-
-        Each cycle backprops a rotating `gain_samples_per_cycle` subset (K) and appends
-        (cost, Δu[0], ∇J) to a ring buffer of capacity `gain_buffer_size` (M).
-        Once the buffer has filled and on every (M/K)-th cycle thereafter,
-        runs the paper gain formula over the full M-sized buffer and caches K.
-        Between ticks reuses the cached K.
-        """
-        rg = self.rollout_gen
-        K = self._gain_K
-        M = self._gain_M
-        stride = self._gain_stride
-
-        sample_indices = (
-            jnp.arange(K, dtype=jnp.int32) + self._gain_cycle * K
-        ) % rg.num_parallel_computations
-        raw_sub = raw_samples_delta[sample_indices]
-        if rg.config.MPC.smoothing == "Spline":
-            control_vars_sub = optimal_samples[rg.control_spline_indices, :] + raw_sub
-        else:
-            control_vars_sub = optimal_samples + raw_sub
-
-        if reference.ndim == 1:
-            reference_tiled = jnp.tile(reference, (rg.horizon + 1, 1))
-        else:
-            reference_tiled = reference
-
-        (costs_sub, control_vars_returned), grads_sub = rg.rollout_sens_to_state(
-            state, reference_tiled, control_vars_sub
+        context = self._make_exact_gain_context(
+            self._gain_cycle,
+            state,
+            reference,
+            optimal_samples,
+            raw_samples_delta,
+            samples_delta_clipped,
+            nominal_costs,
         )
-        deltas_sub = rg.compute_samples_delta(control_vars_returned, optimal_samples)
-        deltas_first = deltas_sub[:, 0, :]
-
-        idx = self._gain_buf_idx
-        self._gain_buf_costs = self._gain_buf_costs.at[idx:idx + K].set(costs_sub)
-        self._gain_buf_deltas = self._gain_buf_deltas.at[idx:idx + K].set(deltas_first)
-        self._gain_buf_grads = self._gain_buf_grads.at[idx:idx + K].set(grads_sub)
-
-        self._gain_buf_idx = (idx + K) % M
-        self._gain_buf_fill = min(M, self._gain_buf_fill + K)
+        sample_indices = self._select_exact_gain_sample_indices(
+            self._gain_cycle,
+            context.nominal_costs,
+        )
+        snapshot = self._pack_exact_gain_snapshot(context, sample_indices)
+        batch = self._process_exact_gain_snapshot(snapshot)
+        self._sync_exact_window.append(batch)
         self._gain_cycle += 1
 
-        # Update K on the stride tick once the buffer has filled at least once.
-        if self._gain_buf_fill >= M and (self._gain_cycle % stride == 0):
-            return self.gains_obj.gains_computation(
-                self._gain_buf_costs,
-                self._gain_buf_deltas[:, jnp.newaxis, :],
-                self._gain_buf_grads,
-            )
-        return self.gains_obj.cur_gains
+        if self._sync_exact_window.ready_to_publish():
+            return self._sync_exact_window.compute_gain(self.gains_obj)
+        return self._get_current_gains()
 
     @partial(jax.jit, static_argnums=(0,))
     def _fd_sample_indices(self, nominal_costs):
@@ -501,4 +1075,4 @@ class Controller:
     
     @property
     def gains(self):
-        return self.gains_obj.cur_gains
+        return self._get_current_gains()
