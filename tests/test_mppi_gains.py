@@ -1,4 +1,3 @@
-import control
 import jax
 import jax.numpy as jnp
 import time
@@ -37,22 +36,11 @@ class Objective(BaseObjective):
         return jnp.asarray(20.0 * (err.T @ self.terminal_cost @ err), dtype=jnp.float32)
 
 
-def lqr_seed():
-    # Match the semi-implicit Euler integrator used by the default model.
-    ad = jnp.array([[1.0, DT], [0.0, 1.0]], dtype=jnp.float32)
-    bd = jnp.array([[DT * DT], [DT]], dtype=jnp.float32)
-    k, s, _ = control.dlqr(ad, bd, Q, Q[0, 0])
-    k = jnp.asarray(k, dtype=jnp.float32)
-    s = jnp.asarray(s, dtype=jnp.float32)
-
-    x = jnp.array([0.0, 0.0], dtype=jnp.float32)
-    x_des = jnp.array([0.5, 0.0], dtype=jnp.float32)
+def linear_seed():
     controls = jnp.zeros((HORIZON, 2), dtype=jnp.float32)
-    for idx in range(HORIZON):
-        u = jnp.asarray(-k @ (x - x_des), dtype=jnp.float32)
-        controls = controls.at[idx, 0].set(u[0])
-        x = ad @ x + bd @ u
-    return controls, s
+    controls = controls.at[:, 0].set(jnp.linspace(0.25, 0.05, HORIZON))
+    terminal_cost = jnp.array([[1.0, 0.0], [0.0, 0.5]], dtype=jnp.float32)
+    return controls, terminal_cost
 
 
 def build_solver(
@@ -94,7 +82,7 @@ def build_solver(
 
 
 def run_gain(gain_method):
-    seed, terminal_cost = lqr_seed()
+    seed, terminal_cost = linear_seed()
     solver = build_solver(gain_method, terminal_cost)
     solver.sampler.optimal_samples = seed
     solver.command(
@@ -118,7 +106,7 @@ def test_finite_difference_mppi_gains_match_exact_ad_gains():
 
 
 def test_buffered_exact_gain_path_skips_full_batch_exact_rollout():
-    seed, terminal_cost = lqr_seed()
+    seed, terminal_cost = linear_seed()
     solver = build_solver(
         "exact",
         terminal_cost,
@@ -148,7 +136,7 @@ def test_buffered_exact_gain_path_skips_full_batch_exact_rollout():
 
 
 def test_buffered_exact_gain_path_allows_full_batch_promotion():
-    _, terminal_cost = lqr_seed()
+    _, terminal_cost = linear_seed()
     solver = build_solver(
         "exact",
         terminal_cost,
@@ -162,7 +150,7 @@ def test_buffered_exact_gain_path_allows_full_batch_promotion():
 
 
 def test_exact_gain_snapshot_keeps_nominal_and_lowest_cost_samples():
-    _, terminal_cost = lqr_seed()
+    _, terminal_cost = linear_seed()
     solver = build_solver(
         "exact",
         terminal_cost,
@@ -249,7 +237,7 @@ def test_rolling_gain_window_replaces_oldest_batch_when_full():
 
 
 def test_phase0_exact_refresh_matches_sync_exact_when_k_equals_m():
-    seed, terminal_cost = lqr_seed()
+    seed, terminal_cost = linear_seed()
     state = jnp.array([0.0, 0.0], dtype=jnp.float32)
     reference = jnp.array([0.5, 0.0], dtype=jnp.float32)
 
@@ -289,7 +277,7 @@ def test_phase0_exact_refresh_matches_sync_exact_when_k_equals_m():
 
 
 def test_phase0_exact_probe_stays_open_loop_until_window_is_full():
-    seed, terminal_cost = lqr_seed()
+    seed, terminal_cost = linear_seed()
     solver = build_solver(
         "exact",
         terminal_cost,
@@ -332,7 +320,7 @@ def test_phase0_exact_probe_stays_open_loop_until_window_is_full():
 
 
 def test_background_exact_gain_worker_publishes_after_window_is_full():
-    seed, terminal_cost = lqr_seed()
+    seed, terminal_cost = linear_seed()
     solver = build_solver(
         "exact",
         terminal_cost,
@@ -372,8 +360,45 @@ def test_background_exact_gain_worker_publishes_after_window_is_full():
         solver.stop_async_exact_gain_worker()
 
 
+def test_public_background_gain_lifecycle_is_idempotent():
+    seed, terminal_cost = linear_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_samples_per_cycle=2,
+        gain_buffer_size=4,
+    )
+    solver.sampler.optimal_samples = seed
+
+    assert solver.start_background_gains(reset_published_gain=True)
+    assert solver.background_gain_status()["worker_running"]
+
+    solver.close()
+    assert not solver.background_gain_status()["worker_running"]
+
+    solver.stop_background_gains()
+    solver.close()
+    assert not solver.background_gain_status()["worker_running"]
+
+
+def test_background_gain_lifecycle_noops_when_not_configured():
+    _, terminal_cost = linear_seed()
+    solver = build_solver(
+        "finite_difference",
+        terminal_cost,
+        num_parallel_computations=8,
+        gain_fd_num_samples=4,
+    )
+
+    assert not solver.start_background_gains(reset_published_gain=True)
+    solver.stop_background_gains()
+    solver.close()
+    assert not solver.background_gain_status()["worker_running"]
+
+
 def test_finite_difference_gain_subset_uses_configured_prefix():
-    _, terminal_cost = lqr_seed()
+    _, terminal_cost = linear_seed()
     solver = build_solver(
         "finite_difference",
         terminal_cost,

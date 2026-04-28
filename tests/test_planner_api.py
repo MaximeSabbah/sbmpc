@@ -145,6 +145,8 @@ def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     assert np.isfinite(output.diagnostics.torque_norm)
     assert np.all(np.isfinite(output.tau_ff))
     assert np.all(np.isfinite(output.K))
+    assert output.diagnostics.gain_mode == "fd_feedback"
+    assert output.diagnostics.foreground_planning_time_ms is not None
 
 
 def test_panda_pregrasp_controller_reuses_solution_guess() -> None:
@@ -195,3 +197,49 @@ def test_panda_pregrasp_controller_can_reseed_every_step() -> None:
     controller.step(q, v)
 
     assert call_count == 2
+
+
+def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    controller = PandaPregraspController(
+        planner=planner,
+        config=config,
+        gain_mode="feedforward",
+    )
+
+    output = controller.step(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+    )
+
+    assert output.diagnostics.gain_mode == "feedforward"
+    assert np.allclose(output.K, np.zeros_like(output.K))
+
+
+def test_panda_pregrasp_controller_exact_async_mode_starts_and_stops_worker() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    config.MPC.gain_samples_per_cycle = 2
+    config.MPC.gain_buffer_size = 4
+    controller = PandaPregraspController(
+        planner=planner,
+        config=config,
+        gain_mode="exact_async_feedback",
+    )
+
+    try:
+        controller.start()
+        status = controller.controller.background_gain_status()
+        assert status["worker_running"]
+        assert controller.gain_mode == "exact_async_feedback"
+    finally:
+        controller.close()
+
+    assert not controller.controller.background_gain_status()["worker_running"]

@@ -605,9 +605,10 @@ Current implementation note:
   `/control` using best-effort QoS. The bridge must match those endpoints; the
   earlier `/linear_feedback_controller/{sensor,control}` assumption is not
   correct for this stack.
-- `sbmpc_bringup/config/sbmpc_bridge_milestone5_feedforward.yaml` and
-  `sbmpc_bringup/config/sbmpc_bridge_milestone5_feedback.yaml` start disarmed
-  with `enable_nonzero_control: false`. Arm the bridge explicitly with:
+- `sbmpc_bringup/config/sbmpc_bridge_feedforward.yaml`,
+  `sbmpc_bringup/config/sbmpc_bridge.yaml`, and
+  `sbmpc_bringup/config/sbmpc_bridge_exact_async.yaml` start disarmed with
+  `enable_nonzero_control: false`. Arm the bridge explicitly with:
   `ros2 param set /sbmpc_lfc_bridge_node enable_nonzero_control true`.
 - In one headless validation run, the feedforward PREGRASP path reached
   `state="running"` with zero gain, nonzero `/control` feedforward, and a

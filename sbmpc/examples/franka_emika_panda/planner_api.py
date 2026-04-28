@@ -48,6 +48,15 @@ class PlannerDiagnostics:
     orientation_error: float
     object_error: float | None
     goal_position: np.ndarray
+    gain_mode: str | None = None
+    foreground_planning_time_ms: float | None = None
+    background_gain_time_ms: float | None = None
+    async_gain_worker_running: bool = False
+    async_gain_worker_error: str | None = None
+    gain_age_cycles: float | None = None
+    gain_window_fill: int = 0
+    gain_completed_batch_count: int = 0
+    gain_dropped_snapshot_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,97 @@ class PlannerOutput:
     next_phase: Phase
     gripper_command: GripperCommand
     diagnostics: PlannerDiagnostics
+
+
+GAIN_MODE_FEEDFORWARD = "feedforward"
+GAIN_MODE_FD_FEEDBACK = "fd_feedback"
+GAIN_MODE_EXACT_ASYNC_FEEDBACK = "exact_async_feedback"
+SUPPORTED_GAIN_MODES = {
+    GAIN_MODE_FEEDFORWARD,
+    GAIN_MODE_FD_FEEDBACK,
+    GAIN_MODE_EXACT_ASYNC_FEEDBACK,
+}
+
+
+def _resolve_gain_mode(config: Config, gain_mode: str | None) -> str:
+    if gain_mode is not None:
+        mode = gain_mode.strip().lower()
+        if mode not in SUPPORTED_GAIN_MODES:
+            valid = ", ".join(sorted(SUPPORTED_GAIN_MODES))
+            raise ValueError(f"unsupported gain_mode '{gain_mode}'. Choose from: {valid}.")
+        return mode
+
+    if not config.MPC.gains:
+        return GAIN_MODE_FEEDFORWARD
+    if config.MPC.gain_method == "finite_difference":
+        return GAIN_MODE_FD_FEEDBACK
+    if config.MPC.gain_method == "exact":
+        if (
+            config.MPC.gain_samples_per_cycle is not None
+            and config.MPC.gain_buffer_size is not None
+        ):
+            return GAIN_MODE_EXACT_ASYNC_FEEDBACK
+        raise ValueError(
+            "exact planner gains require gain_samples_per_cycle and "
+            "gain_buffer_size so exact gradients can run in the background."
+        )
+    raise ValueError(f"unsupported gain method: {config.MPC.gain_method!r}.")
+
+
+def _apply_gain_mode_to_config(config: Config, gain_mode: str) -> None:
+    if gain_mode == GAIN_MODE_FEEDFORWARD:
+        config.MPC.gains = False
+        return
+    if gain_mode == GAIN_MODE_FD_FEEDBACK:
+        config.MPC.gains = True
+        config.MPC.gain_method = "finite_difference"
+        config.MPC.gain_samples_per_cycle = None
+        config.MPC.gain_buffer_size = None
+        return
+    if gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+        config.MPC.gains = True
+        config.MPC.gain_method = "exact"
+        if (
+            config.MPC.gain_samples_per_cycle is None
+            or config.MPC.gain_buffer_size is None
+        ):
+            raise ValueError(
+                "exact_async_feedback requires gain_samples_per_cycle and "
+                "gain_buffer_size."
+            )
+        return
+    raise ValueError(f"unsupported gain_mode: {gain_mode!r}.")
+
+
+def _finite_or_none(value: object | None) -> float | None:
+    if value is None:
+        return None
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def _async_gain_diagnostics(controller, gain_mode: str) -> dict[str, object]:
+    if gain_mode != GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+        return {
+            "background_gain_time_ms": None,
+            "async_gain_worker_running": False,
+            "async_gain_worker_error": None,
+            "gain_age_cycles": None,
+            "gain_window_fill": 0,
+            "gain_completed_batch_count": 0,
+            "gain_dropped_snapshot_count": 0,
+        }
+
+    status = controller.background_gain_status()
+    return {
+        "background_gain_time_ms": _finite_or_none(status.get("gain_refresh_ms")),
+        "async_gain_worker_running": bool(status.get("worker_running", False)),
+        "async_gain_worker_error": status.get("worker_error"),
+        "gain_age_cycles": _finite_or_none(status.get("published_gain_age_cycles")),
+        "gain_window_fill": int(status.get("rolling_window_fill", 0)),
+        "gain_completed_batch_count": int(status.get("completed_batch_count", 0)),
+        "gain_dropped_snapshot_count": int(status.get("dropped_snapshot_count", 0)),
+    }
 
 
 class PandaPickAndPlaceController:
@@ -71,6 +171,7 @@ class PandaPickAndPlaceController:
         gains: bool = True,
         num_steps: int = 1,
         visualize: bool = False,
+        gain_mode: str | None = None,
     ) -> None:
         self.planner = PandaPickAndPlacePlanner() if planner is None else planner
         self.objective = PandaPickAndPlaceObjective(self.planner)
@@ -83,6 +184,8 @@ class PandaPickAndPlaceController:
             if config is None
             else config
         )
+        self.gain_mode = _resolve_gain_mode(self.config, gain_mode)
+        _apply_gain_mode_to_config(self.config, self.gain_mode)
         self.model, self.controller = build_model_and_solver(
             self.config,
             self.objective,
@@ -91,6 +194,18 @@ class PandaPickAndPlaceController:
         self._default_num_steps = self._validate_num_steps(num_steps)
         self._solution_initialized = False
         self._last_reference_signature: tuple[object, ...] | None = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.controller.start_background_gains(reset_published_gain=True)
+        self._started = True
+
+    def close(self) -> None:
+        self.controller.close()
+        self._started = False
 
     def warmup(
         self,
@@ -154,12 +269,25 @@ class PandaPickAndPlaceController:
         )
         effective_num_steps = self._default_num_steps if num_steps is None else num_steps
         effective_num_steps = self._validate_num_steps(effective_num_steps)
+        reset_gain_state = (
+            reset_guess
+            or not self._solution_initialized
+            or reference_signature != self._last_reference_signature
+        )
         if (
             reset_guess
             or not self._solution_initialized
             or reference_signature != self._last_reference_signature
         ):
             self._seed_nominal_solution(state, reference.goal_q)
+        if reset_gain_state:
+            if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
+                self.controller.stop_background_gains()
+                self._started = False
+            self.controller.reset_published_gains()
+
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.start()
 
         start_time = time.time_ns()
         input_sequence = self.controller.command(
@@ -167,6 +295,8 @@ class PandaPickAndPlaceController:
             self.planner.reference_vec,
             shift_guess=True,
             num_steps=effective_num_steps,
+            update_gains=self.gain_mode != GAIN_MODE_EXACT_ASYNC_FEEDBACK,
+            capture_gain_context=self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK,
         )
         input_sequence = jax.block_until_ready(input_sequence)
         self._solution_initialized = True
@@ -174,6 +304,7 @@ class PandaPickAndPlaceController:
         gains = np.asarray(jax.block_until_ready(self.controller.gains), dtype=np.float32)
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
+        gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
 
         ee_pos, ee_x, ee_z = self.planner.ee_features(q)
         position_error = float(jnp.linalg.norm(ee_pos - reference.goal_pos))
@@ -213,6 +344,9 @@ class PandaPickAndPlaceController:
             orientation_error=orientation_error,
             object_error=object_error,
             goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
+            gain_mode=self.gain_mode,
+            foreground_planning_time_ms=planning_time_ms,
+            **gain_diag,
         )
         return PlannerOutput(
             tau_ff=tau_ff,
@@ -249,10 +383,6 @@ class PandaPickAndPlaceController:
             goal_q,
             self.config.MPC.horizon,
             self.config.MPC.dt,
-        )
-        self.controller.gains_obj.cur_gains = jnp.zeros(
-            (self.planner.nu, self.planner.nx),
-            dtype=getattr(self.config.general, "dtype", jnp.float32),
         )
 
     @staticmethod
@@ -298,6 +428,7 @@ class PandaPregraspController:
         num_steps: int = 1,
         visualize: bool = False,
         reseed_every_step: bool = False,
+        gain_mode: str | None = None,
     ) -> None:
         self.planner = PandaPregraspPlanner() if planner is None else planner
         self.objective = PandaPregraspObjective(self.planner)
@@ -310,6 +441,8 @@ class PandaPregraspController:
             if config is None
             else config
         )
+        self.gain_mode = _resolve_gain_mode(self.config, gain_mode)
+        _apply_gain_mode_to_config(self.config, self.gain_mode)
         self.model, self.controller = build_model_and_solver(
             self.config,
             self.objective,
@@ -318,6 +451,18 @@ class PandaPregraspController:
         self._default_num_steps = self._validate_num_steps(num_steps)
         self._solution_initialized = False
         self._reseed_every_step = reseed_every_step
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.controller.start_background_gains(reset_published_gain=True)
+        self._started = True
+
+    def close(self) -> None:
+        self.controller.close()
+        self._started = False
 
     def warmup(
         self,
@@ -351,8 +496,17 @@ class PandaPregraspController:
         state = jnp.concatenate([q, v], axis=0)
         effective_num_steps = self._default_num_steps if num_steps is None else num_steps
         effective_num_steps = self._validate_num_steps(effective_num_steps)
+        reset_gain_state = reset_guess or not self._solution_initialized
         if reset_guess or self._reseed_every_step or not self._solution_initialized:
             self._seed_nominal_solution(state)
+        if reset_gain_state:
+            if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
+                self.controller.stop_background_gains()
+                self._started = False
+            self.controller.reset_published_gains()
+
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.start()
 
         reference = self.planner.reference
         start_time = time.time_ns()
@@ -361,12 +515,15 @@ class PandaPregraspController:
             self.planner.reference_vec,
             shift_guess=True,
             num_steps=effective_num_steps,
+            update_gains=self.gain_mode != GAIN_MODE_EXACT_ASYNC_FEEDBACK,
+            capture_gain_context=self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK,
         )
         input_sequence = jax.block_until_ready(input_sequence)
         self._solution_initialized = True
         gains = np.asarray(jax.block_until_ready(self.controller.gains), dtype=np.float32)
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
+        gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
 
         ee_pos, ee_x, ee_z = self.planner.ee_features(q)
         position_error = float(jnp.linalg.norm(ee_pos - reference.goal_pos))
@@ -392,6 +549,9 @@ class PandaPregraspController:
             orientation_error=orientation_error,
             object_error=None,
             goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
+            gain_mode=self.gain_mode,
+            foreground_planning_time_ms=planning_time_ms,
+            **gain_diag,
         )
         return PlannerOutput(
             tau_ff=tau_ff,
@@ -422,10 +582,6 @@ class PandaPregraspController:
             state,
             self.config.MPC.horizon,
             self.config.MPC.dt,
-        )
-        self.controller.gains_obj.cur_gains = jnp.zeros(
-            (self.planner.nu, self.planner.nx),
-            dtype=getattr(self.config.general, "dtype", jnp.float32),
         )
 
     @staticmethod

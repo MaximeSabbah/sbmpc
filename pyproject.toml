@@ -13,7 +13,6 @@ dependencies = [
     "numpy",
     "matplotlib",
     "jax>=0.6.0",
-    "control",
     "mujoco-mjx",
     "interpax",
     "equinox>=0.13.4"

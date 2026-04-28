@@ -502,6 +502,26 @@ class Controller:
         with self._gain_lock:
             self.gains_obj.cur_gains = gains
 
+    def reset_published_gains(self):
+        self._set_current_gains(self._zero_gains)
+
+    def start_background_gains(self, reset_published_gain=True):
+        if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
+            return False
+        self.start_async_exact_gain_worker(
+            reset_published_gain=reset_published_gain,
+        )
+        return True
+
+    def stop_background_gains(self, wait=True):
+        self.stop_async_exact_gain_worker(wait=wait)
+
+    def background_gain_status(self):
+        return self.async_exact_gain_status()
+
+    def close(self):
+        self.stop_background_gains(wait=True)
+
     def command(
         self,
         state,
@@ -930,6 +950,7 @@ class Controller:
             ),
             "completed_batch_count": int(self._async_completed_batch_count),
             "worker_error": self._async_worker_error,
+            "worker_running": bool(self._async_running),
         }
 
     def async_exact_gain_status(self):
@@ -944,6 +965,7 @@ class Controller:
                     "rolling_window_fill": 0,
                     "completed_batch_count": 0,
                     "worker_error": None,
+                    "worker_running": False,
                 }
             )
             return result
