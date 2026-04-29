@@ -70,13 +70,8 @@ class PlannerOutput:
 
 
 GAIN_MODE_FEEDFORWARD = "feedforward"
-GAIN_MODE_FD_FEEDBACK = "fd_feedback"
 GAIN_MODE_EXACT_ASYNC_FEEDBACK = "exact_async_feedback"
-SUPPORTED_GAIN_MODES = {
-    GAIN_MODE_FEEDFORWARD,
-    GAIN_MODE_FD_FEEDBACK,
-    GAIN_MODE_EXACT_ASYNC_FEEDBACK,
-}
+SUPPORTED_GAIN_MODES = {GAIN_MODE_FEEDFORWARD, GAIN_MODE_EXACT_ASYNC_FEEDBACK}
 ASYNC_GAIN_WARMUP_TIMEOUT_SEC = 120.0
 
 
@@ -90,8 +85,6 @@ def _resolve_gain_mode(config: Config, gain_mode: str | None) -> str:
 
     if not config.MPC.gains:
         return GAIN_MODE_FEEDFORWARD
-    if config.MPC.gain_method == "finite_difference":
-        return GAIN_MODE_FD_FEEDBACK
     if config.MPC.gain_method == "exact":
         if (
             config.MPC.gain_samples_per_cycle is not None
@@ -108,10 +101,6 @@ def _resolve_gain_mode(config: Config, gain_mode: str | None) -> str:
 def _apply_gain_mode_to_config(config: Config, gain_mode: str) -> None:
     if gain_mode == GAIN_MODE_FEEDFORWARD:
         config.MPC.gains = False
-        return
-    if gain_mode == GAIN_MODE_FD_FEEDBACK:
-        config.MPC.gains = True
-        config.MPC.gain_method = "finite_difference"
         config.MPC.gain_samples_per_cycle = None
         config.MPC.gain_buffer_size = None
         return

@@ -486,6 +486,9 @@ def make_panda_pick_and_place_config(
         config.MPC.horizon = 8
         config.MPC.num_parallel_computations = 14
         config.MPC.num_control_points = 4
+        config.MPC.gain_method = "exact"
+        config.MPC.gain_samples_per_cycle = 14
+        config.MPC.gain_buffer_size = 14
     else:
         config.MPC.horizon = 16
         config.MPC.num_parallel_computations = 32
@@ -496,9 +499,6 @@ def make_panda_pick_and_place_config(
         config.MPC.dt,
         Phase.PREGRASP,
     )
-    config.MPC.gain_method = "finite_difference"
-    config.MPC.gain_fd_scheme = "forward"
-    config.MPC.gain_fd_epsilon = 1e-3
     config.solver_dynamics = DynamicsModel.CUSTOM
     config.sim_dynamics = DynamicsModel.CUSTOM
     return config

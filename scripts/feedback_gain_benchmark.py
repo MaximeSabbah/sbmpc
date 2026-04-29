@@ -32,7 +32,6 @@ class BenchmarkResult:
     name: str
     gains_enabled: bool
     gain_method: str
-    gain_fd_scheme: str
     horizon: int
     num_parallel_computations: int
     num_control_points: int
@@ -63,9 +62,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--name", default="case", help="Label used in the output.")
     parser.add_argument(
         "--mode",
-        choices=("ff", "fd", "exact"),
+        choices=("ff", "exact"),
         default="exact",
-        help="Benchmark feedforward only, finite-difference gains, or exact gains.",
+        help="Benchmark feedforward only or exact gains.",
     )
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--samples", type=int, default=14)
@@ -87,11 +86,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--std-value", type=float, default=0.05)
-    parser.add_argument(
-        "--gain-fd-scheme",
-        choices=("forward", "central"),
-        default="central",
-    )
     parser.add_argument("--num-steps", type=int, default=1)
     parser.add_argument(
         "--repeats",
@@ -110,10 +104,6 @@ def _parse_args() -> argparse.Namespace:
 def _build_controller(args: argparse.Namespace) -> tuple[PandaPickAndPlacePlanner, PandaPickAndPlaceController]:
     planner = PandaPickAndPlacePlanner()
     gains_enabled = args.mode != "ff"
-    if args.mode == "exact":
-        gain_method = "exact"
-    else:
-        gain_method = "finite_difference"
 
     config = make_panda_pick_and_place_config(
         planner,
@@ -136,8 +126,7 @@ def _build_controller(args: argparse.Namespace) -> tuple[PandaPickAndPlacePlanne
             dtype=jnp.float32,
         )
     config.MPC.gains = gains_enabled
-    config.MPC.gain_method = gain_method
-    config.MPC.gain_fd_scheme = args.gain_fd_scheme
+    config.MPC.gain_method = "exact"
     config.MPC.smoothing = None if args.smoothing == "none" else args.smoothing
 
     controller = PandaPickAndPlaceController(
@@ -195,17 +184,7 @@ def _profile_command(
         jax.block_until_ready(optimal_samples)
         t3 = time.perf_counter()
 
-        if gains_obj.compute_gains and rollout_gen.gain_method == "finite_difference":
-            new_gains = low._finite_difference_gains(
-                state,
-                reference,
-                previous_optimal_samples,
-                raw_samples_delta,
-                samples,
-                costs,
-            )
-        else:
-            new_gains = gains_obj.gains_computation(costs, samples, gradients)
+        new_gains = gains_obj.gains_computation(costs, samples, gradients)
         jax.block_until_ready(new_gains)
         gains_obj.cur_gains = new_gains
         gains = new_gains
@@ -339,16 +318,11 @@ def _benchmark(args: argparse.Namespace) -> BenchmarkResult:
     )
     clip_fraction, max_ratio_to_limit = _clip_stats(controller, planner, state)
     gains_enabled = args.mode != "ff"
-    if args.mode == "exact":
-        gain_method = "exact"
-    else:
-        gain_method = "finite_difference"
 
     return BenchmarkResult(
         name=args.name,
         gains_enabled=gains_enabled,
-        gain_method=gain_method,
-        gain_fd_scheme=args.gain_fd_scheme,
+        gain_method="exact",
         horizon=args.horizon,
         num_parallel_computations=args.samples,
         num_control_points=args.control_points,

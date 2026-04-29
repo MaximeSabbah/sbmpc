@@ -604,3 +604,29 @@ record the reason here and update the plan section itself in the same commit.
   copy/wrapper with FER names and effort-compatible actuators.
 - Next handoff: Start implementation at §A1/A1b. Keep `fer_joint*` names in
   all ROS interfaces, and append a new entry here after each completed phase.
+
+### 2026-04-29 — Codex Phase A Implementation
+- Scope: Implemented the Phase A cleanup needed before MuJoCo wiring: removed
+  obsolete finite-difference gain support from `sbmpc`, migrated ROS bridge
+  defaults to exact async feedback, and removed legacy Gazebo bringup assets.
+- Changed: `sbmpc/settings.py` and `sbmpc/solvers.py` are exact-gain only;
+  Panda planner configs now use exact buffered gains; `planner_api.py` supports
+  only `feedforward` and `exact_async_feedback`; bridge parameters no longer
+  expose `planner_gain_method` or `planner_gain_fd_*`; `sbmpc_bridge.yaml`
+  defaults to `exact_async_feedback` with `128/512` gain buffering; Gazebo
+  launch/xacro/inertial workaround files were deleted from `sbmpc_bringup`;
+  tests and README were updated to match.
+- Verified: `rg` zero-hit checks passed for finite-difference gain symbols in
+  non-doc `sbmpc`, for finite-difference bridge symbols in `sbmpc_ros`, and for
+  legacy `franka_gazebo` / `ros_gz` / `gz_sim` / `gz_ros_control` hooks in
+  `sbmpc_ros`. Tests passed:
+  `pixi run python -m pytest tests/test_mppi_gains.py` with ROS env vars
+  unset, `pixi run python -m pytest tests/test_planner_api.py` with ROS env
+  vars unset, and focused `sbmpc_ros` pytest for planner adapter, bridge config,
+  bringup config, launch imports, launch preflight, and validation helpers.
+- Not verified / blockers: Did not vendor or build `mujoco_ros2_control`, did
+  not add the MuJoCo xacro/launch, and did not run behavior metrics against
+  live MuJoCo or hardware yet.
+- Next handoff: Continue at §B/§C: vendor/build `mujoco_ros2_control`, add the
+  FER-named MuJoCo ros2_control xacro/launch, then run the §6/§7 behavior
+  metric validation.

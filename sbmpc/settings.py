@@ -153,9 +153,6 @@ class MPCConfig:
         self._filter = None
         self._gains = False
         self._gain_method = "exact"
-        self._gain_fd_epsilon = 1e-3
-        self._gain_fd_scheme = "central"
-        self._gain_fd_num_samples = None
         # Buffered-gain (exact path) knobs. None/None = single-shot on all samples (current behavior).
         #   gain_samples_per_cycle: how many of the N MPPI samples to backprop per cycle
         #   gain_buffer_size:       accumulate this many samples across cycles before issuing a K update
@@ -269,45 +266,10 @@ class MPCConfig:
     def gain_method(self, value):
         if not isinstance(value, str):
             raise ValueError("str type is expected")
-        supported_methods = ["exact", "finite_difference"]
+        supported_methods = ["exact"]
         if value not in supported_methods:
             raise ValueError(f"gain_method not supported. Choose from {supported_methods}")
         self._gain_method = value
-
-    @property
-    def gain_fd_epsilon(self):
-        return self._gain_fd_epsilon
-
-    @gain_fd_epsilon.setter
-    def gain_fd_epsilon(self, value):
-        if not isinstance(value, float):
-            raise ValueError("float type is expected")
-        if not value > 0.0:
-            raise ValueError("must be greater than zero")
-        self._gain_fd_epsilon = value
-
-    @property
-    def gain_fd_scheme(self):
-        return self._gain_fd_scheme
-
-    @gain_fd_scheme.setter
-    def gain_fd_scheme(self, value):
-        if not isinstance(value, str):
-            raise ValueError("str type is expected")
-        supported_schemes = ["forward", "central"]
-        if value not in supported_schemes:
-            raise ValueError(f"gain_fd_scheme not supported. Choose from {supported_schemes}")
-        self._gain_fd_scheme = value
-
-    @property
-    def gain_fd_num_samples(self):
-        return self._gain_fd_num_samples
-
-    @gain_fd_num_samples.setter
-    def gain_fd_num_samples(self, value):
-        if value is not None and (not isinstance(value, int) or value < 1):
-            raise ValueError("gain_fd_num_samples must be a positive int or None")
-        self._gain_fd_num_samples = value
 
     @property
     def gain_samples_per_cycle(self):

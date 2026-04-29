@@ -269,12 +269,11 @@ def run_visual(planner, objective, config):
     sim.post_update = post_update
     print(f"\nJAX backend: {jax.default_backend()}, devices: {jax.devices()}")
     print(
-        f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
-        f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
-        f"fd={config.MPC.gain_fd_num_samples}  "
-        f"gK={config.MPC.gain_samples_per_cycle}  gM={config.MPC.gain_buffer_size}  "
-        f"mjx={config.robot.mjx_opts}"
-    )
+            f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
+            f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
+            f"gK={config.MPC.gain_samples_per_cycle}  gM={config.MPC.gain_buffer_size}  "
+            f"mjx={config.robot.mjx_opts}"
+        )
     sim.simulate()
 
 
@@ -288,10 +287,6 @@ def main():
     parser.add_argument("--steps", type=int, default=N_TRIALS, help="Timing trials per config")
     parser.add_argument("--quality-steps", type=int, default=N_QUALITY,
                         help="Simulation steps for quality check")
-    parser.add_argument("--gain-fd-samples", type=int, default=None,
-                        help="Override MPC.gain_fd_num_samples for finite-difference gains.")
-    parser.add_argument("--gain-method", choices=("exact", "finite_difference"), default=None,
-                        help="Override MPC.gain_method. Required to benchmark exact buffered gains.")
     parser.add_argument("--gain-samples-per-cycle", type=int, default=None,
                         help="Buffered-gain: how many of the MPPI samples to backprop per cycle.")
     parser.add_argument("--gain-buffer-size", type=int, default=None,
@@ -314,10 +309,7 @@ def main():
     args.mjx_opts = mjx_opts or None
 
     def _apply_gain_knobs(config):
-        if args.gain_method is not None:
-            config.MPC.gain_method = args.gain_method
-        if args.gain_fd_samples is not None:
-            config.MPC.gain_fd_num_samples = args.gain_fd_samples
+        config.MPC.gain_method = "exact"
         if args.gain_samples_per_cycle is not None:
             config.MPC.gain_samples_per_cycle = args.gain_samples_per_cycle
         if args.gain_buffer_size is not None:
@@ -366,7 +358,6 @@ def main():
                     _reset_initial_guess(planner, config)
                     label = (
                         f"h={h:2d} n={s:4d} cp={cp} "
-                        f"fd={config.MPC.gain_fd_num_samples} "
                         f"gK={config.MPC.gain_samples_per_cycle} gM={config.MPC.gain_buffer_size} "
                         f"mjx={config.robot.mjx_opts}"
                     )
@@ -411,7 +402,6 @@ def main():
     label = (
         f"h={config.MPC.horizon} n={config.MPC.num_parallel_computations} "
         f"cp={config.MPC.num_control_points} gains={config.MPC.gains} "
-        f"fd={config.MPC.gain_fd_num_samples} "
         f"gK={config.MPC.gain_samples_per_cycle} gM={config.MPC.gain_buffer_size} "
         f"mjx={config.robot.mjx_opts}"
     )

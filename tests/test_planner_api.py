@@ -10,13 +10,30 @@ from sbmpc.examples.franka_emika_panda.panda_pick_and_place import (
 )
 
 
+_CONTROLLERS: list[PandaPickAndPlaceController | PandaPregraspController] = []
+
+
+def track_controller(controller: PandaPickAndPlaceController | PandaPregraspController):
+    _CONTROLLERS.append(controller)
+    return controller
+
+
+def teardown_module() -> None:
+    for controller in reversed(_CONTROLLERS):
+        controller.close()
+    _CONTROLLERS.clear()
+
+
 def build_controller(gains: bool) -> PandaPickAndPlaceController:
     planner = PandaPickAndPlacePlanner()
     config = make_panda_pick_and_place_config(planner, visualize=False, gains=gains)
     config.MPC.horizon = 4
     config.MPC.num_parallel_computations = 8
     config.MPC.num_control_points = 2
-    return PandaPickAndPlaceController(planner=planner, config=config)
+    if gains:
+        config.MPC.gain_samples_per_cycle = 4
+        config.MPC.gain_buffer_size = 8
+    return track_controller(PandaPickAndPlaceController(planner=planner, config=config))
 
 
 def build_pregrasp_controller(gains: bool) -> PandaPregraspController:
@@ -26,8 +43,9 @@ def build_pregrasp_controller(gains: bool) -> PandaPregraspController:
     config.MPC.num_parallel_computations = 8
     config.MPC.num_control_points = 2
     if gains:
-        config.MPC.gain_fd_num_samples = 8
-    return PandaPregraspController(planner=planner, config=config)
+        config.MPC.gain_samples_per_cycle = 4
+        config.MPC.gain_buffer_size = 8
+    return track_controller(PandaPregraspController(planner=planner, config=config))
 
 
 def test_panda_pick_and_place_controller_step_returns_ros_ready_shapes() -> None:
@@ -145,7 +163,7 @@ def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     assert np.isfinite(output.diagnostics.torque_norm)
     assert np.all(np.isfinite(output.tau_ff))
     assert np.all(np.isfinite(output.K))
-    assert output.diagnostics.gain_mode == "fd_feedback"
+    assert output.diagnostics.gain_mode == "exact_async_feedback"
     assert output.diagnostics.foreground_planning_time_ms is not None
 
 
@@ -175,11 +193,14 @@ def test_panda_pregrasp_controller_can_reseed_every_step() -> None:
     config.MPC.horizon = 4
     config.MPC.num_parallel_computations = 8
     config.MPC.num_control_points = 2
-    config.MPC.gain_fd_num_samples = 8
-    controller = PandaPregraspController(
-        planner=planner,
-        config=config,
-        reseed_every_step=True,
+    config.MPC.gain_samples_per_cycle = 4
+    config.MPC.gain_buffer_size = 8
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            reseed_every_step=True,
+        )
     )
     call_count = 0
     original = controller.planner.nominal_torque_sequence_from_state
@@ -205,10 +226,12 @@ def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:
     config.MPC.horizon = 4
     config.MPC.num_parallel_computations = 8
     config.MPC.num_control_points = 2
-    controller = PandaPregraspController(
-        planner=planner,
-        config=config,
-        gain_mode="feedforward",
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            gain_mode="feedforward",
+        )
     )
 
     output = controller.step(
@@ -228,10 +251,12 @@ def test_panda_pregrasp_controller_exact_async_mode_starts_and_stops_worker() ->
     config.MPC.num_control_points = 2
     config.MPC.gain_samples_per_cycle = 2
     config.MPC.gain_buffer_size = 4
-    controller = PandaPregraspController(
-        planner=planner,
-        config=config,
-        gain_mode="exact_async_feedback",
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            gain_mode="exact_async_feedback",
+        )
     )
 
     try:

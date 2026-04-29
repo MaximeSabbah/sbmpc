@@ -470,12 +470,9 @@ def make_panda_pregrasp_config(
         config.MPC.horizon = 8
         config.MPC.num_parallel_computations = 1024
         config.MPC.num_control_points = 8
-        config.MPC.gain_method = "finite_difference"
-        config.MPC.gain_fd_scheme = "forward"
-        # MJX rollouts are float32; 1e-3 is too small for stable velocity-column
-        # finite differences and produces noisy LFC gains.
-        config.MPC.gain_fd_epsilon = 1e-2
-        config.MPC.gain_fd_num_samples = 256
+        config.MPC.gain_method = "exact"
+        config.MPC.gain_samples_per_cycle = 128
+        config.MPC.gain_buffer_size = 512
     else:
         config.MPC.horizon = 16
         config.MPC.num_parallel_computations = 32

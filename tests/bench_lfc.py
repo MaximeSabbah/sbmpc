@@ -42,7 +42,6 @@ BENCH_PRESETS = {
     "custom": {},
     "exact-feedback": {
         "timing_mode": "gazebo",
-        "gain_method": "exact",
         "phase0_async_probe": False,
         "background_gain_worker": True,
         "gain_samples_per_cycle": 128,
@@ -52,7 +51,6 @@ BENCH_PRESETS = {
     },
     "exact-phase0": {
         "timing_mode": "gazebo",
-        "gain_method": "exact",
         "phase0_async_probe": True,
         "background_gain_worker": False,
         "gain_samples_per_cycle": 128,
@@ -62,7 +60,6 @@ BENCH_PRESETS = {
     },
     "exact-feedforward": {
         "timing_mode": "gazebo",
-        "gain_method": "exact",
         "phase0_async_probe": False,
         "background_gain_worker": True,
         "gain_samples_per_cycle": 128,
@@ -70,34 +67,15 @@ BENCH_PRESETS = {
         "feedback": False,
         "gains": True,
     },
-    "fast-feedforward": {
-        "timing_mode": "gazebo",
-        "gain_method": "finite_difference",
-        "phase0_async_probe": False,
-        "background_gain_worker": False,
-        "feedback": False,
-        "gains": False,
-    },
-    "fd-feedback": {
-        "timing_mode": "gazebo",
-        "gain_method": "finite_difference",
-        "phase0_async_probe": False,
-        "background_gain_worker": False,
-        "gain_fd_samples": 128,
-        "feedback": True,
-        "gains": True,
-    },
 }
 
 
 PRESET_FLAG_NAMES = {
     "timing_mode": ("--timing-mode",),
-    "gain_method": ("--gain-method",),
     "phase0_async_probe": ("--phase0-async-probe",),
     "background_gain_worker": ("--background-gain-worker",),
     "gain_samples_per_cycle": ("--gain-samples-per-cycle",),
     "gain_buffer_size": ("--gain-buffer-size",),
-    "gain_fd_samples": ("--gain-fd-samples",),
     "feedback": ("--feedback", "--no-feedback"),
     "gains": ("--gains", "--no-gains"),
 }
@@ -165,16 +143,15 @@ def _build_lfc_sim(args: argparse.Namespace):
     objective = PandaPregraspObjective(planner)
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
     config.MPC.gains = args.gains
-    config.MPC.gain_method = args.gain_method
-    config.MPC.gain_fd_epsilon = args.gain_fd_epsilon
-    config.MPC.gain_fd_scheme = args.gain_fd_scheme
-    config.MPC.gain_fd_num_samples = args.gain_fd_samples
+    config.MPC.gain_method = "exact"
     config.MPC.dt = args.dt
     config.MPC.horizon = args.horizon
     config.MPC.num_parallel_computations = args.samples
     config.MPC.num_control_points = args.control_points
-    config.MPC.gain_samples_per_cycle = getattr(args, "gain_samples_per_cycle", None)
-    config.MPC.gain_buffer_size = getattr(args, "gain_buffer_size", None)
+    if args.gain_samples_per_cycle is not None:
+        config.MPC.gain_samples_per_cycle = args.gain_samples_per_cycle
+    if args.gain_buffer_size is not None:
+        config.MPC.gain_buffer_size = args.gain_buffer_size
     config.robot.mjx_opts = getattr(args, "mjx_opts", None)
     config.MPC.initial_guess = planner.nominal_torque_sequence(
         config.MPC.horizon,
@@ -754,7 +731,7 @@ def _emit_reference(args: argparse.Namespace, result: dict[str, object], path: s
     payload = {
         "config": {
             "preset": args.preset,
-            "gain_method": args.gain_method,
+            "gain_method": "exact",
             "gains": bool(args.gains),
             "phase0_async_probe": bool(args.phase0_async_probe),
             "background_gain_worker": bool(args.background_gain_worker),
@@ -879,13 +856,9 @@ def main() -> None:
     parser.add_argument("--feedback", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable LFC feedback. Use --no-feedback for feedforward-only validation.")
     parser.add_argument("--gains", action=argparse.BooleanOptionalAction, default=True,
-                        help="Compute SB-MPC gains. Preset fast-feedforward disables this.")
+                        help="Compute SB-MPC gains.")
     parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--clip-velocity", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--gain-method", choices=("exact", "finite_difference"), default="exact")
-    parser.add_argument("--gain-fd-epsilon", type=float, default=1e-3)
-    parser.add_argument("--gain-fd-scheme", choices=("forward", "central"), default="forward")
-    parser.add_argument("--gain-fd-samples", type=int, default=256)
     parser.add_argument("--phase0-async-probe", action="store_true",
                         help="Run the no-thread exact-gain background probe with separate gain refresh timing.")
     parser.add_argument("--background-gain-worker", action="store_true",
@@ -936,8 +909,6 @@ def main() -> None:
     if args.phase0_async_probe and args.background_gain_worker:
         raise ValueError("--phase0-async-probe and --background-gain-worker are mutually exclusive.")
     if _exact_gain_context_enabled(args):
-        if args.gain_method != "exact":
-            raise ValueError("exact gain context modes require --gain-method exact.")
         if args.gain_samples_per_cycle is None or args.gain_buffer_size is None:
             raise ValueError(
                 "exact gain context modes require both --gain-samples-per-cycle "
@@ -950,7 +921,7 @@ def main() -> None:
     print(
         f"preset={args.preset} "
         f"dt={args.dt} h={args.horizon} samples={args.samples} cp={args.control_points} "
-        f"gain_method={args.gain_method} gains={args.gains} substeps={args.substeps} "
+        f"gain_method=exact gains={args.gains} substeps={args.substeps} "
         f"timing={args.timing_mode} retime={args.retime_initial_state} "
         f"desired={args.desired_state_mode} feedback={args.feedback} "
         f"clip_torque={args.clip_torque} "

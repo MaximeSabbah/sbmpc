@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-import time
 
 from sbmpc import BaseObjective
 import sbmpc.settings as settings
@@ -50,7 +49,6 @@ def build_solver(
     num_parallel_computations=3000,
     gain_samples_per_cycle=None,
     gain_buffer_size=None,
-    gain_fd_num_samples=None,
 ):
     robot_config = settings.RobotConfig()
     robot_config.nq = 1
@@ -69,9 +67,6 @@ def build_solver(
     config.MPC.gain_method = gain_method
     config.MPC.gain_samples_per_cycle = gain_samples_per_cycle
     config.MPC.gain_buffer_size = gain_buffer_size
-    config.MPC.gain_fd_scheme = "central"
-    config.MPC.gain_fd_epsilon = 1e-3
-    config.MPC.gain_fd_num_samples = gain_fd_num_samples
     config.solver_dynamics = settings.DynamicsModel.CUSTOM
     config.sim_dynamics = settings.DynamicsModel.CUSTOM
 
@@ -81,9 +76,9 @@ def build_solver(
     return solver
 
 
-def run_gain(gain_method):
+def run_gain():
     seed, terminal_cost = linear_seed()
-    solver = build_solver(gain_method, terminal_cost)
+    solver = build_solver("exact", terminal_cost)
     solver.sampler.optimal_samples = seed
     solver.command(
         jnp.array([0.0, 0.0], dtype=jnp.float32),
@@ -94,15 +89,12 @@ def run_gain(gain_method):
     return jax.block_until_ready(solver.gains)
 
 
-def test_finite_difference_mppi_gains_match_exact_ad_gains():
-    exact = run_gain("exact")
-    finite_difference = run_gain("finite_difference")
+def test_exact_mppi_gains_are_finite_and_nonzero():
+    exact = run_gain()
 
     assert exact.shape == (2, 2)
-    assert finite_difference.shape == exact.shape
     assert jnp.all(jnp.isfinite(exact))
-    assert jnp.all(jnp.isfinite(finite_difference))
-    assert jnp.linalg.norm(finite_difference - exact, ord=jnp.inf) < 2e-2
+    assert not jnp.allclose(exact, jnp.zeros_like(exact))
 
 
 def test_buffered_exact_gain_path_skips_full_batch_exact_rollout():
@@ -343,13 +335,12 @@ def test_background_exact_gain_worker_publishes_after_window_is_full():
                 update_gains=False,
                 capture_gain_context=True,
             ).block_until_ready()
+            assert solver.wait_for_async_exact_gain_batches(
+                int(solver.async_exact_gain_status()["completed_batch_count"]) + 1,
+                timeout_sec=10.0,
+            )
 
-        deadline = time.perf_counter() + 10.0
         status = solver.async_exact_gain_status()
-        while status["first_gain_ready_cycle"] is None and time.perf_counter() < deadline:
-            time.sleep(0.01)
-            status = solver.async_exact_gain_status()
-
         gains = jax.block_until_ready(solver.gains)
         assert status["first_gain_ready_cycle"] == 1
         assert status["rolling_window_fill"] == 4
@@ -385,28 +376,12 @@ def test_public_background_gain_lifecycle_is_idempotent():
 def test_background_gain_lifecycle_noops_when_not_configured():
     _, terminal_cost = linear_seed()
     solver = build_solver(
-        "finite_difference",
+        "exact",
         terminal_cost,
         num_parallel_computations=8,
-        gain_fd_num_samples=4,
     )
 
     assert not solver.start_background_gains(reset_published_gain=True)
     solver.stop_background_gains()
     solver.close()
     assert not solver.background_gain_status()["worker_running"]
-
-
-def test_finite_difference_gain_subset_uses_configured_prefix():
-    _, terminal_cost = linear_seed()
-    solver = build_solver(
-        "finite_difference",
-        terminal_cost,
-        num_parallel_computations=8,
-        gain_fd_num_samples=4,
-    )
-
-    costs = jnp.array([10.0, 2.0, 6.0, 1.0, 8.0, 3.0, 9.0, 4.0], dtype=jnp.float32)
-    indices = tuple(map(int, solver._fd_sample_indices(costs).tolist()))
-
-    assert indices == (0, 1, 2, 3)
