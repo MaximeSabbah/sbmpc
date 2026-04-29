@@ -41,7 +41,7 @@ class GripperCommand:
 @dataclass(frozen=True)
 class PlannerDiagnostics:
     planning_time_ms: float
-    running_cost: float
+    running_cost: float | None
     gain_norm: float
     torque_norm: float
     position_error: float
@@ -77,6 +77,7 @@ SUPPORTED_GAIN_MODES = {
     GAIN_MODE_FD_FEEDBACK,
     GAIN_MODE_EXACT_ASYNC_FEEDBACK,
 }
+ASYNC_GAIN_WARMUP_TIMEOUT_SEC = 120.0
 
 
 def _resolve_gain_mode(config: Config, gain_mode: str | None) -> str:
@@ -160,6 +161,30 @@ def _async_gain_diagnostics(controller, gain_mode: str) -> dict[str, object]:
     }
 
 
+def _async_gain_batches_to_first_publish(config: Config) -> int:
+    samples_per_cycle = int(config.MPC.gain_samples_per_cycle or 0)
+    buffer_size = int(config.MPC.gain_buffer_size or 0)
+    if samples_per_cycle <= 0 or buffer_size <= 0:
+        return 1
+    return max(1, (buffer_size + samples_per_cycle - 1) // samples_per_cycle)
+
+
+def _wait_for_async_gain_batches(controller, min_completed_batches: int) -> None:
+    ok = controller.wait_for_async_exact_gain_batches(
+        min_completed_batches,
+        timeout_sec=ASYNC_GAIN_WARMUP_TIMEOUT_SEC,
+    )
+    if ok:
+        return
+    status = controller.background_gain_status()
+    raise TimeoutError(
+        "Timed out waiting for async exact-gain warmup batches "
+        f"({status.get('completed_batch_count', 0)}/{min_completed_batches} complete, "
+        f"window_fill={status.get('rolling_window_fill', 0)}, "
+        f"worker_error={status.get('worker_error')})."
+    )
+
+
 class PandaPickAndPlaceController:
     """Stable, non-ROS adapter around the Panda pick-and-place planner."""
 
@@ -172,6 +197,7 @@ class PandaPickAndPlaceController:
         num_steps: int = 1,
         visualize: bool = False,
         gain_mode: str | None = None,
+        compute_running_cost: bool = True,
     ) -> None:
         self.planner = PandaPickAndPlacePlanner() if planner is None else planner
         self.objective = PandaPickAndPlaceObjective(self.planner)
@@ -195,6 +221,8 @@ class PandaPickAndPlaceController:
         self._solution_initialized = False
         self._last_reference_signature: tuple[object, ...] | None = None
         self._started = False
+        self._async_warmup_complete = False
+        self._compute_running_cost = compute_running_cost
 
     def start(self) -> None:
         if self._started:
@@ -214,15 +242,35 @@ class PandaPickAndPlaceController:
         target_pose: TaskPose | np.ndarray | None = None,
         num_steps: int | None = None,
     ) -> PlannerOutput:
-        return self.step(
+        async_completed_before = 0
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            async_completed_before = int(
+                self.controller.background_gain_status().get("completed_batch_count", 0)
+            )
+        output = self.step(
             self.planner.home_q,
             jnp.zeros(self.planner.nv, dtype=jnp.float32),
             phase,
             object_pose=object_pose,
             target_pose=target_pose,
             num_steps=num_steps,
-            reset_guess=True,
+            reset_guess=not self._solution_initialized,
         )
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            if self._async_warmup_complete:
+                _wait_for_async_gain_batches(
+                    self.controller,
+                    async_completed_before + 1,
+                )
+            else:
+                output = self._warmup_exact_async_until_ready(
+                    output,
+                    phase=phase,
+                    object_pose=object_pose,
+                    target_pose=target_pose,
+                    num_steps=num_steps,
+                )
+        return output
 
     def reference_for_phase(
         self,
@@ -285,6 +333,7 @@ class PandaPickAndPlaceController:
                 self.controller.stop_background_gains()
                 self._started = False
             self.controller.reset_published_gains()
+            self._async_warmup_complete = False
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
@@ -321,15 +370,17 @@ class PandaPickAndPlaceController:
             )
             object_error = float(jnp.linalg.norm(object_pos - object_goal))
 
-        running_cost = float(
-            jax.block_until_ready(
-                self.objective.running_cost(
-                    state,
-                    jnp.asarray(tau_ff, dtype=jnp.float32),
-                    self.planner.reference_vec,
+        running_cost = None
+        if self._compute_running_cost:
+            running_cost = float(
+                jax.block_until_ready(
+                    self.objective.running_cost(
+                        state,
+                        jnp.asarray(tau_ff, dtype=jnp.float32),
+                        self.planner.reference_vec,
+                    )
                 )
             )
-        )
         gripper_width = float(self.planner.gripper_target(phase))
         gripper_command = GripperCommand(
             action="open" if gripper_width >= self.planner.GRIPPER_OPEN else "close",
@@ -385,6 +436,57 @@ class PandaPickAndPlaceController:
             self.config.MPC.dt,
         )
 
+    def _warmup_exact_async_until_ready(
+        self,
+        output: PlannerOutput,
+        *,
+        phase: Phase,
+        object_pose: TaskPose | np.ndarray | None,
+        target_pose: TaskPose | np.ndarray | None,
+        num_steps: int | None,
+    ) -> PlannerOutput:
+        if self._async_warmup_complete:
+            return output
+
+        q = self.planner.home_q
+        v = jnp.zeros(self.planner.nv, dtype=jnp.float32)
+        target_batches = _async_gain_batches_to_first_publish(self.config)
+        target_fill = int(self.config.MPC.gain_buffer_size or 0)
+
+        _wait_for_async_gain_batches(self.controller, 1)
+        while True:
+            status = self.controller.background_gain_status()
+            completed = int(status.get("completed_batch_count", 0))
+            fill = int(status.get("rolling_window_fill", 0))
+            if completed >= target_batches and fill >= target_fill:
+                break
+            output = self.step(
+                q,
+                v,
+                phase,
+                object_pose=object_pose,
+                target_pose=target_pose,
+                num_steps=num_steps,
+                reset_guess=False,
+            )
+            _wait_for_async_gain_batches(self.controller, completed + 1)
+
+        completed = int(
+            self.controller.background_gain_status().get("completed_batch_count", 0)
+        )
+        output = self.step(
+            q,
+            v,
+            phase,
+            object_pose=object_pose,
+            target_pose=target_pose,
+            num_steps=num_steps,
+            reset_guess=False,
+        )
+        _wait_for_async_gain_batches(self.controller, completed + 1)
+        self._async_warmup_complete = True
+        return output
+
     @staticmethod
     def _validate_num_steps(value: int) -> int:
         num_steps = int(value)
@@ -429,6 +531,7 @@ class PandaPregraspController:
         visualize: bool = False,
         reseed_every_step: bool = False,
         gain_mode: str | None = None,
+        compute_running_cost: bool = True,
     ) -> None:
         self.planner = PandaPregraspPlanner() if planner is None else planner
         self.objective = PandaPregraspObjective(self.planner)
@@ -452,6 +555,8 @@ class PandaPregraspController:
         self._solution_initialized = False
         self._reseed_every_step = reseed_every_step
         self._started = False
+        self._async_warmup_complete = False
+        self._compute_running_cost = compute_running_cost
 
     def start(self) -> None:
         if self._started:
@@ -472,12 +577,29 @@ class PandaPregraspController:
         num_steps: int | None = None,
     ) -> PlannerOutput:
         del phase, object_pose, target_pose
-        return self.step(
+        async_completed_before = 0
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            async_completed_before = int(
+                self.controller.background_gain_status().get("completed_batch_count", 0)
+            )
+        output = self.step(
             self.planner.home_q,
             jnp.zeros(self.planner.nv, dtype=jnp.float32),
             num_steps=num_steps,
-            reset_guess=True,
+            reset_guess=not self._solution_initialized,
         )
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            if self._async_warmup_complete:
+                _wait_for_async_gain_batches(
+                    self.controller,
+                    async_completed_before + 1,
+                )
+            else:
+                output = self._warmup_exact_async_until_ready(
+                    output,
+                    num_steps=num_steps,
+                )
+        return output
 
     def step(
         self,
@@ -504,6 +626,7 @@ class PandaPregraspController:
                 self.controller.stop_background_gains()
                 self._started = False
             self.controller.reset_published_gains()
+            self._async_warmup_complete = False
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
@@ -531,15 +654,17 @@ class PandaPregraspController:
             (1.0 - jnp.clip(jnp.dot(ee_z, reference.goal_z_axis), -1.0, 1.0))
             + 0.5 * (1.0 - jnp.clip(jnp.dot(ee_x, reference.goal_x_axis), -1.0, 1.0))
         )
-        running_cost = float(
-            jax.block_until_ready(
-                self.objective.running_cost(
-                    state,
-                    jnp.asarray(tau_ff, dtype=jnp.float32),
-                    self.planner.reference_vec,
+        running_cost = None
+        if self._compute_running_cost:
+            running_cost = float(
+                jax.block_until_ready(
+                    self.objective.running_cost(
+                        state,
+                        jnp.asarray(tau_ff, dtype=jnp.float32),
+                        self.planner.reference_vec,
+                    )
                 )
             )
-        )
         diagnostics = PlannerDiagnostics(
             planning_time_ms=planning_time_ms,
             running_cost=running_cost,
@@ -583,6 +708,48 @@ class PandaPregraspController:
             self.config.MPC.horizon,
             self.config.MPC.dt,
         )
+
+    def _warmup_exact_async_until_ready(
+        self,
+        output: PlannerOutput,
+        *,
+        num_steps: int | None,
+    ) -> PlannerOutput:
+        if self._async_warmup_complete:
+            return output
+
+        q = self.planner.home_q
+        v = jnp.zeros(self.planner.nv, dtype=jnp.float32)
+        target_batches = _async_gain_batches_to_first_publish(self.config)
+        target_fill = int(self.config.MPC.gain_buffer_size or 0)
+
+        _wait_for_async_gain_batches(self.controller, 1)
+        while True:
+            status = self.controller.background_gain_status()
+            completed = int(status.get("completed_batch_count", 0))
+            fill = int(status.get("rolling_window_fill", 0))
+            if completed >= target_batches and fill >= target_fill:
+                break
+            output = self.step(
+                q,
+                v,
+                num_steps=num_steps,
+                reset_guess=False,
+            )
+            _wait_for_async_gain_batches(self.controller, completed + 1)
+
+        completed = int(
+            self.controller.background_gain_status().get("completed_batch_count", 0)
+        )
+        output = self.step(
+            q,
+            v,
+            num_steps=num_steps,
+            reset_guess=False,
+        )
+        _wait_for_async_gain_batches(self.controller, completed + 1)
+        self._async_warmup_complete = True
+        return output
 
     @staticmethod
     def _validate_num_steps(value: int) -> int:
