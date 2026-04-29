@@ -1,7 +1,6 @@
 # MuJoCo-ROS2 Deployment Plan — sbmpc + sbmpc_ros
 
-> This document supersedes `ASYNC_GAIN_ROS_GAZEBO_PLAN.md` (to be deleted as
-> part of Phase A4). `ASYNC_GAIN_BACKGROUND_PLAN.md` (algorithm) and
+`ASYNC_GAIN_BACKGROUND_PLAN.md` (algorithm) and
 > `ROS_DEPLOYMENT_ROADMAP.md` (project arc / real-robot path) remain
 > authoritative and unchanged.
 
@@ -24,13 +23,15 @@ This plan does two things, in order:
    only to support either of those. This applies to **both** `/workspace/sbmpc`
    and `/workspace/sbmpc_ros`.
 2. **Replatform sim on `mujoco_ros2_control`.** Wire MuJoCo physics directly
-   into `ros2_control` so the ROS sim shares the exact MJCF used by
-   `bench_lfc.py`. Validate with a closed-loop ROS run that reproduces the
-   benchmark's success criteria.
+   into `ros2_control` so the ROS sim shares the same physical model, `home`
+   keyframe, and PREGRASP reference used by `bench_lfc.py`. Validate with a
+   closed-loop ROS run that reproduces the benchmark's success criteria.
 
-After this plan completes, **nothing about the real-robot stack changes** —
-real-robot deployment continues to be governed by
-`docs/ROS_DEPLOYMENT_ROADMAP.md`.
+After this plan completes, the **real-robot launch topology and safety posture
+stay governed by** `docs/ROS_DEPLOYMENT_ROADMAP.md`. One config-level change is
+required, though: because the finite-difference gain path is being removed, any
+real-robot bridge preset that currently requests `fd_feedback` must be migrated
+to the exact background-worker path before it can be used.
 
 ### Success criteria (acceptance gates, all measured in ROS)
 
@@ -39,8 +40,8 @@ real-robot deployment continues to be governed by
 | Foreground (bridge timer + planner) period | 50 Hz, p99 ≤ 20 ms | `lfc_bridge_node._on_timer()` + planner `step()` |
 | Background gain worker | Running, dropped-snapshot rate ≤ 1 % over a 30 s run | `BridgeDiagnostics` |
 | Steady-state EE position error | < 1 mm (Euclidean) at the pregrasp pose, sustained 5 s | New ROS-side test mirroring `bench_lfc._ee_error()` |
-| Gain stability | Velocity HF energy (5–50 Hz band) ≤ value reached by `exact-feedback` preset on the same MJCF | New ROS-side check mirroring `bench_lfc._joint_vel_hf_energy()` |
-| MuJoCo physics ⟷ bench_lfc parity | Same MJCF (`sbmpc/examples/panda_pick_place/panda.xml`) loaded in both | mujoco_ros2_control `<mujoco_model>` param |
+| Gain stability | Velocity HF energy (5–50 Hz band) ≤ value reached by `exact-feedback` preset on the same physical model | New ROS-side check mirroring `bench_lfc._joint_vel_hf_energy()` |
+| MuJoCo physics ⟷ bench_lfc parity | Same physical model, same `home` keyframe, and same PREGRASP reference as `bench_lfc.py` | mujoco_ros2_control `<mujoco_model>` param + xacro test |
 
 The two new ROS-side measurements (EE error and gain HF energy) are the
 single most important deliverable of this plan: they let any agent verify
@@ -60,9 +61,14 @@ python -m sbmpc.tests.bench_lfc \
 
 Translates in ROS to: a single launch file that spins up
 
-- mujoco_ros2_control with **`sbmpc/examples/panda_pick_place/panda.xml`** as
-  the loaded MJCF (chosen for strict parity with `PandaPregraspPlanner` —
-  `sbmpc/sbmpc/examples/franka_emika_panda/panda_pregrasp.py:20`),
+- mujoco_ros2_control with a model derived from
+  **`sbmpc/examples/panda_pick_place/scene.xml`**, because
+  `PandaPregraspPlanner` loads `scene.xml` for the `home` keyframe, object
+  position, target position, and PREGRASP reference while using `panda.xml`
+  for the arm dynamics. If `mujoco_ros2_control` cannot expose the runtime
+  `fer_joint*` interfaces against the included `panda.xml` names directly,
+  create a ROS-control-specific MJCF wrapper/copy that changes only names and
+  actuator types needed by the driver; do **not** mutate the benchmark files.
 - `linear_feedback_controller` chainable with `joint_state_estimator`
   (already configured in `sbmpc_ros/sbmpc_bringup/config/franka_controllers.yaml`),
 - the existing `lfc_bridge_node` running the planner in
@@ -72,9 +78,20 @@ Translates in ROS to: a single launch file that spins up
   this milestone — pregrasp pose only, matching bench_lfc).
 
 The bridge already publishes `Control` at 50 Hz and consumes `Sensor`. We are
-**not changing the bridge**; we are only replacing what produces the `Sensor`
-stream and consumes the `Control` stream — Gazebo today, mujoco_ros2_control
-after this plan.
+mostly preserving that bridge loop; however, the FD cleanup necessarily touches
+the bridge's ROS parameter surface and adapter tests. The runtime joint names
+for ROS, `ros2_control`, LFC params, bridge configs, and validation tests are
+the FER names exposed by the Franka stack:
+
+```text
+fer_joint1 ... fer_joint7
+fer_finger_joint1
+```
+
+The internal `sbmpc` planner may still use its Panda/Pinocchio names
+(`panda_joint*`) inside the algorithm repository. Do not leak those names into
+the ROS hardware interfaces unless the active Franka description actually
+exports them.
 
 ---
 
@@ -117,6 +134,14 @@ Files and call sites to delete (verified via Phase-1 exploration):
     `finite_difference`.
 - `sbmpc/sbmpc/examples/franka_emika_panda/panda_pregrasp.py` — grep for
   `gain_fd_*`, `finite_difference`; remove any defaults that still set them.
+- `sbmpc/sbmpc/examples/franka_emika_panda/planner_api.py`
+  - delete `GAIN_MODE_FD_FEEDBACK` and remove it from
+    `SUPPORTED_GAIN_MODES`;
+  - remove every branch that maps `fd_feedback` to
+    `config.MPC.gain_method = "finite_difference"`;
+  - make the supported feedback mode `exact_async_feedback`, with
+    `gain_samples_per_cycle` and `gain_buffer_size` required when gains are
+    enabled.
 - `sbmpc/tests/`
   - Any test parametrized over gain methods: drop the FD parametrization,
     keep the exact-async one.
@@ -125,9 +150,38 @@ Files and call sites to delete (verified via Phase-1 exploration):
   Only the exact background-worker path is supported."* (Single line, no
   rewriting of the body.)
 
-**Verification:** `pytest -q tests/`, then run the four remaining presets
+**Verification:** `pytest -q tests/`, then run the remaining presets
 (`exact-feedback`, `exact-phase0`, `exact-feedforward`, `custom`) for 50
-steps each; tail EE error must still be < 1 mm on `exact-feedback`.
+steps each; tail EE error must still be < 1 mm on `exact-feedback`. If
+`custom` still means "use current defaults", update those defaults to exact
+async or make `custom` explicitly require all gain-mode inputs.
+
+### A1b. Remove finite-difference knobs from `sbmpc_ros/`
+
+This is required by §7's `gain_fd` zero-hit gate and by the real launch, whose
+default bridge file currently requests `fd_feedback`.
+
+- `sbmpc_ros/sbmpc_ros_bridge/sbmpc_ros_bridge/lfc_bridge_node.py`
+  - remove `planner_gain_method`, `planner_gain_fd_epsilon`,
+    `planner_gain_fd_scheme`, and `planner_gain_fd_num_samples` parameters;
+  - keep only `planner_mode`, `planner_gain_samples_per_cycle`, and
+    `planner_gain_buffer_size` for exact async gains.
+- `sbmpc_ros/sbmpc_ros_bridge/sbmpc_ros_bridge/planner_adapter.py`
+  - remove `gain_method` and `gain_fd_*` fields from
+    `PlannerConfigOverrides`, `planner_config_overrides_from_values()`, and
+    `apply_config_overrides()`.
+- `sbmpc_ros/sbmpc_bringup/config/sbmpc_bridge.yaml`
+  - migrate from `planner_mode: fd_feedback` to
+    `planner_mode: exact_async_feedback`;
+  - add `planner_gain_samples_per_cycle: 128` and
+    `planner_gain_buffer_size: 512`;
+  - keep `enable_nonzero_control: false` as the safe default for real robot
+    bringup.
+- `sbmpc_ros/sbmpc_bringup/config/sbmpc_bridge_exact_async.yaml`
+  - keep this as the MuJoCo validation preset; it already uses FER joint
+    names and exact async settings.
+- `sbmpc_ros/sbmpc_ros_bridge/test/` and `sbmpc_ros/sbmpc_bringup/test/`
+  - delete FD assertions/fixtures and replace them with exact-async coverage.
 
 ### A2. Remove Gazebo from `sbmpc_ros/`
 
@@ -162,13 +216,11 @@ exploration):
   - drop assertions on `gz_args`, `disable_gazebo_gravity`,
     `GZ_SIM_RESOURCE_PATH` (the new launch file declares neither).
 - `sbmpc_ros/sbmpc_bringup/config/franka_lfc_params_sim.yaml`
-  - lines ~94–105 — delete the gravity-comp comment block and
-    `remove_gravity_compensation_effort: false` (Gazebo-only quirk).
-    The new sim publishes effort with gravity already included by MuJoCo, so
-    this matches the real-robot setting (`remove_gravity_compensation_effort:
-    true` in `franka_lfc_params.yaml`). Update the file to be a thin
-    sim-specific override or fold it into `franka_lfc_params.yaml` —
-    decision deferred to Phase C wiring.
+  - keep a sim-specific LFC params file unless testing proves it can be
+    folded away. For MuJoCo direct effort control, LFC must send the absolute
+    SB-MPC torque command as-is, so `remove_gravity_compensation_effort` should
+    remain `false` in sim. The real robot keeps `true`, because libfranka/FCI
+    adds its own gravity compensation downstream.
 - `sbmpc_ros/sbmpc_bringup/config/fer_sim_inertials.yaml`
   - **Delete.** Inertia overrides exist only because of Gazebo's link4
     instability; MuJoCo uses the inertias baked into the MJCF.
@@ -190,9 +242,9 @@ After A1+A2, audit for orphans (only orphans whose origin we made dead):
   sbmpc/`).
 - `sbmpc_ros/sbmpc_bringup/sbmpc_bringup/pixi_supervisor.py` — confirm no
   Gazebo-specific env vars referenced.
-- `sbmpc_ros/sbmpc_ros_bridge/` — pure modules
-  (`safety.py`, `joint_mapping.py`, `lfc_msg_adapter.py`, `planner_adapter.py`,
-  `diagnostics.py`) are unaffected; keep untouched.
+- `sbmpc_ros/sbmpc_ros_bridge/` — pure modules other than the FD-removal
+  touch points in §A1b (`planner_adapter.py`, bridge parameter declarations,
+  and their tests) should remain untouched.
 - `sbmpc_ros/sbmpc_bringup/config/` — drop yamls referenced by zero launch
   files after the sim launch is deleted; keep `sbmpc_bridge.yaml`,
   `sbmpc_bridge_exact_async.yaml`, `sbmpc_bridge_feedforward.yaml`,
@@ -222,7 +274,7 @@ repositories:
   mujoco_ros2_control:
     type: git
     url: https://github.com/ros-controls/mujoco_ros2_control.git
-    version: <pin specific commit SHA — chosen by first agent that runs this>
+    version: <pin specific commit SHA or release tag verified against this ROS distro>
 ```
 
 Then:
@@ -236,7 +288,9 @@ colcon build --packages-up-to mujoco_ros2_control
 ```
 
 Add `mujoco_ros2_control` to `package.xml` of `sbmpc_bringup` as
-`<exec_depend>` (replacing the three Gazebo deps removed in A2).
+`<exec_depend>` (replacing the three Gazebo deps removed in A2). Add explicit
+test dependencies for `mujoco_ros2_control_msgs` if the runtime tests call
+MuJoCo pause/reset/step services directly.
 
 **Verification:** `colcon test --packages-select mujoco_ros2_control` (only to
 confirm build, not to gate on its own tests passing).
@@ -244,10 +298,10 @@ confirm build, not to gate on its own tests passing).
 ### B2. Smoke-test the upstream demo
 
 Before integrating with the Franka, run the `mujoco_ros2_control_demos`
-launch headless:
+launch headless. As of the 0.0.2 docs, the basic demo is:
 
 ```
-ros2 launch mujoco_ros2_control_demos cart_pole.launch.py headless:=true
+ros2 launch mujoco_ros2_control_demos 01_basic_robot.launch.py headless:=true
 ```
 
 Confirm `controller_manager` comes up and `/joint_states` ticks. Stop. This
@@ -258,8 +312,10 @@ Franka complexity on top of it.
 
 ## 5. Phase C — Wire mujoco_ros2_control into sbmpc_ros
 
-The bridge does **not** change. The planner does **not** change. We rebuild
-only the URDF + launch + the one config that fed Gazebo.
+The bridge control law and planner algorithm do **not** change in this phase.
+By this point §A1/A1b should already have removed the obsolete FD parameter
+surface. Phase C rebuilds the URDF/xacro, launch, MuJoCo model wrapper if
+needed, and sim-specific configs that used to feed Gazebo.
 
 ### C1. New URDF/xacro
 
@@ -270,26 +326,34 @@ Required content:
   (no Gazebo includes).
 - `<ros2_control name="MujocoFrankaSystem" type="system">` with
   `<hardware><plugin>mujoco_ros2_control/MujocoSystemInterface</plugin></hardware>`
-  and the `<param name="mujoco_model">` pointing to
-  `/workspace/sbmpc/examples/panda_pick_place/panda.xml` (the path
-  `PandaPregraspPlanner` itself uses — confirmed at
-  `sbmpc/sbmpc/examples/franka_emika_panda/panda_pregrasp.py:20`).
-- For each of `panda_joint{1..7}`: `command_interface=effort`,
-  `state_interface=position,velocity,effort`,
-  `<param name="mujoco_joint">actuator{1..7}</param>` mapped to the actuators
-  declared in `panda.xml`.
-- For the gripper: `panda_finger_joint{1,2}` mapped to the split tendon
-  motor in `panda.xml`. The gripper is held closed by
-  `gripper_action_controller` for this milestone — gripper actuator may need
-  to be re-typed from `<general>` to `<motor>` in `panda.xml` (verify against
-  the upstream README; if so, add a single override file
-  `sbmpc/examples/panda_pick_place/panda_ros2_control.xml` that includes
-  `panda.xml` and overrides actuator types — do **not** mutate the file used
-  by bench_lfc).
+  and the `<param name="mujoco_model">` pointing to the selected MuJoCo model:
+  preferably `sbmpc/examples/panda_pick_place/scene.xml` so the `home`
+  keyframe exists, or a generated ROS-control MJCF wrapper that includes the
+  same physical model and preserves that keyframe.
+- Add `<param name="initial_keyframe">home</param>` if supported by the pinned
+  `mujoco_ros2_control` version. The upstream README documents this parameter.
+- Add `<param name="headless">$(arg headless)</param>` so container launches do
+  not require a GUI.
+- For each of `fer_joint{1..7}` expose `command_interface=effort` and
+  `state_interface=position,velocity,effort`.
+- Do **not** assume `<param name="mujoco_joint">...</param>` is supported. The
+  upstream documentation examples map ros2_control joints to MuJoCo
+  joints/actuators by name, and effort control is natively supported only for
+  MuJoCo `motor`, `general`, or similar actuator types. During implementation,
+  verify the pinned source. If explicit ROS-name-to-MJCF-name mapping is not
+  supported, create `sbmpc/examples/panda_pick_place/panda_ros2_control.xml`
+  as a generated/hand-audited copy whose physical values match `panda.xml` but
+  whose arm joints/actuators are named `fer_joint1..7` and use effort-compatible
+  actuators.
+- For the gripper, expose the single controller joint the current ROS stack
+  expects: `fer_finger_joint1`. Keep the second finger coupled internally in
+  MJCF via equality/tendon mechanics. `franka_controllers.yaml` uses
+  `position_controllers/GripperActionController` on `fer_finger_joint1`, not a
+  two-joint gripper controller.
 
-Keep the same joint name strings the rest of the stack expects
-(`panda_joint1..7`, `panda_finger_joint1..2`) — `joint_mapping.py` and the
-LFC controllers depend on them.
+Keep the same FER joint name strings the rest of the ROS stack expects. The
+bridge's `joint_names` parameter and LFC `initial_state` snapshot must contain
+`fer_joint1..7`, matching `franka_lfc_params*.yaml`.
 
 ### C2. New sim launch
 
@@ -297,16 +361,24 @@ Create `sbmpc_ros/sbmpc_bringup/launch/sbmpc_franka_lfc_mujoco_sim.launch.py`.
 Skeleton (mirrors the deleted Gazebo launch but minus all gz nodes):
 
 1. `robot_state_publisher` with the new xacro.
-2. `mujoco_ros2_control` node (executable name per upstream README;
-   typically `mujoco_ros2_control`). It owns the `controller_manager`.
+2. `mujoco_ros2_control` control node. The current upstream README uses
+   `package="mujoco_ros2_control"` and `executable="ros2_control_node"`, with
+   `parameters=[{"use_sim_time": True}, controllers_file, optional_plugins_file]`.
+   On Humble, remap `("~/robot_description", "/robot_description")` as shown
+   in the demos if needed.
 3. `joint_state_broadcaster` spawner (unchanged from old launch).
 4. `gripper_action_controller` spawner (unchanged).
 5. `joint_state_estimator` + `linear_feedback_controller` spawner
    (`--activate-as-group`, unchanged).
 6. The `lfc_bridge_node` Python node, parameters from
    `sbmpc_bridge_exact_async.yaml` (the bench_lfc-equivalent preset).
-7. Same `RegisterEventHandler` chain as before, with `Shutdown` on bridge
-   exit.
+7. Launch argument `enable_nonzero_control`, default `false`, that can override
+   the bridge parameter for validation runs. The parity smoke test must set it
+   to `true`; the safe default remains silent/PD hold.
+8. Event handling adapted to MuJoCo: `Shutdown` on control-node or bridge exit,
+   and spawners launched only after `controller_manager` is available. Do not
+   blindly reuse the old `spawn_entity`-based event chain because that process
+   no longer exists.
 
 **Do not** add `use_sim_time` indirection beyond what mujoco_ros2_control
 itself documents. **Do not** carry over `GZ_SIM_RESOURCE_PATH` or
@@ -315,13 +387,15 @@ itself documents. **Do not** carry over `GZ_SIM_RESOURCE_PATH` or
 ### C3. Configs
 
 - `franka_lfc_params_sim.yaml` — reduce to a single override file containing
-  only the keys that legitimately differ from real (probably none if MuJoCo
-  publishes effort with gravity included). If empty, delete and have the
-  new launch use `franka_lfc_params.yaml`.
+  only the keys that legitimately differ from real. Today the important
+  difference is `remove_gravity_compensation_effort: false` for direct-effort
+  simulation, while real remains `true`.
 - The new launch file's default `bridge_params_file` must be
   `sbmpc_bridge_exact_async.yaml` (not `sbmpc_bridge.yaml`). This is the
   config that requests the `exact_async_feedback` planner mode — i.e. the
   bench_lfc reference.
+- `sbmpc_bridge.yaml` must also be migrated away from `fd_feedback` during
+  §A1b so the real launch remains parseable after FD removal.
 
 ### C4. Validation and parity tests (the heart of this plan)
 
@@ -333,19 +407,24 @@ Add these tests under `sbmpc_ros/sbmpc_bringup/test/`:
 2. `test_mujoco_xacro.py` — render the xacro to URDF, assert the
    `<plugin>mujoco_ros2_control/MujocoSystemInterface</plugin>` line exists,
    the `mujoco_model` param resolves to a path that exists on disk, and the
-   joint/actuator mapping is exhaustive (7 arm + 2 finger).
+   exposed ROS interfaces are exhaustive for `fer_joint1..7` plus the
+   configured gripper joint. If a ROS-control-specific MJCF copy is used, assert
+   its physical parameters match the benchmark MJCF except for the approved
+   name/actuator-type changes.
 3. `test_ee_parity_smoke.py` — runtime test (gated behind a
    `pytest.importorskip("rclpy")`). Brings up the launch in a subprocess for
-   a 5 s window with `lfc_bridge_node` armed, captures `/sbmpc/control` and
-   the joint states, computes EE position via `PandaPregraspPlanner.ee_position`
-   (sbmpc is on the `PYTHONPATH`), and asserts:
+   a 5 s window with `lfc_bridge_node` armed
+   (`enable_nonzero_control:=true`), captures `/sbmpc/control` and the FER
+   joint states, computes EE position via `PandaPregraspPlanner.ee_position`
+   after converting the ordered FER arm vector to the planner's internal
+   7-DoF vector, and asserts:
    - 50 Hz cadence on `/sbmpc/control`, p99 ≤ 20 ms inter-message gap;
    - tail EE error (last 100 samples) < 1 mm;
    - velocity HF energy (5–50 Hz band) within 2× the bench_lfc reference.
 
-The reference numbers for (b) and (c) are produced by running
-`bench_lfc.py --preset exact-feedback --steps 250` and recording them in a
-JSON fixture committed alongside the test.
+The reference numbers for (b) and (c) are produced by running the §6
+`bench_lfc.py --emit-reference` command and committing the resulting JSON
+fixture alongside the test.
 
 ---
 
@@ -355,15 +434,18 @@ Run order:
 
 ```
 # 1. Algorithm sanity
-python -m sbmpc.tests.bench_lfc --preset exact-feedback --steps 250 \
-  --json-out /tmp/bench_lfc_reference.json
+python -m sbmpc.tests.bench_lfc --preset exact-feedback --steps 250
+python -m sbmpc.tests.bench_lfc --preset exact-feedback \
+  --timing-mode immediate --steps 250 \
+  --emit-reference /tmp/bench_lfc_reference.json
 
 # 2. Build everything
 cd /workspace/ros2_ws && colcon build --symlink-install
 source install/setup.bash
 
 # 3. ROS sim
-ros2 launch sbmpc_bringup sbmpc_franka_lfc_mujoco_sim.launch.py
+ros2 launch sbmpc_bringup sbmpc_franka_lfc_mujoco_sim.launch.py \
+  enable_nonzero_control:=true
 
 # 4. In another shell, the parity check
 pytest /workspace/ros2_ws/src/sbmpc_ros/sbmpc_bringup/test/test_ee_parity_smoke.py -x
@@ -376,10 +458,18 @@ run is the human gate before declaring this milestone done.
 If the EE error is > 1 mm, do not retune controller gains. Diagnose in this
 order:
 
-1. Confirm `mujoco_model` resolves to the same `panda.xml` bench_lfc loads.
-2. Confirm `effort` is being commanded raw (no double-gravity correction).
+1. Confirm `mujoco_model` resolves to `scene.xml` or to the approved
+   ROS-control MJCF copy/wrapper derived from it.
+   If using a ROS-control MJCF copy/wrapper, confirm the only differences from
+   the benchmark physical model are approved ROS interface names and actuator
+   type changes needed for effort control.
+2. Confirm `effort` is being commanded raw in sim:
+   `remove_gravity_compensation_effort: false` for MuJoCo, while real remains
+   `true`.
 3. Confirm the bridge is in `exact_async_feedback` mode and the background
-   worker is producing gains (`BridgeDiagnostics` `gain_age_ms` < 200 ms).
+   worker is producing gains (`BridgeDiagnostics.last_gain_worker_running` is
+   true, dropped snapshots remain within target, and
+   `last_gain_age_cycles * planner_dt < 0.2 s`).
 4. Compare the LFC sign convention — bench_lfc explicitly notes the ROS
    `linear_feedback_controller` sign convention (file header comment); make
    sure the bridge's `planner_output_to_control()` has not been edited.
@@ -390,15 +480,17 @@ order:
 
 Mark done when, in a fresh checkout following only this document:
 
-- The `git grep` for `gazebo`, `gz_sim`, `ros_gz`, `gain_fd` in both
-  repositories returns zero hits in production code.
+- The `git grep` for `gazebo`, `gz_sim`, `ros_gz`, `gain_fd`, `fd_feedback`,
+  and `finite_difference` in both repositories returns zero hits in production
+  code. Scope the grep to production paths so historical docs and the agent log
+  do not create false positives.
 - `bench_lfc.py --preset exact-feedback --steps 250` succeeds.
 - `ros2 launch sbmpc_bringup sbmpc_franka_lfc_mujoco_sim.launch.py` brings
   up cleanly.
 - `test_ee_parity_smoke.py` passes.
 
-Real-robot deployment then proceeds per `ROS_DEPLOYMENT_ROADMAP.md` —
-unchanged.
+Real-robot deployment topology then proceeds per `ROS_DEPLOYMENT_ROADMAP.md`;
+the bridge config has already been migrated away from FD in §A1b.
 
 ---
 
@@ -406,18 +498,28 @@ unchanged.
 
 **`sbmpc/`**
 - `sbmpc/tests/bench_lfc.py` — the reference (do not edit beyond the FD
-  cleanup in §A1).
+  cleanup in §A1 and any reference-output flag alignment needed by §6).
 - `sbmpc/sbmpc/solvers.py` — async gain worker (§A1: drop FD branch).
 - `sbmpc/sbmpc/settings.py` — drop `gain_fd_*` fields.
+- `sbmpc/sbmpc/examples/franka_emika_panda/planner_api.py` — drop
+  `fd_feedback` and keep exact async as the supported feedback mode.
 - `sbmpc/sbmpc/examples/franka_emika_panda/panda_pregrasp.py:20` —
-  `PANDA_XML_PATH`. **This is the MJCF mujoco_ros2_control must load.**
-- `sbmpc/examples/panda_pick_place/panda.xml` — the model itself.
+  `PANDA_XML_PATH`; line 19 is `PANDA_SCENE_PATH`. The ROS sim must preserve
+  both the `panda.xml` physical model and the `scene.xml` `home` keyframe /
+  PREGRASP reference semantics.
+- `sbmpc/examples/panda_pick_place/panda.xml` and `scene.xml` — benchmark
+  model/reference inputs. Do not mutate them for ROS naming; add a wrapper/copy
+  if needed.
 
 **`sbmpc_ros/`**
-- `sbmpc_ros_bridge/sbmpc_ros_bridge/lfc_bridge_node.py` — unchanged.
-- `sbmpc_ros_bridge/sbmpc_ros_bridge/planner_adapter.py` — unchanged.
+- `sbmpc_ros_bridge/sbmpc_ros_bridge/lfc_bridge_node.py` — bridge loop mostly
+  unchanged, but FD parameters must be removed.
+- `sbmpc_ros_bridge/sbmpc_ros_bridge/planner_adapter.py` — remove FD override
+  plumbing; preserve the current planner adapter role.
 - `sbmpc_bringup/config/sbmpc_bridge_exact_async.yaml` — the bridge preset
   to use as default in the new launch.
+- `sbmpc_bringup/config/sbmpc_bridge.yaml` — real-launch default; migrate from
+  `fd_feedback` to exact async during §A1b.
 - `sbmpc_bringup/config/franka_controllers.yaml` — shared with real, do not
   edit beyond removing Gazebo-only bits if any (audit; expected: none).
 
@@ -449,11 +551,56 @@ unchanged.
 A fresh session can resume by:
 
 1. Reading this file end-to-end.
-2. Running `git status` in `/workspace/sbmpc` and `/workspace/sbmpc_ros` to
+2. Reading §11 newest-first to see what previous agents actually changed,
+   verified, skipped, or discovered.
+3. Running `git status` in `/workspace/sbmpc` and `/workspace/sbmpc_ros` to
    see how much of §A is already done.
-3. Running the §6 build chain — failures point to which phase is incomplete.
-4. The checklist at §7 is the definitive "are we done" test.
+4. Running the §6 build chain — failures point to which phase is incomplete.
+5. The checklist at §7 is the definitive "are we done" test.
 
 This document is intentionally written so that every concrete change cites
 either a file path or a file path + line number. There are no implicit
 dependencies on session memory.
+
+---
+
+## 11. Agent Work Log
+
+Every agent/session that makes progress on this plan must append a short entry
+here before ending the turn. This is the durable memory for future Codex or
+agentic coding sessions.
+
+Required format:
+
+```markdown
+### YYYY-MM-DD — Agent / Session
+- Scope:
+- Changed:
+- Verified:
+- Not verified / blockers:
+- Next handoff:
+```
+
+Keep entries factual and compact. Include command names and relevant file
+paths, but do not paste long logs. If an agent changes direction from this plan,
+record the reason here and update the plan section itself in the same commit.
+
+### 2026-04-29 — Codex Review / Plan Correction
+- Scope: Reviewed `MUJOCO_ROS2_DEPLOYMENT_PLAN.md` against current
+  `sbmpc`, `sbmpc_ros`, and upstream `mujoco_ros2_control` documentation.
+- Changed: Corrected the plan to use FER runtime joint names, added ROS-side
+  finite-difference cleanup, fixed MuJoCo direct-effort gravity guidance,
+  replaced the stale demo launch name, corrected the control-node executable,
+  added bridge arming requirements for parity tests, and added this work log.
+- Verified: Read current configs/code including `franka_lfc_params*.yaml`,
+  `franka_controllers.yaml`, `sbmpc_bridge*.yaml`, `lfc_bridge_node.py`,
+  `planner_adapter.py`, `planner_api.py`, `panda_pregrasp.py`, `panda.xml`,
+  and `scene.xml`; checked upstream docs for `mujoco_ros2_control`
+  `MujocoSystemInterface`, `ros2_control_node`, actuator interface support,
+  gripper mimic guidance, `initial_keyframe`, and headless launch support.
+- Not verified / blockers: Did not build or run ROS/MuJoCo; implementation must
+  still confirm whether the pinned `mujoco_ros2_control` supports explicit
+  ROS-name-to-MJCF-name mapping. If not, create an audited ROS-control MJCF
+  copy/wrapper with FER names and effort-compatible actuators.
+- Next handoff: Start implementation at §A1/A1b. Keep `fer_joint*` names in
+  all ROS interfaces, and append a new entry here after each completed phase.
