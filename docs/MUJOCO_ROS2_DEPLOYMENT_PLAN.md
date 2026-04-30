@@ -294,6 +294,7 @@ MuJoCo pause/reset/step services directly.
 
 **Verification:** `colcon test --packages-select mujoco_ros2_control` (only to
 confirm build, not to gate on its own tests passing).
+At this stage it would be great to also adapt what is in sbmpc_containers to have a clean and reusable installation setup in the Docker.
 
 ### B2. Smoke-test the upstream demo
 
@@ -630,3 +631,49 @@ record the reason here and update the plan section itself in the same commit.
 - Next handoff: Continue at §B/§C: vendor/build `mujoco_ros2_control`, add the
   FER-named MuJoCo ros2_control xacro/launch, then run the §6/§7 behavior
   metric validation.
+
+### 2026-04-30 — Codex Phase B/C Implementation
+- Scope: Implemented the first MuJoCo ROS2-control integration slice after the
+  completed Phase A cleanup: pinned and imported upstream MuJoCo dependencies,
+  added the FER-named MuJoCo model/URDF/launch surface, and added tests around
+  the new wiring.
+- Changed: Created `/workspace/ros2_ws/src/sbmpc_ros.repos` with
+  `mujoco_vendor` `0.0.8` (`26187d69dd239adc45c121af780d57590d189686`) and
+  `mujoco_ros2_control` `0.0.2`
+  (`c277c1d243af4ee81fb114ad47a985c1c540b8d4`); imported both under
+  `/workspace/ros2_ws/src`; added the same pinned manifest to
+  `sbmpc_containers/repos/mujoco_ros2_control.repos` and wired it into the
+  Docker build. Added `sbmpc_bringup/mujoco/panda_ros2_control.xml` and
+  `panda_pick_place_ros2_control_scene.xml` as an audited ROS-control MJCF copy
+  with `fer_joint1..7`, `fer_finger_joint1`, motor arm actuators, and a
+  1 ms timestep matching `bench_lfc.py --dt 0.02 --substeps 20`. Added
+  `franka_arm_with_sbmpc_mujoco.urdf.xacro`,
+  `sbmpc_franka_lfc_mujoco_sim.launch.py`, MuJoCo launch/xacro/parity tests,
+  installed MJCF data files, reduced `franka_lfc_params_sim.yaml` to the
+  direct-effort gravity override, and updated the stale-node guard to include
+  `/mujoco_ros2_control_node`.
+- Verified: `vcs import /workspace/ros2_ws/src <
+  /workspace/ros2_ws/src/sbmpc_ros.repos`; `rosdep update --rosdistro jazzy`;
+  `rosdep install --from-paths src --ignore-src -r -y --rosdistro jazzy`;
+  `colcon build --symlink-install --packages-up-to mujoco_ros2_control
+  sbmpc_bringup`; `colcon test --packages-select mujoco_ros2_control`;
+  `colcon test --packages-select sbmpc_bringup --pytest-args -q`; final
+  `colcon test-result --verbose` reported `180 tests, 0 errors, 0 failures,
+  2 skipped`. Full local Python suite passed with `77 passed, 2 skipped`.
+  Rendered the installed xacro to `/tmp/franka_arm_with_sbmpc_mujoco.urdf` and
+  confirmed FER joints plus `mujoco_ros2_control/MujocoSystemInterface`. A
+  30 s headless safe launch with `enable_nonzero_control:=false` reached
+  MuJoCo hardware initialization, arm effort actuator registration, gripper
+  position actuator registration, controller activation, bridge startup, and
+  planner JIT warmup; log grep found no errors, only the expected headless GLFW
+  camera warning.
+- Not verified / blockers: Did not run the armed
+  `enable_nonzero_control:=true` parity test or the 30 s acceptance metrics
+  for foreground p99 timing, EE error, dropped gain snapshots, or HF velocity
+  energy. `test_ee_parity_smoke.py` is present but intentionally skipped unless
+  `SBMPC_RUN_MUJOCO_PARITY=1` is set.
+- Next handoff: Run the live parity gate from §6 with
+  `SBMPC_RUN_MUJOCO_PARITY=1` and
+  `ros2 launch sbmpc_bringup sbmpc_franka_lfc_mujoco_sim.launch.py
+  enable_nonzero_control:=true`; collect the §1 metrics over 5 s and then
+  30 s before declaring Phase D/E complete.
