@@ -415,11 +415,12 @@ Add these tests under `sbmpc_ros/sbmpc_bringup/test/`:
 3. `test_ee_parity_smoke.py` — runtime test (gated behind a
    `pytest.importorskip("rclpy")`). Brings up the launch in a subprocess for
    a 5 s window with `lfc_bridge_node` armed
-   (`enable_nonzero_control:=true`), captures `/sbmpc/control` and the FER
-   joint states, computes EE position via `PandaPregraspPlanner.ee_position`
+   (`enable_nonzero_control:=true`), captures
+   `/control` and the FER joint state carried in `/sensor`, computes EE
+   position via `PandaPregraspPlanner.ee_position`
    after converting the ordered FER arm vector to the planner's internal
    7-DoF vector, and asserts:
-   - 50 Hz cadence on `/sbmpc/control`, p99 ≤ 20 ms inter-message gap;
+   - 50 Hz cadence on `/control`, p99 ≤ 20 ms inter-message gap;
    - tail EE error (last 100 samples) < 1 mm;
    - velocity HF energy (5–50 Hz band) within 2× the bench_lfc reference.
 
