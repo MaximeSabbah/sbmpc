@@ -167,6 +167,32 @@ def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     assert output.diagnostics.foreground_planning_time_ms is not None
 
 
+def test_panda_pregrasp_controller_can_skip_task_diagnostics() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=False)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            compute_running_cost=False,
+            compute_task_diagnostics=False,
+        )
+    )
+
+    output = controller.step(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+    )
+
+    assert output.diagnostics.running_cost is None
+    assert output.diagnostics.position_error is None
+    assert output.diagnostics.orientation_error is None
+    assert output.diagnostics.goal_position.shape == (3,)
+
+
 def test_panda_pregrasp_controller_reuses_solution_guess() -> None:
     controller = build_pregrasp_controller(gains=True)
     call_count = 0
@@ -268,3 +294,44 @@ def test_panda_pregrasp_controller_exact_async_mode_starts_and_stops_worker() ->
         controller.close()
 
     assert not controller.controller.background_gain_status()["worker_running"]
+
+
+def test_panda_pregrasp_controller_reset_runtime_state_after_warmup_reseeds_next_step() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    config.MPC.gain_samples_per_cycle = 2
+    config.MPC.gain_buffer_size = 4
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            gain_mode="exact_async_feedback",
+        )
+    )
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    controller.step(q, v)
+    assert controller.controller.background_gain_status()["worker_running"]
+
+    controller.reset_runtime_state_after_warmup()
+
+    assert not controller.controller.background_gain_status()["worker_running"]
+    assert controller._started is False
+    assert controller._solution_initialized is False
+
+    call_count = 0
+    original = controller.planner.nominal_torque_sequence_from_state
+
+    def wrapped(state, horizon, dt):
+        nonlocal call_count
+        call_count += 1
+        return original(state, horizon, dt)
+
+    controller.planner.nominal_torque_sequence_from_state = wrapped
+    controller.step(q, v)
+
+    assert call_count == 1

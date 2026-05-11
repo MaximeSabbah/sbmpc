@@ -44,8 +44,8 @@ class PlannerDiagnostics:
     running_cost: float | None
     gain_norm: float
     torque_norm: float
-    position_error: float
-    orientation_error: float
+    position_error: float | None
+    orientation_error: float | None
     object_error: float | None
     goal_position: np.ndarray
     gain_mode: str | None = None
@@ -150,6 +150,27 @@ def _async_gain_diagnostics(controller, gain_mode: str) -> dict[str, object]:
     }
 
 
+def _current_gains_numpy(
+    controller,
+    gain_mode: str,
+    gain_diag: dict[str, object],
+    *,
+    cached_gains: np.ndarray | None,
+    cached_completed_batch_count: int | None,
+) -> tuple[np.ndarray, int | None]:
+    completed_batch_count = None
+    if gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+        completed_batch_count = int(gain_diag.get("gain_completed_batch_count", 0))
+        if (
+            cached_gains is not None
+            and cached_completed_batch_count == completed_batch_count
+        ):
+            return cached_gains, completed_batch_count
+
+    gains = np.asarray(jax.block_until_ready(controller.gains), dtype=np.float32)
+    return gains, completed_batch_count
+
+
 def _async_gain_batches_to_first_publish(config: Config) -> int:
     samples_per_cycle = int(config.MPC.gain_samples_per_cycle or 0)
     buffer_size = int(config.MPC.gain_buffer_size or 0)
@@ -187,6 +208,7 @@ class PandaPickAndPlaceController:
         visualize: bool = False,
         gain_mode: str | None = None,
         compute_running_cost: bool = True,
+        compute_task_diagnostics: bool = True,
     ) -> None:
         self.planner = PandaPickAndPlacePlanner() if planner is None else planner
         self.objective = PandaPickAndPlaceObjective(self.planner)
@@ -212,6 +234,9 @@ class PandaPickAndPlaceController:
         self._started = False
         self._async_warmup_complete = False
         self._compute_running_cost = compute_running_cost
+        self._compute_task_diagnostics = compute_task_diagnostics
+        self._cached_gains: np.ndarray | None = None
+        self._cached_gain_completed_batch_count: int | None = None
 
     def start(self) -> None:
         if self._started:
@@ -223,6 +248,21 @@ class PandaPickAndPlaceController:
     def close(self) -> None:
         self.controller.close()
         self._started = False
+        self._cached_gains = None
+        self._cached_gain_completed_batch_count = None
+
+    def reset_runtime_state_after_warmup(self) -> None:
+        """Keep warmup as compilation only before starting live control."""
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
+            self.controller.stop_background_gains()
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.controller.reset_published_gains()
+        self._started = False
+        self._solution_initialized = False
+        self._last_reference_signature = None
+        self._async_warmup_complete = False
+        self._cached_gains = None
+        self._cached_gain_completed_batch_count = None
 
     def warmup(
         self,
@@ -323,6 +363,8 @@ class PandaPickAndPlaceController:
                 self._started = False
             self.controller.reset_published_gains()
             self._async_warmup_complete = False
+            self._cached_gains = None
+            self._cached_gain_completed_batch_count = None
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
@@ -339,19 +381,30 @@ class PandaPickAndPlaceController:
         input_sequence = jax.block_until_ready(input_sequence)
         self._solution_initialized = True
         self._last_reference_signature = reference_signature
-        gains = np.asarray(jax.block_until_ready(self.controller.gains), dtype=np.float32)
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
         gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
-
-        ee_pos, ee_x, ee_z = self.planner.ee_features(q)
-        position_error = float(jnp.linalg.norm(ee_pos - reference.goal_pos))
-        orientation_error = float(
-            (1.0 - jnp.clip(jnp.dot(ee_z, reference.goal_z_axis), -1.0, 1.0))
-            + 0.5 * (1.0 - jnp.clip(jnp.dot(ee_x, reference.goal_x_axis), -1.0, 1.0))
+        gains, self._cached_gain_completed_batch_count = _current_gains_numpy(
+            self.controller,
+            self.gain_mode,
+            gain_diag,
+            cached_gains=self._cached_gains,
+            cached_completed_batch_count=self._cached_gain_completed_batch_count,
         )
+        self._cached_gains = gains
+
+        position_error = None
+        orientation_error = None
+        if self._compute_task_diagnostics:
+            ee_pos, ee_x, ee_z = self.planner.ee_features(q)
+            position_error = float(jnp.linalg.norm(ee_pos - reference.goal_pos))
+            orientation_error = float(
+                (1.0 - jnp.clip(jnp.dot(ee_z, reference.goal_z_axis), -1.0, 1.0))
+                + 0.5
+                * (1.0 - jnp.clip(jnp.dot(ee_x, reference.goal_x_axis), -1.0, 1.0))
+            )
         object_error = None
-        if object_pos is not None:
+        if self._compute_task_diagnostics and object_pos is not None:
             object_goal = self.planner.object_goal_position(
                 phase,
                 object_pos=object_pos,
@@ -521,6 +574,7 @@ class PandaPregraspController:
         reseed_every_step: bool = False,
         gain_mode: str | None = None,
         compute_running_cost: bool = True,
+        compute_task_diagnostics: bool = True,
     ) -> None:
         self.planner = PandaPregraspPlanner() if planner is None else planner
         self.objective = PandaPregraspObjective(self.planner)
@@ -546,6 +600,9 @@ class PandaPregraspController:
         self._started = False
         self._async_warmup_complete = False
         self._compute_running_cost = compute_running_cost
+        self._compute_task_diagnostics = compute_task_diagnostics
+        self._cached_gains: np.ndarray | None = None
+        self._cached_gain_completed_batch_count: int | None = None
 
     def start(self) -> None:
         if self._started:
@@ -557,6 +614,20 @@ class PandaPregraspController:
     def close(self) -> None:
         self.controller.close()
         self._started = False
+        self._cached_gains = None
+        self._cached_gain_completed_batch_count = None
+
+    def reset_runtime_state_after_warmup(self) -> None:
+        """Keep warmup as compilation only before starting live control."""
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
+            self.controller.stop_background_gains()
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.controller.reset_published_gains()
+        self._started = False
+        self._solution_initialized = False
+        self._async_warmup_complete = False
+        self._cached_gains = None
+        self._cached_gain_completed_batch_count = None
 
     def warmup(
         self,
@@ -616,6 +687,8 @@ class PandaPregraspController:
                 self._started = False
             self.controller.reset_published_gains()
             self._async_warmup_complete = False
+            self._cached_gains = None
+            self._cached_gain_completed_batch_count = None
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
@@ -632,17 +705,28 @@ class PandaPregraspController:
         )
         input_sequence = jax.block_until_ready(input_sequence)
         self._solution_initialized = True
-        gains = np.asarray(jax.block_until_ready(self.controller.gains), dtype=np.float32)
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
         gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
-
-        ee_pos, ee_x, ee_z = self.planner.ee_features(q)
-        position_error = float(jnp.linalg.norm(ee_pos - reference.goal_pos))
-        orientation_error = float(
-            (1.0 - jnp.clip(jnp.dot(ee_z, reference.goal_z_axis), -1.0, 1.0))
-            + 0.5 * (1.0 - jnp.clip(jnp.dot(ee_x, reference.goal_x_axis), -1.0, 1.0))
+        gains, self._cached_gain_completed_batch_count = _current_gains_numpy(
+            self.controller,
+            self.gain_mode,
+            gain_diag,
+            cached_gains=self._cached_gains,
+            cached_completed_batch_count=self._cached_gain_completed_batch_count,
         )
+        self._cached_gains = gains
+
+        position_error = None
+        orientation_error = None
+        if self._compute_task_diagnostics:
+            ee_pos, ee_x, ee_z = self.planner.ee_features(q)
+            position_error = float(jnp.linalg.norm(ee_pos - reference.goal_pos))
+            orientation_error = float(
+                (1.0 - jnp.clip(jnp.dot(ee_z, reference.goal_z_axis), -1.0, 1.0))
+                + 0.5
+                * (1.0 - jnp.clip(jnp.dot(ee_x, reference.goal_x_axis), -1.0, 1.0))
+            )
         running_cost = None
         if self._compute_running_cost:
             running_cost = float(
