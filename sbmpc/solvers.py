@@ -229,8 +229,17 @@ class RolloutGenerator():
                 ),
                 device=self.device,
             )
+            self.rollout_gradients_to_state = jax.jit(
+                jax.vmap(
+                    self.rollout_single_state_gradient,
+                    in_axes=(None, None, 0),
+                    out_axes=0,
+                ),
+                device=self.device,
+            )
         else:
             self.rollout_sens_to_state = None
+            self.rollout_gradients_to_state = None
 
         # Rename functions for cost during rollout
         self.cost_and_constraints = self.objective.cost_and_constraints
@@ -301,6 +310,17 @@ class RolloutGenerator():
             lambda tangent: jax.jvp(cost_from_state, (initial_state,), (tangent,))[1]
         )(basis)
         return cost_and_control, gradient
+
+    def rollout_single_state_gradient(self, initial_state, reference, control_variables):
+        """Compute only dJ/dx for one already-scored control sample."""
+        def cost_from_state(state):
+            cost, _ = self.rollout_single(state, reference, control_variables)
+            return cost
+
+        basis = jnp.eye(self.model.nx, dtype=self.dtype_general)
+        return jax.vmap(
+            lambda tangent: jax.jvp(cost_from_state, (initial_state,), (tangent,))[1]
+        )(basis)
 
 
     def rollout_single_with_sensitivity(self, initial_state, reference, control_variables):
@@ -448,6 +468,7 @@ class Controller:
             self._phase0_first_gain_ready_cycle = None
             self._phase0_last_published_cycle = None
             self._phase0_last_refresh = {}
+            self._phase0_completed_batch_count = 0
             self._async_exact_window = RollingGainWindow(
                 self._gain_M,
                 self._gain_K,
@@ -476,6 +497,7 @@ class Controller:
             self._phase0_first_gain_ready_cycle = None
             self._phase0_last_published_cycle = None
             self._phase0_last_refresh = {}
+            self._phase0_completed_batch_count = 0
             self._async_capture_cycle = 0
             self._async_pending_context = None
             self._async_dropped_snapshot_count = 0
@@ -640,7 +662,7 @@ class Controller:
         )
 
     def _process_exact_gain_snapshot(self, snapshot: ExactGainSnapshot):
-        _, gradients = self.rollout_gen.rollout_sens_to_state(
+        gradients = self.rollout_gen.rollout_gradients_to_state(
             snapshot.state,
             snapshot.reference,
             snapshot.control_variables,
@@ -774,6 +796,7 @@ class Controller:
         self._phase0_last_published_cycle = None
         self._phase0_last_refresh = {}
         self._phase0_capture_cycle = 0
+        self._phase0_completed_batch_count = 0
         if reset_published_gain:
             self._set_current_gains(self._zero_gains)
 
@@ -792,6 +815,9 @@ class Controller:
                 if self._phase0_exact_window is not None
                 else 0
             ),
+            "completed_batch_count": int(self._phase0_completed_batch_count),
+            "worker_error": None,
+            "worker_running": False,
         }
 
     def phase0_refresh_exact_gains(self):
@@ -815,9 +841,43 @@ class Controller:
             if self._phase0_first_gain_ready_cycle is None:
                 self._phase0_first_gain_ready_cycle = context.cycle_id
 
+        self._phase0_completed_batch_count += 1
         result = self.phase0_probe_status()
         result.update(refresh)
+        result["completed_batch_count"] = self._phase0_completed_batch_count
         self._phase0_last_refresh = result
+        return result
+
+    def phase0_exact_gain_status(self):
+        if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
+            result = self._empty_exact_gain_refresh_status()
+            result.update(
+                {
+                    "first_gain_ready_cycle": None,
+                    "published_gain_age_cycles": float("nan"),
+                    "queue_depth_max": 0,
+                    "dropped_snapshot_count": 0,
+                    "rolling_window_fill": 0,
+                    "completed_batch_count": 0,
+                    "worker_error": None,
+                    "worker_running": False,
+                }
+            )
+            return result
+        result = self.phase0_probe_status()
+        if self._phase0_last_refresh:
+            for key in (
+                "subset_select_ms",
+                "snapshot_pack_ms",
+                "gain_grad_ms",
+                "gain_synth_ms",
+                "gain_refresh_ms",
+                "gain_published",
+                "source_cycle_id",
+            ):
+                result[key] = self._phase0_last_refresh.get(key, 0.0)
+        else:
+            result.update(self._empty_exact_gain_refresh_status())
         return result
     
     def start_async_exact_gain_worker(self, reset_published_gain=True):

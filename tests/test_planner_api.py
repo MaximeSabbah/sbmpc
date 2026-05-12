@@ -167,6 +167,57 @@ def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     assert output.diagnostics.foreground_planning_time_ms is not None
 
 
+def test_panda_pregrasp_controller_split_feedforward_and_gain_outputs() -> None:
+    controller = build_pregrasp_controller(gains=True)
+
+    feedforward = controller.step_feedforward(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+    )
+    gain = controller.latest_gain(feedforward.diagnostics)
+
+    assert feedforward.tau_ff.shape == (controller.planner.nu,)
+    assert not hasattr(feedforward, "K")
+    assert gain.K.shape == (controller.planner.nu, controller.planner.nx)
+    assert gain.diagnostics.foreground_planning_time_ms is not None
+    assert np.isfinite(gain.diagnostics.torque_norm)
+    assert np.isfinite(gain.diagnostics.gain_norm)
+    assert np.all(np.isfinite(feedforward.tau_ff))
+    assert np.all(np.isfinite(gain.K))
+
+
+def test_panda_pregrasp_controller_exact_async_refreshes_without_worker() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    config.MPC.gain_samples_per_cycle = 2
+    config.MPC.gain_buffer_size = 4
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            gain_mode="exact_async_feedback",
+            compute_running_cost=False,
+            compute_task_diagnostics=False,
+        )
+    )
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    feedforward = controller.step_feedforward(q, v)
+    status = controller.controller.background_gain_status()
+    assert status["worker_running"] is False
+
+    gain = controller.refresh_gain_if_budget(feedforward.diagnostics, budget_sec=None)
+    assert gain is not None
+    assert gain.diagnostics.gain_mode == "exact_async_feedback"
+    assert gain.diagnostics.async_gain_worker_running is False
+    assert gain.diagnostics.gain_completed_batch_count == 1
+    assert gain.diagnostics.gain_window_fill == 2
+
+
 def test_panda_pregrasp_controller_can_skip_task_diagnostics() -> None:
     planner = PandaPregraspPlanner()
     config = make_panda_pregrasp_config(planner, visualize=False, gains=False)
@@ -269,7 +320,7 @@ def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:
     assert np.allclose(output.K, np.zeros_like(output.K))
 
 
-def test_panda_pregrasp_controller_exact_async_mode_starts_and_stops_worker() -> None:
+def test_panda_pregrasp_controller_exact_async_mode_does_not_start_worker() -> None:
     planner = PandaPregraspPlanner()
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
     config.MPC.horizon = 4
@@ -288,7 +339,8 @@ def test_panda_pregrasp_controller_exact_async_mode_starts_and_stops_worker() ->
     try:
         controller.start()
         status = controller.controller.background_gain_status()
-        assert status["worker_running"]
+        assert status["worker_running"] is False
+        assert controller.controller.phase0_exact_gain_status()["worker_running"] is False
         assert controller.gain_mode == "exact_async_feedback"
     finally:
         controller.close()
@@ -315,11 +367,19 @@ def test_panda_pregrasp_controller_reset_runtime_state_after_warmup_reseeds_next
     q = controller.planner.home_q
     v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
     controller.step(q, v)
-    assert controller.controller.background_gain_status()["worker_running"]
+    assert controller.controller.background_gain_status()["worker_running"] is False
+    assert (
+        controller.controller.phase0_exact_gain_status()["completed_batch_count"]
+        >= 1
+    )
 
     controller.reset_runtime_state_after_warmup()
 
     assert not controller.controller.background_gain_status()["worker_running"]
+    assert (
+        controller.controller.phase0_exact_gain_status()["completed_batch_count"]
+        == 0
+    )
     assert controller._started is False
     assert controller._solution_initialized is False
 

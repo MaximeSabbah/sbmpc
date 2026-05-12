@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from threading import Lock
 import time
 
 import jax
@@ -69,10 +70,27 @@ class PlannerOutput:
     diagnostics: PlannerDiagnostics
 
 
+@dataclass(frozen=True)
+class FeedforwardOutput:
+    tau_ff: np.ndarray
+    phase: object
+    next_phase: object
+    gripper_command: GripperCommand
+    diagnostics: PlannerDiagnostics
+
+
+@dataclass(frozen=True)
+class GainSnapshot:
+    K: np.ndarray
+    diagnostics: PlannerDiagnostics
+
+
 GAIN_MODE_FEEDFORWARD = "feedforward"
 GAIN_MODE_EXACT_ASYNC_FEEDBACK = "exact_async_feedback"
-SUPPORTED_GAIN_MODES = {GAIN_MODE_FEEDFORWARD, GAIN_MODE_EXACT_ASYNC_FEEDBACK}
-ASYNC_GAIN_WARMUP_TIMEOUT_SEC = 120.0
+SUPPORTED_GAIN_MODES = {
+    GAIN_MODE_FEEDFORWARD,
+    GAIN_MODE_EXACT_ASYNC_FEEDBACK,
+}
 
 
 def _resolve_gain_mode(config: Config, gain_mode: str | None) -> str:
@@ -138,7 +156,7 @@ def _async_gain_diagnostics(controller, gain_mode: str) -> dict[str, object]:
             "gain_dropped_snapshot_count": 0,
         }
 
-    status = controller.background_gain_status()
+    status = controller.phase0_exact_gain_status()
     return {
         "background_gain_time_ms": _finite_or_none(status.get("gain_refresh_ms")),
         "async_gain_worker_running": bool(status.get("worker_running", False)),
@@ -171,28 +189,34 @@ def _current_gains_numpy(
     return gains, completed_batch_count
 
 
+def _zero_gains_numpy(controller) -> np.ndarray:
+    return np.asarray(controller._zero_gains, dtype=np.float32)
+
+
+def _diagnostics_with_gain(
+    diagnostics: PlannerDiagnostics,
+    gain_diag: dict[str, object],
+    gains: np.ndarray,
+) -> PlannerDiagnostics:
+    return replace(
+        diagnostics,
+        gain_norm=float(np.linalg.norm(gains)),
+        background_gain_time_ms=gain_diag["background_gain_time_ms"],
+        async_gain_worker_running=gain_diag["async_gain_worker_running"],
+        async_gain_worker_error=gain_diag["async_gain_worker_error"],
+        gain_age_cycles=gain_diag["gain_age_cycles"],
+        gain_window_fill=gain_diag["gain_window_fill"],
+        gain_completed_batch_count=gain_diag["gain_completed_batch_count"],
+        gain_dropped_snapshot_count=gain_diag["gain_dropped_snapshot_count"],
+    )
+
+
 def _async_gain_batches_to_first_publish(config: Config) -> int:
     samples_per_cycle = int(config.MPC.gain_samples_per_cycle or 0)
     buffer_size = int(config.MPC.gain_buffer_size or 0)
     if samples_per_cycle <= 0 or buffer_size <= 0:
         return 1
     return max(1, (buffer_size + samples_per_cycle - 1) // samples_per_cycle)
-
-
-def _wait_for_async_gain_batches(controller, min_completed_batches: int) -> None:
-    ok = controller.wait_for_async_exact_gain_batches(
-        min_completed_batches,
-        timeout_sec=ASYNC_GAIN_WARMUP_TIMEOUT_SEC,
-    )
-    if ok:
-        return
-    status = controller.background_gain_status()
-    raise TimeoutError(
-        "Timed out waiting for async exact-gain warmup batches "
-        f"({status.get('completed_batch_count', 0)}/{min_completed_batches} complete, "
-        f"window_fill={status.get('rolling_window_fill', 0)}, "
-        f"worker_error={status.get('worker_error')})."
-    )
 
 
 class PandaPickAndPlaceController:
@@ -237,32 +261,33 @@ class PandaPickAndPlaceController:
         self._compute_task_diagnostics = compute_task_diagnostics
         self._cached_gains: np.ndarray | None = None
         self._cached_gain_completed_batch_count: int | None = None
+        self._cached_gain_lock = Lock()
+        self._last_gain_refresh_ms: float | None = None
 
     def start(self) -> None:
         if self._started:
             return
-        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
-            self.controller.start_background_gains(reset_published_gain=True)
         self._started = True
 
     def close(self) -> None:
         self.controller.close()
         self._started = False
-        self._cached_gains = None
-        self._cached_gain_completed_batch_count = None
+        with self._cached_gain_lock:
+            self._cached_gains = None
+            self._cached_gain_completed_batch_count = None
 
     def reset_runtime_state_after_warmup(self) -> None:
         """Keep warmup as compilation only before starting live control."""
-        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
-            self.controller.stop_background_gains()
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.controller.reset_published_gains()
+            self.controller.reset_phase0_exact_gain_probe(reset_published_gain=False)
         self._started = False
         self._solution_initialized = False
         self._last_reference_signature = None
         self._async_warmup_complete = False
-        self._cached_gains = None
-        self._cached_gain_completed_batch_count = None
+        with self._cached_gain_lock:
+            self._cached_gains = None
+            self._cached_gain_completed_batch_count = None
 
     def warmup(
         self,
@@ -271,11 +296,6 @@ class PandaPickAndPlaceController:
         target_pose: TaskPose | np.ndarray | None = None,
         num_steps: int | None = None,
     ) -> PlannerOutput:
-        async_completed_before = 0
-        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
-            async_completed_before = int(
-                self.controller.background_gain_status().get("completed_batch_count", 0)
-            )
         output = self.step(
             self.planner.home_q,
             jnp.zeros(self.planner.nv, dtype=jnp.float32),
@@ -287,10 +307,7 @@ class PandaPickAndPlaceController:
         )
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             if self._async_warmup_complete:
-                _wait_for_async_gain_batches(
-                    self.controller,
-                    async_completed_before + 1,
-                )
+                self.refresh_gain_if_budget(output.diagnostics, budget_sec=None)
             else:
                 output = self._warmup_exact_async_until_ready(
                     output,
@@ -358,13 +375,13 @@ class PandaPickAndPlaceController:
         ):
             self._seed_nominal_solution(state, reference.goal_q)
         if reset_gain_state:
-            if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
-                self.controller.stop_background_gains()
-                self._started = False
             self.controller.reset_published_gains()
+            if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+                self.controller.reset_phase0_exact_gain_probe(reset_published_gain=False)
             self._async_warmup_complete = False
-            self._cached_gains = None
-            self._cached_gain_completed_batch_count = None
+            with self._cached_gain_lock:
+                self._cached_gains = None
+                self._cached_gain_completed_batch_count = None
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
@@ -384,14 +401,19 @@ class PandaPickAndPlaceController:
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
         gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
-        gains, self._cached_gain_completed_batch_count = _current_gains_numpy(
+        with self._cached_gain_lock:
+            cached_gains = self._cached_gains
+            cached_completed_batch_count = self._cached_gain_completed_batch_count
+        gains, completed_batch_count = _current_gains_numpy(
             self.controller,
             self.gain_mode,
             gain_diag,
-            cached_gains=self._cached_gains,
-            cached_completed_batch_count=self._cached_gain_completed_batch_count,
+            cached_gains=cached_gains,
+            cached_completed_batch_count=cached_completed_batch_count,
         )
-        self._cached_gains = gains
+        with self._cached_gain_lock:
+            self._cached_gains = gains
+            self._cached_gain_completed_batch_count = completed_batch_count
 
         position_error = None
         orientation_error = None
@@ -450,6 +472,56 @@ class PandaPickAndPlaceController:
             diagnostics=diagnostics,
         )
 
+    def refresh_gain_if_budget(
+        self,
+        diagnostics: PlannerDiagnostics | None = None,
+        *,
+        budget_sec: float | None = None,
+    ) -> GainSnapshot | None:
+        if self.gain_mode != GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            return None
+        if budget_sec is not None and budget_sec <= 0.0:
+            return None
+
+        start_time = time.perf_counter()
+        refresh = self.controller.phase0_refresh_exact_gains()
+        elapsed_ms = 1000.0 * (time.perf_counter() - start_time)
+        if refresh.get("source_cycle_id") is not None:
+            refresh_ms = _finite_or_none(refresh.get("gain_refresh_ms"))
+            self._last_gain_refresh_ms = elapsed_ms if refresh_ms is None else refresh_ms
+
+        gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
+        with self._cached_gain_lock:
+            cached_gains = self._cached_gains
+            cached_completed_batch_count = self._cached_gain_completed_batch_count
+        gains, completed_batch_count = _current_gains_numpy(
+            self.controller,
+            self.gain_mode,
+            gain_diag,
+            cached_gains=cached_gains,
+            cached_completed_batch_count=cached_completed_batch_count,
+        )
+        with self._cached_gain_lock:
+            self._cached_gains = gains
+            self._cached_gain_completed_batch_count = completed_batch_count
+        if diagnostics is None:
+            diagnostics = PlannerDiagnostics(
+                planning_time_ms=0.0,
+                running_cost=None,
+                gain_norm=float(np.linalg.norm(gains)),
+                torque_norm=0.0,
+                position_error=None,
+                orientation_error=None,
+                object_error=None,
+                goal_position=np.asarray(self.planner.reference.goal_pos, dtype=np.float32),
+                gain_mode=self.gain_mode,
+                foreground_planning_time_ms=None,
+                **gain_diag,
+            )
+        else:
+            diagnostics = _diagnostics_with_gain(diagnostics, gain_diag, gains)
+        return GainSnapshot(K=gains, diagnostics=diagnostics)
+
     @staticmethod
     def _joint_vector(values: np.ndarray, size: int, name: str) -> jax.Array:
         array = np.asarray(values, dtype=np.float32)
@@ -495,9 +567,9 @@ class PandaPickAndPlaceController:
         target_batches = _async_gain_batches_to_first_publish(self.config)
         target_fill = int(self.config.MPC.gain_buffer_size or 0)
 
-        _wait_for_async_gain_batches(self.controller, 1)
         while True:
-            status = self.controller.background_gain_status()
+            self.refresh_gain_if_budget(output.diagnostics, budget_sec=None)
+            status = self.controller.phase0_exact_gain_status()
             completed = int(status.get("completed_batch_count", 0))
             fill = int(status.get("rolling_window_fill", 0))
             if completed >= target_batches and fill >= target_fill:
@@ -511,21 +583,15 @@ class PandaPickAndPlaceController:
                 num_steps=num_steps,
                 reset_guess=False,
             )
-            _wait_for_async_gain_batches(self.controller, completed + 1)
-
-        completed = int(
-            self.controller.background_gain_status().get("completed_batch_count", 0)
+        warm = self.controller.command(
+            jnp.concatenate([q, v], axis=0),
+            self.planner.reference_vec,
+            shift_guess=True,
+            num_steps=self._default_num_steps if num_steps is None else num_steps,
+            update_gains=False,
+            capture_gain_context=False,
         )
-        output = self.step(
-            q,
-            v,
-            phase,
-            object_pose=object_pose,
-            target_pose=target_pose,
-            num_steps=num_steps,
-            reset_guess=False,
-        )
-        _wait_for_async_gain_batches(self.controller, completed + 1)
+        jax.block_until_ready(warm)
         self._async_warmup_complete = True
         return output
 
@@ -603,31 +669,32 @@ class PandaPregraspController:
         self._compute_task_diagnostics = compute_task_diagnostics
         self._cached_gains: np.ndarray | None = None
         self._cached_gain_completed_batch_count: int | None = None
+        self._cached_gain_lock = Lock()
+        self._last_gain_refresh_ms: float | None = None
 
     def start(self) -> None:
         if self._started:
             return
-        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
-            self.controller.start_background_gains(reset_published_gain=True)
         self._started = True
 
     def close(self) -> None:
         self.controller.close()
         self._started = False
-        self._cached_gains = None
-        self._cached_gain_completed_batch_count = None
+        with self._cached_gain_lock:
+            self._cached_gains = None
+            self._cached_gain_completed_batch_count = None
 
     def reset_runtime_state_after_warmup(self) -> None:
         """Keep warmup as compilation only before starting live control."""
-        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
-            self.controller.stop_background_gains()
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.controller.reset_published_gains()
+            self.controller.reset_phase0_exact_gain_probe(reset_published_gain=False)
         self._started = False
         self._solution_initialized = False
         self._async_warmup_complete = False
-        self._cached_gains = None
-        self._cached_gain_completed_batch_count = None
+        with self._cached_gain_lock:
+            self._cached_gains = None
+            self._cached_gain_completed_batch_count = None
 
     def warmup(
         self,
@@ -637,11 +704,6 @@ class PandaPregraspController:
         num_steps: int | None = None,
     ) -> PlannerOutput:
         del phase, object_pose, target_pose
-        async_completed_before = 0
-        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
-            async_completed_before = int(
-                self.controller.background_gain_status().get("completed_batch_count", 0)
-            )
         output = self.step(
             self.planner.home_q,
             jnp.zeros(self.planner.nv, dtype=jnp.float32),
@@ -650,10 +712,7 @@ class PandaPregraspController:
         )
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             if self._async_warmup_complete:
-                _wait_for_async_gain_batches(
-                    self.controller,
-                    async_completed_before + 1,
-                )
+                self.refresh_gain_if_budget(output.diagnostics, budget_sec=None)
             else:
                 output = self._warmup_exact_async_until_ready(
                     output,
@@ -672,6 +731,38 @@ class PandaPregraspController:
         num_steps: int | None = None,
         reset_guess: bool = False,
     ) -> PlannerOutput:
+        feedforward = self.step_feedforward(
+            q,
+            v,
+            phase,
+            object_pose=object_pose,
+            target_pose=target_pose,
+            num_steps=num_steps,
+            reset_guess=reset_guess,
+        )
+        if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            self.refresh_gain_if_budget(feedforward.diagnostics, budget_sec=None)
+        gain = self.latest_gain(feedforward.diagnostics)
+        return PlannerOutput(
+            tau_ff=feedforward.tau_ff,
+            K=gain.K,
+            phase=feedforward.phase,
+            next_phase=feedforward.next_phase,
+            gripper_command=feedforward.gripper_command,
+            diagnostics=gain.diagnostics,
+        )
+
+    def step_feedforward(
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        phase: object | None = None,
+        object_pose: TaskPose | np.ndarray | None = None,
+        target_pose: TaskPose | np.ndarray | None = None,
+        *,
+        num_steps: int | None = None,
+        reset_guess: bool = False,
+    ) -> FeedforwardOutput:
         del phase, object_pose, target_pose
         q = PandaPickAndPlaceController._joint_vector(q, self.planner.nq, "q")
         v = PandaPickAndPlaceController._joint_vector(v, self.planner.nv, "v")
@@ -682,13 +773,13 @@ class PandaPregraspController:
         if reset_guess or self._reseed_every_step or not self._solution_initialized:
             self._seed_nominal_solution(state)
         if reset_gain_state:
-            if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK and self._started:
-                self.controller.stop_background_gains()
-                self._started = False
             self.controller.reset_published_gains()
+            if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+                self.controller.reset_phase0_exact_gain_probe(reset_published_gain=False)
             self._async_warmup_complete = False
-            self._cached_gains = None
-            self._cached_gain_completed_batch_count = None
+            with self._cached_gain_lock:
+                self._cached_gains = None
+                self._cached_gain_completed_batch_count = None
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
@@ -708,14 +799,10 @@ class PandaPregraspController:
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
         gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
-        gains, self._cached_gain_completed_batch_count = _current_gains_numpy(
-            self.controller,
-            self.gain_mode,
-            gain_diag,
-            cached_gains=self._cached_gains,
-            cached_completed_batch_count=self._cached_gain_completed_batch_count,
-        )
-        self._cached_gains = gains
+        with self._cached_gain_lock:
+            cached_gains = self._cached_gains
+        if cached_gains is None:
+            cached_gains = _zero_gains_numpy(self.controller)
 
         position_error = None
         orientation_error = None
@@ -741,7 +828,7 @@ class PandaPregraspController:
         diagnostics = PlannerDiagnostics(
             planning_time_ms=planning_time_ms,
             running_cost=running_cost,
-            gain_norm=float(np.linalg.norm(gains)),
+            gain_norm=float(np.linalg.norm(cached_gains)),
             torque_norm=float(np.linalg.norm(tau_ff)),
             position_error=position_error,
             orientation_error=orientation_error,
@@ -751,14 +838,72 @@ class PandaPregraspController:
             foreground_planning_time_ms=planning_time_ms,
             **gain_diag,
         )
-        return PlannerOutput(
+        return FeedforwardOutput(
             tau_ff=tau_ff,
-            K=gains,
             phase=self.PHASE_NAME,
             next_phase=self.PHASE_NAME,
             gripper_command=GripperCommand(action="open", width=self.GRIPPER_OPEN),
             diagnostics=diagnostics,
         )
+
+    def latest_gain(
+        self,
+        diagnostics: PlannerDiagnostics | None = None,
+    ) -> GainSnapshot:
+        gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
+        with self._cached_gain_lock:
+            cached_gains = self._cached_gains
+            cached_completed_batch_count = self._cached_gain_completed_batch_count
+        gains, completed_batch_count = _current_gains_numpy(
+            self.controller,
+            self.gain_mode,
+            gain_diag,
+            cached_gains=cached_gains,
+            cached_completed_batch_count=cached_completed_batch_count,
+        )
+        with self._cached_gain_lock:
+            self._cached_gains = gains
+            self._cached_gain_completed_batch_count = completed_batch_count
+
+        if diagnostics is None:
+            reference = self.planner.reference
+            diagnostics = PlannerDiagnostics(
+                planning_time_ms=0.0,
+                running_cost=None,
+                gain_norm=float(np.linalg.norm(gains)),
+                torque_norm=0.0,
+                position_error=None,
+                orientation_error=None,
+                object_error=None,
+                goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
+                gain_mode=self.gain_mode,
+                foreground_planning_time_ms=None,
+                **gain_diag,
+            )
+        else:
+            diagnostics = _diagnostics_with_gain(diagnostics, gain_diag, gains)
+        return GainSnapshot(K=gains, diagnostics=diagnostics)
+
+    def refresh_gain_if_budget(
+        self,
+        diagnostics: PlannerDiagnostics | None = None,
+        *,
+        budget_sec: float | None = None,
+    ) -> GainSnapshot | None:
+        if self.gain_mode != GAIN_MODE_EXACT_ASYNC_FEEDBACK:
+            return None
+        if budget_sec is not None and budget_sec <= 0.0:
+            return None
+
+        start_time = time.perf_counter()
+        refresh = self.controller.phase0_refresh_exact_gains()
+        elapsed_ms = 1000.0 * (time.perf_counter() - start_time)
+        if refresh.get("source_cycle_id") is not None:
+            refresh_ms = _finite_or_none(refresh.get("gain_refresh_ms"))
+            self._last_gain_refresh_ms = (
+                elapsed_ms if refresh_ms is None else refresh_ms
+            )
+        return self.latest_gain(diagnostics)
 
     def predict_state(
         self,
@@ -796,9 +941,9 @@ class PandaPregraspController:
         target_batches = _async_gain_batches_to_first_publish(self.config)
         target_fill = int(self.config.MPC.gain_buffer_size or 0)
 
-        _wait_for_async_gain_batches(self.controller, 1)
         while True:
-            status = self.controller.background_gain_status()
+            self.refresh_gain_if_budget(output.diagnostics, budget_sec=None)
+            status = self.controller.phase0_exact_gain_status()
             completed = int(status.get("completed_batch_count", 0))
             fill = int(status.get("rolling_window_fill", 0))
             if completed >= target_batches and fill >= target_fill:
@@ -809,18 +954,15 @@ class PandaPregraspController:
                 num_steps=num_steps,
                 reset_guess=False,
             )
-            _wait_for_async_gain_batches(self.controller, completed + 1)
-
-        completed = int(
-            self.controller.background_gain_status().get("completed_batch_count", 0)
+        warm = self.controller.command(
+            jnp.concatenate([q, v], axis=0),
+            self.planner.reference_vec,
+            shift_guess=True,
+            num_steps=self._default_num_steps if num_steps is None else num_steps,
+            update_gains=False,
+            capture_gain_context=False,
         )
-        output = self.step(
-            q,
-            v,
-            num_steps=num_steps,
-            reset_guess=False,
-        )
-        _wait_for_async_gain_batches(self.controller, completed + 1)
+        jax.block_until_ready(warm)
         self._async_warmup_complete = True
         return output
 

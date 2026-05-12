@@ -38,8 +38,8 @@ to the exact background-worker path before it can be used.
 | Metric | Target | Source |
 |---|---|---|
 | Foreground torque/control publication | 50 Hz, p99 ≤ 20 ms once armed and past startup | `/control` header/receive cadence in ROS |
-| Controller foreground compute path | p99 ≤ 21 ms without MuJoCo/rendering load | ROS bridge adapter timing smoke fed by synthetic or recorded `Sensor` messages |
-| Background gain worker | Running opportunistically, finite gains, no worker errors, bounded age/staleness | `BridgeDiagnostics`; dropped snapshots are diagnostic, not a freshness-at-50-Hz gate |
+| Isolated feedforward solve path | Target p99 ≤ 10 ms, hard p99 < 20 ms without MuJoCo/rendering load | Controller timing smoke that times feedforward-only MPPI and excludes gain refresh |
+| Exact gain refresh | Opportunistic, finite gains, no errors, bounded age/staleness when refresh fits the slack budget | `BridgeDiagnostics`; dropped snapshots are diagnostic, not a freshness-at-50-Hz gate |
 | Steady-state EE position error | < 1 mm (Euclidean) at the pregrasp pose, sustained 5 s | ROS-side MuJoCo behavior smoke mirroring `bench_lfc._ee_error()` from FER joint states |
 | Gain/behavior stability | No rejected planner outputs, bounded joint spans/velocity/HF energy, no unsafe divergence | ROS-side MuJoCo behavior smoke plus visual replay when needed |
 | MuJoCo physics ⟷ bench_lfc parity | Same physical model, same `home` keyframe, and same PREGRASP reference as `bench_lfc.py` | mujoco_ros2_control `<mujoco_model>` param + xacro test |
@@ -52,12 +52,38 @@ before moving toward the real robot.
 ### Validation split — timing, async gains, and MuJoCo visualization
 
 The foreground 50 Hz gate applies to torque/control publication and to the
-controller foreground compute path. It does **not** mean exact gains must be
-recomputed or refreshed at 50 Hz. Exact gains run asynchronously in the
-background and update the controller opportunistically when ready. A dropped
-gain snapshot means a newer pending context replaced an older one while the
-worker was busy; it is useful diagnostic information, but it is not by itself a
-controller failure.
+foreground feedforward torque solve. It does **not** mean exact gains must be
+recomputed or refreshed at 50 Hz. Exact gains run opportunistically and update
+the controller only when the available slack can cover a refresh. A dropped
+gain snapshot means a newer pending context replaced an older one before the
+gain path could process it; it is useful
+diagnostic information, but it is not by itself a controller failure.
+
+Chosen controller architecture for the next implementation pass:
+
+- Keep the real-time command path feedforward-first. A 50 Hz tick should solve
+  only the MPPI feedforward torque for the newest sensor state, update
+  `latest_tau_ff`, and publish using the current `latest_K`.
+- Store feedforward and gains in separate double buffers:
+  `latest_tau_ff` / `latest_initial_state` are owned by the foreground solver;
+  `latest_K` is owned by the gain refresh path. The publisher composes
+  `Control(tau_ff=latest_tau_ff, K=latest_K)` from those buffers.
+- The exact-gain refresh path consumes captured foreground contexts and
+  updates `latest_K` atomically when a budgeted gain batch completes. It must
+  never be on the critical path for publishing or for the next feedforward
+  solve.
+- On a single GPU, "opportunistic" is only true if gain work cannot occupy the
+  same GPU queue across the next foreground deadline. If a gain batch is a
+  monolithic 20-25 ms GPU job, it can still delay the next 7-10 ms foreground
+  rollout even though Python code is not explicitly waiting for it. The
+  implementation must therefore either isolate gain work on another device /
+  process, or split/schedule gain work into bounded chunks that fit the slack
+  after a foreground solve and are skipped when no slack is available.
+- The acceptance diagnostic for this architecture is not the current
+  `PandaPregraspController.step()` wall time. It is: foreground-only
+  feedforward timing, gain age/staleness, and proof that enabling gain refresh
+  does not increase feedforward p99 or `/control` publication
+  jitter.
 
 MuJoCo ROS is primarily a deployment-safety and wiring tool: it should show
 that the ROS stack sends sensible commands through the correct FER joints and
@@ -87,8 +113,11 @@ The code anchors are:
 
 - `test_ee_parity_smoke.py` for MuJoCo ROS wiring/behavior and `/control`
   publication cadence;
-- `test_controller_timing_smoke.py` for controller-only foreground timing
-  without MuJoCo/rendering load.
+- `test_controller_timing_smoke.py` for the current controller-only adapter
+  timing without MuJoCo/rendering load;
+- a new feedforward-first timing smoke to add with the architecture rework,
+  which must separately report feedforward solve time, gain-worker refresh
+  time, gain age, and any foreground delay caused by the gain worker.
 
 ### Current state checkpoint — 2026-05-11
 
@@ -110,13 +139,12 @@ This is the restart anchor for future Codex/agent sessions.
   MuJoCo parity passed with `SBMPC_RUN_MUJOCO_PARITY=1` over an 8 s observation
   window. A short diagnostic run showed final EE error around `0.0002 m`, no
   rejected planner outputs, and stable joint velocities.
-- Accepted / timing: The remaining controller-only smoke reports p99 around
-  `20.4-20.9 ms` for the ROS planner-adapter foreground compute path. This is
-  accepted as a `21 ms` controller-only gate while keeping the real foreground
-  publication requirement at 50 Hz / p99 ≤ 20 ms. The timing delta versus the
-  `7-8 ms` `bench_lfc.py` raw command timer is currently understood as
-  adapter/JAX foreground work under async-gain GPU contention and different
-  timing semantics, not MuJoCo behavior failure or ROS publish overhead.
+- Current / timing: The current controller-only smoke can pass a `21 ms` gate
+  for the ROS planner-adapter path, while `bench_lfc.py` raw foreground
+  command timing is around `7-8 ms`. This `21 ms` adapter number is now treated
+  as a diagnostic ceiling, not the desired architecture. The next controller
+  pass should separate `tau_ff` and `K` buffers so the foreground feedforward
+  solve is protected from async-gain GPU contention and can target < 10 ms.
 - Still to do: Build the headless record + visual replay workflow for
   `/joint_states`, `/sensor`, `/control`, and `/sbmpc/diagnostics`, then use
   it for human hazard/sanity review before real-robot deployment rehearsal.
@@ -564,6 +592,49 @@ visual replay. The controller timing gate runs without MuJoCo/rendering load,
 matching the real robot deployment constraint that only the controller should
 consume the controller GPU budget.
 
+### Phase D1 — Feedforward-first controller rework
+
+This is the next controller-architecture pass before real-robot rehearsal.
+Keep SB-MPC tuning fixed.
+
+Target behavior:
+
+1. The 50 Hz foreground loop solves a fresh feedforward torque from the latest
+   `Sensor` state. It must not wait for an exact gain refresh.
+2. `tau_ff` / desired state and `K` live in independent, thread-safe buffers.
+   The publisher composes the outgoing LFC `Control` message from the latest
+   available values at publish time.
+3. Exact-gain computation consumes captured foreground contexts and updates
+   only the gain buffer. Gain age, completed batches, dropped contexts, and
+   worker errors remain diagnostics, not foreground failures.
+4. On a single GPU, gain computation must be either device/process isolated or
+   budgeted into chunks that cannot spill over the next foreground deadline.
+   If JAX launches a non-preemptible gain kernel that takes longer than the
+   available slack, the correct behavior is to skip/defer that gain work, not
+   to delay the next feedforward solve.
+5. The old adapter timing number (`PandaPregraspController.step()` p99 near
+   `20-21 ms`) is not the final acceptance metric. Add a timing smoke that
+   reports:
+   - feedforward solve p50/p95/p99/max with gain worker disabled;
+   - feedforward solve p50/p95/p99/max with gain worker enabled;
+   - background gain refresh timing and gain age;
+   - `/control` cadence and publish/prepare timing.
+
+Implementation sketch:
+
+- In `sbmpc`, expose a public pregrasp API method that computes the foreground
+  feedforward command and captures a gain context without synchronously
+  reading or refreshing gains.
+- In `sbmpc_ros_bridge`, replace the single `PlannerOutput` buffer with
+  separate latest-feedforward and latest-gain buffers, or with an equivalent
+  immutable state object whose `tau_ff` and `K` fields can be updated
+  independently.
+- Preserve LFC sign convention and message shape. The bridge should still
+  publish `feedforward` as `(7, 1)` and `feedback_gain` as `(7, 14)`.
+- Keep `test_ee_parity_smoke.py` as the behavior gate after the rework, and
+  add a controller-only test that proves the gain worker cannot degrade the
+  feedforward p99 beyond the accepted budget.
+
 If the EE error is > 1 mm, do not retune controller gains. Diagnose in this
 order:
 
@@ -613,7 +684,8 @@ behavior smoke, do not retune the controller or weaken
    foreground compute diagnostics are slow only during MuJoCo runs, move that
    timing question to the controller-only smoke before changing code.
 
-If the controller-only timing smoke misses p99 ≤ 21 ms, diagnose in this order:
+If the current controller-only timing smoke misses p99 ≤ 21 ms before D1 is
+implemented, diagnose in this order:
 
 1. Compare against `bench_lfc.py --preset exact-feedback --timing-mode
    immediate` in the same container after JAX cache warmup.
@@ -625,12 +697,18 @@ If the controller-only timing smoke misses p99 ≤ 21 ms, diagnose in this order
    whether synthetic/recorded sensors match the real FER joint ordering.
 4. Only after the fixed-tuning ROS path is understood should a code change be
    made. The desired outcome is the tuned controller meeting the controller
-   timing gate, not a less expensive controller configuration.
+   timing gate through feedforward/gain decoupling, not a less expensive
+   controller configuration.
 
 For visualization before robot deployment, record the headless MuJoCo run
 (`/joint_states`, `/sensor`, `/control`, `/sbmpc/diagnostics`) and replay the
-joint trajectory in MuJoCo or RViz. Replay is for human hazard/sanity review,
-not for controller timing acceptance.
+joint trajectory in MuJoCo or RViz. The simulation launch can do this directly
+with `record_replay:=true`; the recorder starts after the first `/control`
+message by default so JAX/MuJoCo warmup does not pollute replay timing. Replay
+is for human hazard/sanity review, not for controller timing acceptance. Live
+visualization can also add GPU load or fail in the current container/host
+rendering path, so it must not share the controller timing run. Prefer headless
+recording plus replay unless a separate display/GPU path has been validated.
 
 ---
 
@@ -646,8 +724,12 @@ Mark done when, in a fresh checkout following only this document:
 - `ros2 launch sbmpc_bringup sbmpc_franka_lfc_mujoco_sim.launch.py` brings
   up cleanly.
 - `test_ee_parity_smoke.py` passes as the MuJoCo wiring/behavior gate.
-- `test_controller_timing_smoke.py` passes as the controller-only foreground
-  timing gate.
+- The feedforward-first controller timing smoke passes: foreground
+  feedforward p99 stays within budget with the gain worker enabled, gain
+  staleness remains bounded, and `/control` cadence remains 50 Hz after
+  startup.
+- `test_controller_timing_smoke.py` either passes as a legacy adapter smoke or
+  is updated/replaced by the feedforward-first timing smoke.
 
 Real-robot deployment topology then proceeds per `ROS_DEPLOYMENT_ROADMAP.md`;
 the bridge config has already been migrated away from FD in §A1b.
@@ -1095,3 +1177,213 @@ record the reason here and update the plan section itself in the same commit.
   replay workflow. Prefer that over relying on `headless:=false` live GUI
   rendering, because replay keeps visualization load out of the controller
   validation run.
+
+### 2026-05-11 — Codex Feedforward-First Architecture Reanchor
+- Scope: Reframed the controller timing goal after user clarification that
+  the desired runtime behavior is fresh feedforward torque at 50 Hz with gains
+  refreshed only when available.
+- Changed: Updated the acceptance gates and Phase D with a chosen
+  feedforward-first architecture: separate `tau_ff` and `K` buffers, 50 Hz
+  foreground solve protected from exact-gain refresh, opportunistic gain
+  updates, and timing diagnostics that prove the gain worker cannot degrade
+  foreground feedforward p99. Clarified that the current `21 ms`
+  planner-adapter smoke is a diagnostic ceiling, not the target architecture.
+- Verified: No code was changed in this turn. The discussion is based on the
+  current code structure inspected earlier: `bench_lfc.py` raw foreground
+  command timing around `7-8 ms`, current ROS adapter timing near the `21 ms`
+  gate, and background exact-gain refresh often occupying about `20-25 ms` on
+  the same JAX/GPU path.
+- Not verified / blockers: Need implementation and measurement. The key risk
+  is that same-GPU gain kernels may be non-preemptible; if so, opportunistic
+  gains require device/process isolation or smaller budgeted gain chunks,
+  otherwise the gain worker can still delay the next foreground solve.
+- Next handoff: Implement D1. Start by exposing a feedforward-only public API
+  in `sbmpc`, then update `sbmpc_ros_bridge` to publish from independent
+  latest-feedforward and latest-gain buffers. Add a timing smoke that compares
+  feedforward p99 with the gain worker disabled and enabled.
+
+### 2026-05-11 — Codex D1 Split-Buffer Controller Implementation
+- Scope: Implemented the first controller-architecture slice for
+  feedforward-first control without retuning SB-MPC.
+- Changed: Added `FeedforwardOutput` and `GainSnapshot` to the public Panda
+  planner API. `PandaPregraspController.step_feedforward()` now computes
+  `tau_ff` and captures an exact-gain context without bundling a gain read
+  into the output; `latest_gain()` exposes the most recently published gain
+  separately. `SbMpcPlannerAdapter` delegates those split calls. The ROS bridge
+  now stores independent latest-feedforward and latest-gain buffers and
+  composes the outgoing LFC `Control` message at publish time, while preserving
+  fallback behavior for old bundled `PlannerOutput` implementations.
+- Verified: Focused ROS bridge tests passed through the Pixi/ROS runtime:
+  `test_fake_ros_loop.py` and `test_planner_adapter.py` reported `24 passed`.
+  Focused `sbmpc` planner API tests passed with `12 passed`. The opt-in
+  legacy controller timing smoke still passed with
+  `SBMPC_RUN_CONTROLLER_TIMING=1`. A one-step planner smoke returned
+  ROS-shaped `(7, 1)` feedforward and `(7, 14)` gain messages with foreground
+  timing around `7.7 ms`.
+- Not verified / blockers: This pass separates the data path but does not yet
+  solve same-GPU gain contention. The internal exact-gain worker can still
+  occupy the JAX/GPU queue unless the next pass adds device/process isolation
+  or slack-budgeted gain chunks.
+- Next handoff: Add the feedforward-first timing smoke described in Phase D1,
+  then implement gain scheduling/isolation so enabling gain refresh cannot
+  worsen feedforward p99 or `/control` cadence.
+
+### 2026-05-11 — Codex D1 Single-Mode Exact-Async Cleanup
+- Scope: Collapsed the controller implementation back to one public feedback
+  mode: `exact_async_feedback`. There is no separate opportunistic planner
+  mode anymore.
+- Changed: `exact_async_feedback` now means foreground-priority control:
+  `step_feedforward()` performs the MPPI foreground solve and captures a gain
+  context, while gain refresh is attempted only through
+  `refresh_gain_if_budget()` when the bridge has remaining cycle budget. The
+  ROS bridge config is back to `planner_mode: exact_async_feedback`.
+- Verified: Focused ROS bridge / bringup tests passed:
+  `test_fake_ros_loop.py`, `test_planner_adapter.py`,
+  `test_bringup_config.py`, and `test_validate_sim.py` reported `34 passed`.
+  Planner API tests reported `13 passed`. The opt-in controller timing smoke
+  reported foreground p99 `8.014 ms` with wall calls around `9-10.6 ms`.
+  Planner smoke for `exact_async_feedback` returned finite ROS-shaped control
+  with foreground planning `7.49 ms`; the measured exact-gain refresh cost was
+  `21.41 ms`, so live refresh was correctly treated as not fitting in the
+  remaining 50 Hz budget.
+- Remaining constraint: Current exact gain refresh is a monolithic same-GPU
+  job of roughly `20-23 ms`, so it cannot be run inside the leftover budget
+  after a `7-8 ms` foreground solve. The current safe behavior is to preserve
+  the 50 Hz feedforward path and skip gain refresh until enough slack exists.
+
+### 2026-05-11 — Codex Exact-Gain Microbatch Feasibility Check
+- Scope: Checked whether gain computation can be continued across control
+  cycles while still publishing gains synthesized from many samples.
+- Changed: Added `tests/bench_gain_microbatch.py`, a warmed benchmark that
+  separates two axes: current full-gradient sample batches, and gradient-only
+  microtasks that avoid recomputing rollout cost/control values already known
+  from the foreground MPPI pass.
+- Verified: Sample-only splitting of the current refresh path is not enough:
+  `gK=4` in `bench_lfc.py` still measured about `17.16 ms` mean refresh time
+  after warmup. The focused benchmark found the current full-gradient path at
+  about `15.10 ms` for 1 sample and `15.24 ms` for 1 sample in a repeat run.
+  The gradient-only microtask is materially better: 1 sample with all 14 state
+  directions measured about `8.88 ms`; 2 samples about `10.76 ms`; 4 samples
+  about `10.32 ms`.
+- Follow-up with larger sample chunks: the gradient-only path measured about
+  `10.55 ms` for 8 samples, `10.83 ms` for 16 samples, `12.49 ms` for
+  64 samples, and `13.40 ms` for 128 samples. The current full-refresh path
+  over the same shapes measured about `15.5-19.5 ms`. This means the useful
+  split axis is complete sample-gradient records, not partial state
+  directions. Keep the final rolling window large for stability, but fill it
+  with budgeted chunks of complete sample gradients.
+- Interpretation: The rolling-window idea remains applicable and should keep
+  a large sample window for stability. The implementation target should be a
+  resumable gain accumulator: compute a small number of complete
+  `(cost, delta_u0, gradient)` sample records during slack, append complete
+  records to `RollingGainWindow`, and publish `K` atomically only after the
+  window reaches the configured size. Do not reduce the final gain window just
+  to make one cycle fast.
+- Next handoff: Replace `phase0_refresh_exact_gains()` in the live path with a
+  budgeted gradient-only microtask API. Keep `gain_buffer_size=512`; benchmark
+  32/64/128 complete-sample chunks for time-to-first-gain, gain staleness, and
+  behavior stability before committing the production chunk size.
+
+### 2026-05-11 — Codex Rolling-Gain Architecture Benchmark
+- Scope: Added a closed-loop benchmark to choose the gain scheduling
+  architecture before changing the production controller again.
+- Changed: Added `tests/bench_gain_architecture.py`. It measures the
+  foreground `tau_ff` publish path separately from gain work, reuses the
+  foreground costs and first-step control deltas, computes gradient-only
+  complete sample chunks, appends them to a rolling gain window, and reports
+  when the first gain is ready plus the post-fill update cadence. Once the
+  window is full, each new chunk overwrites the oldest chunk and can publish a
+  new `K`, matching the intended "drop old 64 / append new 64" behavior.
+- Metrics: The benchmark reports foreground p99, gain-work p99, total cycle
+  occupancy, 20 ms budget misses, first-gain latency, gain update count,
+  gain-delta norms, final/tail end-effector error, feedback peaks, joint
+  velocity, high-frequency velocity energy, and tail joint spans. It supports
+  fixed chunks such as `32,64,128` and an optional finite-set adaptive scheduler
+  that picks the largest precompiled chunk estimated to fit the slack budget.
+- Verified: `py_compile` passed. A tiny `samples=32, horizon=2, chunk=1,
+  buffer=2` smoke run filled the window and published the first gain. A short
+  realistic-shape smoke with `samples=1024, horizon=8, chunk=64, buffer=128`
+  exercised the real kernel shape; as expected, the deliberately too-small
+  128-sample window produced unstable gains/feedback, reinforcing that the
+  real architecture should keep `gain_buffer_size=512` for stability. The
+  benchmark warmup now also publishes a representative nonzero gain and runs
+  foreground planning once before measured cycles, so first-published-gain JAX
+  compilation does not contaminate timing.
+- Preliminary `64/512` probe: a 30-cycle gazebo-mode run reached
+  `0.40 mm` final EE error, first gain at `0.14 s`, and 23 gain updates.
+  Foreground p99 was `7.54 ms`; gain-work p99 was `14.51 ms`; combined cycle
+  occupancy p99 was `21.97 ms`, so `64` is promising for behavior but still
+  tight for a strict 20 ms same-GPU budget.
+- Suggested first real sweep:
+  `python tests/bench_gain_architecture.py --steps 80 --chunk-sizes 32,64,128 --gain-buffer-size 512 --timing-mode gazebo --output-json /tmp/gain_architecture_512.json`.
+  Use the result to choose the production chunk size.
+
+### 2026-05-12 — Codex Production Rolling 128/512 Controller
+- Scope: Promoted the benchmarked rolling exact-gain architecture into the
+  production `exact_async_feedback` path.
+- Decision: Use `planner_gain_samples_per_cycle=128` and
+  `planner_gain_buffer_size=512` as the first production target. The user
+  sweep showed `128/512` reaches the first gain in about `0.06 s`, updates
+  almost every foreground cycle after that, holds final EE error around
+  `0.51 mm`, and remains close enough to the 20 ms budget to try on the robot
+  GPU. `512/512` is rejected for live control because it costs roughly
+  `31-35 ms` per cycle and produced a large gain jump.
+- Changed: `RolloutGenerator` now exposes a JIT `rollout_gradients_to_state`
+  kernel that computes only `dJ/dx` for selected samples. The existing exact
+  gain refresh path now reuses foreground costs and first-step `delta_u0`,
+  appends complete `(cost, delta_u0, gradient)` records to the rolling window,
+  and synthesizes `K` from the latest 512 records once the window is full.
+  `refresh_gain_if_budget()` no longer skips a positive-budget refresh solely
+  because the previous 128-sample chunk estimate exceeds the strict leftover
+  50 Hz slack; this lets ROS run the chosen architecture and use the measured
+  controller rate as the truth.
+- Warmup fix: Exact-async warmup now compiles one foreground command while a
+  representative nonzero gain is already published, then
+  `reset_runtime_state_after_warmup()` still clears live gains/window state.
+  This removes the first-live-gain JAX compilation spike from foreground
+  timing.
+- ROS scaling: Added `sbmpc_bridge_exact_async_40hz.yaml`, with
+  `publish_rate_hz=40.0`, `planner_deadline_sec=0.025`, and
+  `planner_dt=0.025`, while keeping `128/512` gains. Use this preset if the
+  deployed GPU cannot sustain the chosen controller close enough to 50 Hz.
+- Verified: `test_mppi_gains.py` reported `10 passed`;
+  the exact-async planner API subset reported `3 passed`; ROS bridge/config
+  focused tests reported `32 passed`; the opt-in production timing smoke with
+  20 steps reported foreground p99 `7.726 ms`, `completed_batches=20`,
+  `dropped_snapshots=0`, and passed.
+
+### 2026-05-12 — Codex ROS Replay Visualization Path
+- Scope: Added a way to visualize full ROS-stack behavior without running the
+  viewer in the same timing-sensitive process as SB-MPC/JAX and MuJoCo
+  control.
+- Changed: Added `record_sbmpc_replay`, which subscribes to
+  `/sbmpc/joint_states`, `/sensor`, `/control`, and `/sbmpc/diagnostics` and
+  writes a JSON replay file. Added `replay_sbmpc_trajectory`, which loads that
+  file afterward and replays the recorded FER arm joint trajectory in a MuJoCo
+  viewer using the ROS2-control scene. This keeps the live stack headless while
+  still allowing visual inspection afterward.
+- Workflow: Run `sbmpc_franka_lfc_mujoco_sim.launch.py headless:=true
+  enable_nonzero_control:=true record_replay:=true
+  record_replay_output:=/tmp/sbmpc_ros_replay.json`, stop the live stack, then
+  replay with `/workspace/sbmpc_containers/scripts/pixi_ros_run.sh python -m
+  sbmpc_bringup.trajectory_replay /tmp/sbmpc_ros_replay.json`. Set
+  `record_replay_duration_sec:=8` for a fixed
+  window, or leave it at `0` to record until launch shutdown. Set
+  `record_replay_include_warmup:=true` only when startup/JIT behavior is the
+  object of the recording. The launch recorder autosaves every
+  `record_replay_autosave_period_sec:=5` seconds and writes an empty file as
+  soon as it starts, so an old replay file cannot silently survive a failed or
+  interrupted recording. Replay pacing defaults to `--time-source auto`, which
+  uses recorder wall-clock receive time when available and falls back to control
+  cadence for older files whose state header stamps did not advance.
+- Verified: `replay_sbmpc_trajectory --dry-run` on a synthetic replay JSON
+  loaded the default MuJoCo model and mapped all seven FER arm joints.
+- Follow-up: The recorder summary now includes full-stack timing statistics
+  from bridge diagnostics (`foreground`, `bridge_loop`, planner wall time,
+  background gain, control prepare/publish), control publish cadence, deadline
+  misses, accepted/rejected planner output counts, and rolling gain state.
+  In ROS 2, direct shell commands such as `record_sbmpc_replay` are not
+  guaranteed to be on `PATH`; use `ros2 run sbmpc_bringup record_sbmpc_replay`
+  for standalone recording, or the launch arguments above for the normal
+  workflow. During source-tree development, the modules can still be run
+  directly with `PYTHONPATH=/workspace/sbmpc_ros/sbmpc_bringup`.
