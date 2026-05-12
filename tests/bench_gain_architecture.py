@@ -56,6 +56,8 @@ GATE_HF_ENERGY = 0.13
 class ForegroundPlan:
     tau_ff: np.ndarray
     context: Any
+    reseed_ms: float
+    command_ms: float
     foreground_ms: float
 
 
@@ -267,7 +269,10 @@ class RollingGainProbe:
         if warmups <= 0:
             return
         for chunk in self.chunks:
-            batch = None
+            # First call compiles the fixed-shape chunk. Do not let compilation
+            # poison the runtime estimate used by the adaptive scheduler.
+            batch, _ = self._compute_batch(context, chunk)
+            jax.block_until_ready(batch.gradients)
             timing_samples = []
             for _ in range(warmups):
                 batch, timings = self._compute_batch(context, chunk)
@@ -281,6 +286,8 @@ class RollingGainProbe:
             while self.window.fill < self.window.capacity:
                 self.window.append(batch)
 
+            warm_gain = self.window.compute_gain(self.controller.gains_obj)
+            jax.block_until_ready(warm_gain)
             synth_samples = []
             for _ in range(warmups):
                 t_synth = time.perf_counter()
@@ -370,25 +377,39 @@ def _build_sim(args: argparse.Namespace):
     return planner, config, sim
 
 
-def _plan_foreground(sim, planner, config, state: np.ndarray) -> ForegroundPlan:
-    _reset_guess(sim, planner, config, jnp.asarray(state, dtype=jnp.float32))
-    jax.block_until_ready(sim.controller.sampler.optimal_samples)
+def _plan_foreground(
+    sim,
+    planner,
+    config,
+    state: np.ndarray,
+    *,
+    reseed: bool,
+) -> ForegroundPlan:
+    reseed_ms = 0.0
+    state_jax = jnp.asarray(state, dtype=jnp.float32)
+    if reseed:
+        reseed_start = time.perf_counter()
+        _reset_guess(sim, planner, config, state_jax)
+        jax.block_until_ready(sim.controller.sampler.optimal_samples)
+        reseed_ms = (time.perf_counter() - reseed_start) * 1000.0
 
     start = time.perf_counter()
     input_sequence = sim.controller.command(
-        jnp.asarray(state, dtype=jnp.float32),
+        state_jax,
         sim.const_reference,
         num_steps=1,
         update_gains=False,
         capture_gain_context=True,
     )
     jax.block_until_ready(input_sequence)
-    foreground_ms = (time.perf_counter() - start) * 1000.0
+    command_ms = (time.perf_counter() - start) * 1000.0
     context = _consume_phase0_context(sim.controller)
     return ForegroundPlan(
         tau_ff=np.asarray(input_sequence[0], dtype=np.float64),
         context=context,
-        foreground_ms=foreground_ms,
+        reseed_ms=reseed_ms,
+        command_ms=command_ms,
+        foreground_ms=reseed_ms + command_ms,
     )
 
 
@@ -401,7 +422,7 @@ def _compile_runtime(
 ) -> None:
     state = np.asarray(jax.block_until_ready(sim.current_state_vec()), dtype=np.float64)
     print("[setup] compiling foreground rollout and gain chunks...", flush=True)
-    plan = _plan_foreground(sim, planner, config, state)
+    plan = _plan_foreground(sim, planner, config, state, reseed=True)
     probe.warmup(plan.context, args.warmups)
 
     # The measured loop will eventually run foreground planning after a
@@ -410,7 +431,7 @@ def _compile_runtime(
     warm_chunk = max(probe.chunks)
     while probe.window.fill < probe.window.capacity:
         probe.process_context(plan.context, warm_chunk, step_idx=-1)
-    _plan_foreground(sim, planner, config, state)
+    _plan_foreground(sim, planner, config, state, reseed=True)
 
     sim.controller.reset_phase0_exact_gain_probe(reset_published_gain=True)
 
@@ -466,6 +487,18 @@ def _empty_gain_result() -> dict[str, Any]:
     }
 
 
+def _reseed_this_step(args: argparse.Namespace, step_idx: int) -> bool:
+    if args.reseed_policy == "every":
+        return True
+    if args.reseed_policy == "periodic":
+        return step_idx % max(1, int(args.reseed_period)) == 0
+    if args.reseed_policy == "initial":
+        return step_idx == 0
+    if args.reseed_policy == "none":
+        return False
+    raise ValueError(f"unsupported reseed policy: {args.reseed_policy!r}")
+
+
 def _run_candidate(args: argparse.Namespace, candidate: Candidate) -> dict[str, Any]:
     planner, config, sim = _build_sim(args)
     probe = RollingGainProbe(sim.controller, args.gain_buffer_size, candidate.chunks)
@@ -479,6 +512,10 @@ def _run_candidate(args: argparse.Namespace, candidate: Candidate) -> dict[str, 
     errors: list[float] = []
     feedback_peaks: list[float] = []
     foreground_ms: list[float] = []
+    foreground_command_ms: list[float] = []
+    reseed_ms: list[float] = []
+    subset_select_ms: list[float] = []
+    snapshot_pack_ms: list[float] = []
     gain_work_ms: list[float] = []
     gain_grad_ms: list[float] = []
     gain_synth_ms: list[float] = []
@@ -512,7 +549,13 @@ def _run_candidate(args: argparse.Namespace, candidate: Candidate) -> dict[str, 
             jax.block_until_ready(sim.current_state_vec()),
             dtype=np.float64,
         )
-        plan = _plan_foreground(sim, planner, config, planning_state)
+        plan = _plan_foreground(
+            sim,
+            planner,
+            config,
+            planning_state,
+            reseed=_reseed_this_step(args, step_idx),
+        )
         gain_for_publish = np.asarray(jax.block_until_ready(probe.current_gain), dtype=np.float64)
 
         feedback_peak = 0.0
@@ -592,6 +635,10 @@ def _run_candidate(args: argparse.Namespace, candidate: Candidate) -> dict[str, 
         errors.append(_ee_error(planner, state_np))
         feedback_peaks.append(feedback_peak)
         foreground_ms.append(plan.foreground_ms)
+        foreground_command_ms.append(plan.command_ms)
+        reseed_ms.append(plan.reseed_ms)
+        subset_select_ms.append(gain_result["subset_select_ms"])
+        snapshot_pack_ms.append(gain_result["snapshot_pack_ms"])
         gain_work_ms.append(gain_result["gain_work_ms"])
         gain_grad_ms.append(gain_result["gain_grad_ms"])
         gain_synth_ms.append(gain_result["gain_synth_ms"])
@@ -612,6 +659,7 @@ def _run_candidate(args: argparse.Namespace, candidate: Candidate) -> dict[str, 
                 f"{candidate.label} step={step_idx:04d} "
                 f"err={errors[-1]:.4f}m "
                 f"fg={plan.foreground_ms:.2f}ms "
+                f"seed={plan.reseed_ms:.2f}ms "
                 f"gain={gain_result['gain_work_ms']:.2f}ms "
                 f"cycle={cycle_compute_ms[-1]:.2f}ms "
                 f"chunk={chunk_label} "
@@ -627,6 +675,10 @@ def _run_candidate(args: argparse.Namespace, candidate: Candidate) -> dict[str, 
             "errors": errors,
             "feedback_peaks": feedback_peaks,
             "foreground_ms": foreground_ms,
+            "foreground_command_ms": foreground_command_ms,
+            "reseed_ms": reseed_ms,
+            "subset_select_ms": subset_select_ms,
+            "snapshot_pack_ms": snapshot_pack_ms,
             "gain_work_ms": gain_work_ms,
             "gain_grad_ms": gain_grad_ms,
             "gain_synth_ms": gain_synth_ms,
@@ -675,6 +727,10 @@ def _summarize_candidate(
         "tail_error_mean_m": float(np.mean(errors[tail])),
         "tail_error_std_m": float(np.std(errors[tail])),
         "foreground_ms": _stats(series["foreground_ms"]),
+        "foreground_command_ms": _stats(series["foreground_command_ms"]),
+        "reseed_ms": _stats(series["reseed_ms"]),
+        "subset_select_ms": _stats(series["subset_select_ms"]),
+        "snapshot_pack_ms": _stats(series["snapshot_pack_ms"]),
         "gain_work_ms": _stats(series["gain_work_ms"]),
         "gain_grad_ms": _stats(series["gain_grad_ms"]),
         "gain_synth_ms": _stats([value for value in series["gain_synth_ms"] if value > 0.0]),
@@ -734,6 +790,7 @@ def _summarize_candidate(
         "joint_vel_hf_energy": _joint_vel_hf_energy(v[tail], args.dt),
         "tail_joint_spans": np.ptp(q[tail], axis=0).tolist(),
     }
+    summary["gain_timing_by_chunk"] = _gain_timing_by_chunk(series)
     summary["gate_failures"] = _gate_failures(summary)
     return {
         "label": candidate.label,
@@ -780,6 +837,20 @@ def _jsonify_series(series: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _gain_timing_by_chunk(series: dict[str, Any]) -> dict[str, dict[str, dict[str, float]]]:
+    chunks = np.asarray(series["chosen_chunks"], dtype=np.int64)
+    result: dict[str, dict[str, dict[str, float]]] = {}
+    for chunk in sorted(int(value) for value in np.unique(chunks) if value > 0):
+        mask = chunks == chunk
+        result[str(chunk)] = {
+            "subset_select_ms": _stats(np.asarray(series["subset_select_ms"])[mask]),
+            "snapshot_pack_ms": _stats(np.asarray(series["snapshot_pack_ms"])[mask]),
+            "gain_grad_ms": _stats(np.asarray(series["gain_grad_ms"])[mask]),
+            "gain_work_ms": _stats(np.asarray(series["gain_work_ms"])[mask]),
+        }
+    return result
+
+
 def _print_candidate_summary(result: dict[str, Any]) -> None:
     s = result["summary"]
     fails = s["gate_failures"]
@@ -793,6 +864,7 @@ def _print_candidate_summary(result: dict[str, Any]) -> None:
         f"{mark:5s} {result['label']:18s} "
         f"err_f={s['error_final_m'] * 1000.0:6.2f}mm "
         f"fg_p99={s['foreground_ms']['p99']:6.2f}ms "
+        f"seed_p99={s['reseed_ms']['p99']:5.2f}ms "
         f"gain_p99={s['gain_work_ms']['p99']:6.2f}ms "
         f"cycle_p99={s['cycle_compute_ms']['p99']:6.2f}ms "
         f"miss={s['cycle_budget_miss_count']:3d}/{len(result['series']['errors'])} "
@@ -845,6 +917,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--feedback", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--clip-torque", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--clip-velocity", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--reseed-policy",
+        choices=("every", "periodic", "initial", "none"),
+        default="every",
+        help=(
+            "Nominal trajectory reseeding policy for the foreground critical path. "
+            "'every' matches the current ROS default; 'initial' warm-starts from "
+            "the solver's shifted previous solution after the first measured step."
+        ),
+    )
+    parser.add_argument(
+        "--reseed-period",
+        type=int,
+        default=2,
+        help="Cycle period used only when --reseed-policy=periodic.",
+    )
     parser.add_argument("--gain-buffer-size", type=int, default=512)
     parser.add_argument("--chunk-sizes", type=parse_int_list, default=parse_int_list("32,64,128"))
     parser.add_argument("--adaptive-chunks", type=parse_int_list, default=parse_int_list(""))
@@ -866,6 +954,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--dt must be positive")
     if args.substeps <= 0:
         raise ValueError("--substeps must be positive")
+    if args.reseed_period <= 0:
+        raise ValueError("--reseed-period must be positive")
     if args.gain_buffer_size <= 0:
         raise ValueError("--gain-buffer-size must be positive")
     if not args.chunk_sizes and not args.adaptive_chunks:
@@ -894,7 +984,9 @@ def main(argv: list[str] | None = None) -> None:
         f"samples={args.samples} h={args.horizon} cp={args.control_points} "
         f"buffer={args.gain_buffer_size} chunks={args.chunk_sizes} "
         f"adaptive={args.adaptive_chunks} target={args.target_ms}ms "
-        f"safety={args.safety_margin_ms}ms mjx={args.mjx_opts}",
+        f"safety={args.safety_margin_ms}ms reseed={args.reseed_policy} "
+        f"reseed_period={args.reseed_period} "
+        f"mjx={args.mjx_opts}",
         flush=True,
     )
 
@@ -914,6 +1006,8 @@ def main(argv: list[str] | None = None) -> None:
             "dt": args.dt,
             "substeps": args.substeps,
             "timing_mode": args.timing_mode,
+            "reseed_policy": args.reseed_policy,
+            "reseed_period": args.reseed_period,
             "gain_buffer_size": args.gain_buffer_size,
             "chunk_sizes": args.chunk_sizes,
             "adaptive_chunks": args.adaptive_chunks,

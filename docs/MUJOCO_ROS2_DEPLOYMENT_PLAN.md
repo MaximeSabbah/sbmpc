@@ -1387,3 +1387,50 @@ record the reason here and update the plan section itself in the same commit.
   for standalone recording, or the launch arguments above for the normal
   workflow. During source-tree development, the modules can still be run
   directly with `PYTHONPATH=/workspace/sbmpc_ros/sbmpc_bringup`.
+
+### 2026-05-12 — Codex Timing Overhead Audit
+- Scope: Made the timing budget auditable enough to explain individual
+  millisecond losses before changing production behavior. The ROS diagnostics
+  now split the old opaque planner-step overhead into planner API wall time,
+  bridge/adapter residue, prepare/reseed time, JAX command time, tau
+  extraction, cached-gain fetch, optional task diagnostics, and output build.
+  Replay summaries include those fields when recorded by a rebuilt bridge.
+- Benchmark correction: `bench_gain_architecture.py` now counts nominal
+  reseeding in the foreground critical path, reports reseed time separately,
+  supports `--reseed-policy every|periodic|initial|none`, and summarizes gain
+  timing by selected chunk. Its adaptive chunk estimator now discards JAX
+  compilation before timing; the previous estimator could average compilation
+  into chunk estimates and therefore skip all gain work.
+- Reseed finding: A focused adapter probe showed the current
+  `reseed_every_step=True` prepare path costs about `1.8 ms` mean and about
+  `2.1 ms` p99. Disabling reseed after the first step reduced step wall time
+  from about `9.15 ms` to `7.32 ms`, but the closed-loop benchmark diverged to
+  NaNs by step 30. Periodic reseed every two cycles also failed the stability
+  gates (`feedback_peak≈60 Nm`, very large gain jump). Treat per-step reseed
+  as required until a faster equivalent nominal seeding method is designed and
+  passes the same closed-loop gates.
+- Gain chunk timing: Updated `bench_gain_microbatch.py` to time full
+  `select + pack + gradient` batches with p95/p99. On the current GPU after
+  warmup, full-batch p99 was about `14.46 ms` for 64 samples, `15.73 ms` for
+  128, `21.52 ms` for 256, and `25.94 ms` for 512. The relationship is not
+  smooth or linear, so adaptive scheduling should use a finite precompiled set
+  such as `{64,128}` rather than arbitrary sample counts.
+- Current measured tradeoff:
+  - 50 Hz, fixed `128/512`, reseed every step: cycle p99 `25.95 ms`; first
+    gain `0.06 s`; large enough misses that this is not a true 50 Hz fresh
+    planner path on this GPU.
+  - 50 Hz, fixed `64/512`, reseed every step: cycle p99 `24.01 ms`; first
+    gain `0.14 s`; smaller gain jumps (`dKmax≈0.84`) and lower timing cost.
+  - 25 ms budget, adaptive `{64,128}` with reseed every step: selected mostly
+    64-sample chunks, cycle p99 `23.55 ms`, no budget misses, first gain
+    `0.16 s`, and small gain jumps (`dKmax≈0.53`).
+  - 40 Hz-style `dt=0.025`, fixed `64/512`: cycle p99 `24.99 ms` with one
+    startup miss. Fixed `128/512` at the same setting reached cycle p99
+    `26.59 ms`, so 128 is not the conservative 40 Hz fallback on this GPU.
+- Next handoff: Keep production defaults behavior-compatible until a full ROS
+  replay is rerecorded with the new diagnostic fields. For timing recovery,
+  prioritize (1) a faster per-step nominal reseed equivalent, not removing
+  reseed, (2) 64-sample or adaptive `{64,128}` gain chunks for the 40 Hz
+  fallback, and (3) finite-shape adaptive scheduling with compilation-free
+  estimates. Do not claim a 50 Hz fresh planner path while gain refresh remains
+  in the same critical worker and full cycles measure above 20 ms.

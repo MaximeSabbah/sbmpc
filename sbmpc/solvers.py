@@ -727,6 +727,7 @@ class Controller:
             "gain_grad_ms": 0.0,
             "gain_synth_ms": 0.0,
             "gain_refresh_ms": 0.0,
+            "gain_refresh_wall_ms": 0.0,
             "gain_published": False,
             "source_cycle_id": None,
         }
@@ -831,10 +832,14 @@ class Controller:
 
         context = self._phase0_pending_context
         self._phase0_pending_context = None
+        refresh_wall_start = time.perf_counter()
         refresh, new_gains = self._refresh_exact_gain_context(
             context,
             self._phase0_exact_window,
         )
+        refresh["gain_refresh_wall_ms"] = (
+            time.perf_counter() - refresh_wall_start
+        ) * 1000.0
         if refresh["gain_published"]:
             self._set_current_gains(new_gains)
             self._phase0_last_published_cycle = context.cycle_id
@@ -872,6 +877,7 @@ class Controller:
                 "gain_grad_ms",
                 "gain_synth_ms",
                 "gain_refresh_ms",
+                "gain_refresh_wall_ms",
                 "gain_published",
                 "source_cycle_id",
             ):
@@ -956,10 +962,14 @@ class Controller:
                 self._async_pending_context = None
 
             try:
+                refresh_wall_start = time.perf_counter()
                 refresh, new_gains = self._refresh_exact_gain_context(
                     context,
                     self._async_exact_window,
                 )
+                refresh["gain_refresh_wall_ms"] = (
+                    time.perf_counter() - refresh_wall_start
+                ) * 1000.0
                 if refresh["gain_published"]:
                     self._set_current_gains(new_gains)
 
@@ -1026,6 +1036,7 @@ class Controller:
                     "gain_grad_ms",
                     "gain_synth_ms",
                     "gain_refresh_ms",
+                    "gain_refresh_wall_ms",
                     "gain_published",
                     "source_cycle_id",
                 ):

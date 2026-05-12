@@ -51,7 +51,19 @@ class PlannerDiagnostics:
     goal_position: np.ndarray
     gain_mode: str | None = None
     foreground_planning_time_ms: float | None = None
+    planner_api_wall_time_ms: float | None = None
+    planner_prepare_time_ms: float | None = None
+    planner_command_time_ms: float | None = None
+    planner_tau_extract_time_ms: float | None = None
+    planner_gain_fetch_time_ms: float | None = None
+    planner_task_diagnostics_time_ms: float | None = None
+    planner_output_build_time_ms: float | None = None
     background_gain_time_ms: float | None = None
+    background_gain_wall_time_ms: float | None = None
+    gain_subset_select_time_ms: float | None = None
+    gain_snapshot_pack_time_ms: float | None = None
+    gain_gradient_time_ms: float | None = None
+    gain_synthesis_time_ms: float | None = None
     async_gain_worker_running: bool = False
     async_gain_worker_error: str | None = None
     gain_age_cycles: float | None = None
@@ -148,6 +160,11 @@ def _async_gain_diagnostics(controller, gain_mode: str) -> dict[str, object]:
     if gain_mode != GAIN_MODE_EXACT_ASYNC_FEEDBACK:
         return {
             "background_gain_time_ms": None,
+            "background_gain_wall_time_ms": None,
+            "gain_subset_select_time_ms": None,
+            "gain_snapshot_pack_time_ms": None,
+            "gain_gradient_time_ms": None,
+            "gain_synthesis_time_ms": None,
             "async_gain_worker_running": False,
             "async_gain_worker_error": None,
             "gain_age_cycles": None,
@@ -159,6 +176,13 @@ def _async_gain_diagnostics(controller, gain_mode: str) -> dict[str, object]:
     status = controller.phase0_exact_gain_status()
     return {
         "background_gain_time_ms": _finite_or_none(status.get("gain_refresh_ms")),
+        "background_gain_wall_time_ms": _finite_or_none(
+            status.get("gain_refresh_wall_ms")
+        ),
+        "gain_subset_select_time_ms": _finite_or_none(status.get("subset_select_ms")),
+        "gain_snapshot_pack_time_ms": _finite_or_none(status.get("snapshot_pack_ms")),
+        "gain_gradient_time_ms": _finite_or_none(status.get("gain_grad_ms")),
+        "gain_synthesis_time_ms": _finite_or_none(status.get("gain_synth_ms")),
         "async_gain_worker_running": bool(status.get("worker_running", False)),
         "async_gain_worker_error": status.get("worker_error"),
         "gain_age_cycles": _finite_or_none(status.get("published_gain_age_cycles")),
@@ -201,7 +225,19 @@ def _diagnostics_with_gain(
     return replace(
         diagnostics,
         gain_norm=float(np.linalg.norm(gains)),
+        planner_api_wall_time_ms=diagnostics.planner_api_wall_time_ms,
+        planner_prepare_time_ms=diagnostics.planner_prepare_time_ms,
+        planner_command_time_ms=diagnostics.planner_command_time_ms,
+        planner_tau_extract_time_ms=diagnostics.planner_tau_extract_time_ms,
+        planner_gain_fetch_time_ms=diagnostics.planner_gain_fetch_time_ms,
+        planner_task_diagnostics_time_ms=diagnostics.planner_task_diagnostics_time_ms,
+        planner_output_build_time_ms=diagnostics.planner_output_build_time_ms,
         background_gain_time_ms=gain_diag["background_gain_time_ms"],
+        background_gain_wall_time_ms=gain_diag["background_gain_wall_time_ms"],
+        gain_subset_select_time_ms=gain_diag["gain_subset_select_time_ms"],
+        gain_snapshot_pack_time_ms=gain_diag["gain_snapshot_pack_time_ms"],
+        gain_gradient_time_ms=gain_diag["gain_gradient_time_ms"],
+        gain_synthesis_time_ms=gain_diag["gain_synthesis_time_ms"],
         async_gain_worker_running=gain_diag["async_gain_worker_running"],
         async_gain_worker_error=gain_diag["async_gain_worker_error"],
         gain_age_cycles=gain_diag["gain_age_cycles"],
@@ -343,6 +379,8 @@ class PandaPickAndPlaceController:
         num_steps: int | None = None,
         reset_guess: bool = False,
     ) -> PlannerOutput:
+        api_start = time.perf_counter()
+        prepare_start = time.perf_counter()
         phase = Phase(phase)
         q = self._joint_vector(q, self.planner.nq, "q")
         v = self._joint_vector(v, self.planner.nv, "v")
@@ -385,8 +423,10 @@ class PandaPickAndPlaceController:
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
+        planner_prepare_time_ms = 1000.0 * (time.perf_counter() - prepare_start)
 
         start_time = time.time_ns()
+        command_start = time.perf_counter()
         input_sequence = self.controller.command(
             state,
             self.planner.reference_vec,
@@ -396,10 +436,14 @@ class PandaPickAndPlaceController:
             capture_gain_context=self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK,
         )
         input_sequence = jax.block_until_ready(input_sequence)
+        planner_command_time_ms = 1000.0 * (time.perf_counter() - command_start)
         self._solution_initialized = True
         self._last_reference_signature = reference_signature
+        tau_start = time.perf_counter()
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
+        planner_tau_extract_time_ms = 1000.0 * (time.perf_counter() - tau_start)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
+        gain_fetch_start = time.perf_counter()
         gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
         with self._cached_gain_lock:
             cached_gains = self._cached_gains
@@ -414,7 +458,11 @@ class PandaPickAndPlaceController:
         with self._cached_gain_lock:
             self._cached_gains = gains
             self._cached_gain_completed_batch_count = completed_batch_count
+        planner_gain_fetch_time_ms = 1000.0 * (
+            time.perf_counter() - gain_fetch_start
+        )
 
+        task_diagnostics_start = time.perf_counter()
         position_error = None
         orientation_error = None
         if self._compute_task_diagnostics:
@@ -445,6 +493,10 @@ class PandaPickAndPlaceController:
                     )
                 )
             )
+        planner_task_diagnostics_time_ms = 1000.0 * (
+            time.perf_counter() - task_diagnostics_start
+        )
+        output_build_start = time.perf_counter()
         gripper_width = float(self.planner.gripper_target(phase))
         gripper_command = GripperCommand(
             action="open" if gripper_width >= self.planner.GRIPPER_OPEN else "close",
@@ -461,9 +513,16 @@ class PandaPickAndPlaceController:
             goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
             gain_mode=self.gain_mode,
             foreground_planning_time_ms=planning_time_ms,
+            planner_api_wall_time_ms=None,
+            planner_prepare_time_ms=planner_prepare_time_ms,
+            planner_command_time_ms=planner_command_time_ms,
+            planner_tau_extract_time_ms=planner_tau_extract_time_ms,
+            planner_gain_fetch_time_ms=planner_gain_fetch_time_ms,
+            planner_task_diagnostics_time_ms=planner_task_diagnostics_time_ms,
+            planner_output_build_time_ms=None,
             **gain_diag,
         )
-        return PlannerOutput(
+        output = PlannerOutput(
             tau_ff=tau_ff,
             K=gains,
             phase=phase,
@@ -471,6 +530,16 @@ class PandaPickAndPlaceController:
             gripper_command=gripper_command,
             diagnostics=diagnostics,
         )
+        planner_output_build_time_ms = 1000.0 * (
+            time.perf_counter() - output_build_start
+        )
+        planner_api_wall_time_ms = 1000.0 * (time.perf_counter() - api_start)
+        diagnostics = replace(
+            diagnostics,
+            planner_api_wall_time_ms=planner_api_wall_time_ms,
+            planner_output_build_time_ms=planner_output_build_time_ms,
+        )
+        return replace(output, diagnostics=diagnostics)
 
     def refresh_gain_if_budget(
         self,
@@ -763,6 +832,8 @@ class PandaPregraspController:
         num_steps: int | None = None,
         reset_guess: bool = False,
     ) -> FeedforwardOutput:
+        api_start = time.perf_counter()
+        prepare_start = time.perf_counter()
         del phase, object_pose, target_pose
         q = PandaPickAndPlaceController._joint_vector(q, self.planner.nq, "q")
         v = PandaPickAndPlaceController._joint_vector(v, self.planner.nv, "v")
@@ -783,9 +854,11 @@ class PandaPregraspController:
 
         if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
             self.start()
+        planner_prepare_time_ms = 1000.0 * (time.perf_counter() - prepare_start)
 
         reference = self.planner.reference
         start_time = time.time_ns()
+        command_start = time.perf_counter()
         input_sequence = self.controller.command(
             state,
             self.planner.reference_vec,
@@ -795,15 +868,23 @@ class PandaPregraspController:
             capture_gain_context=self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK,
         )
         input_sequence = jax.block_until_ready(input_sequence)
+        planner_command_time_ms = 1000.0 * (time.perf_counter() - command_start)
         self._solution_initialized = True
+        tau_start = time.perf_counter()
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
+        planner_tau_extract_time_ms = 1000.0 * (time.perf_counter() - tau_start)
         planning_time_ms = 1e-6 * (time.time_ns() - start_time)
+        gain_fetch_start = time.perf_counter()
         gain_diag = _async_gain_diagnostics(self.controller, self.gain_mode)
         with self._cached_gain_lock:
             cached_gains = self._cached_gains
         if cached_gains is None:
             cached_gains = _zero_gains_numpy(self.controller)
+        planner_gain_fetch_time_ms = 1000.0 * (
+            time.perf_counter() - gain_fetch_start
+        )
 
+        task_diagnostics_start = time.perf_counter()
         position_error = None
         orientation_error = None
         if self._compute_task_diagnostics:
@@ -825,6 +906,10 @@ class PandaPregraspController:
                     )
                 )
             )
+        planner_task_diagnostics_time_ms = 1000.0 * (
+            time.perf_counter() - task_diagnostics_start
+        )
+        output_build_start = time.perf_counter()
         diagnostics = PlannerDiagnostics(
             planning_time_ms=planning_time_ms,
             running_cost=running_cost,
@@ -836,15 +921,32 @@ class PandaPregraspController:
             goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
             gain_mode=self.gain_mode,
             foreground_planning_time_ms=planning_time_ms,
+            planner_api_wall_time_ms=None,
+            planner_prepare_time_ms=planner_prepare_time_ms,
+            planner_command_time_ms=planner_command_time_ms,
+            planner_tau_extract_time_ms=planner_tau_extract_time_ms,
+            planner_gain_fetch_time_ms=planner_gain_fetch_time_ms,
+            planner_task_diagnostics_time_ms=planner_task_diagnostics_time_ms,
+            planner_output_build_time_ms=None,
             **gain_diag,
         )
-        return FeedforwardOutput(
+        output = FeedforwardOutput(
             tau_ff=tau_ff,
             phase=self.PHASE_NAME,
             next_phase=self.PHASE_NAME,
             gripper_command=GripperCommand(action="open", width=self.GRIPPER_OPEN),
             diagnostics=diagnostics,
         )
+        planner_output_build_time_ms = 1000.0 * (
+            time.perf_counter() - output_build_start
+        )
+        planner_api_wall_time_ms = 1000.0 * (time.perf_counter() - api_start)
+        diagnostics = replace(
+            diagnostics,
+            planner_api_wall_time_ms=planner_api_wall_time_ms,
+            planner_output_build_time_ms=planner_output_build_time_ms,
+        )
+        return replace(output, diagnostics=diagnostics)
 
     def latest_gain(
         self,

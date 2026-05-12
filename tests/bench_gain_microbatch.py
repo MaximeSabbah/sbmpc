@@ -38,6 +38,8 @@ class TimingSummary:
     min_ms: float
     p50_ms: float
     p90_ms: float
+    p95_ms: float
+    p99_ms: float
     max_ms: float
     timings_ms: list[float]
 
@@ -152,6 +154,8 @@ def summarize(label: str, sample_count: int, direction_count: int | None, timing
         min_ms=float(np.min(values)),
         p50_ms=float(np.quantile(values, 0.50)),
         p90_ms=float(np.quantile(values, 0.90)),
+        p95_ms=float(np.quantile(values, 0.95)),
+        p99_ms=float(np.quantile(values, 0.99)),
         max_ms=float(np.max(values)),
         timings_ms=[float(value) for value in values.tolist()],
     )
@@ -180,11 +184,34 @@ def benchmark(args: argparse.Namespace) -> list[TimingSummary]:
     results: list[TimingSummary] = []
 
     for sample_count in args.sample_counts:
+        def select_pack():
+            indices = sample_indices_for_costs(context.nominal_costs, sample_count)
+            snapshot = controller._pack_exact_gain_snapshot(context, indices)
+            return snapshot.costs, snapshot.delta_u0, snapshot.control_variables
+
+        timings = time_call(
+            select_pack,
+            warmups=args.warmups,
+            repeats=args.repeats,
+        )
+        results.append(summarize("select_pack", sample_count, None, timings))
+
+        def full_batch():
+            indices = sample_indices_for_costs(context.nominal_costs, sample_count)
+            snapshot = controller._pack_exact_gain_snapshot(context, indices)
+            return controller._process_exact_gain_snapshot(snapshot).gradients
+
+        timings = time_call(
+            full_batch,
+            warmups=args.warmups,
+            repeats=args.repeats,
+        )
+        results.append(summarize("full_gain_batch", sample_count, None, timings))
+
         indices = sample_indices_for_costs(context.nominal_costs, sample_count)
         jax.block_until_ready(indices)
         snapshot = controller._pack_exact_gain_snapshot(context, indices)
         jax.block_until_ready(snapshot.control_variables)
-
         def full_gradient():
             return controller._process_exact_gain_snapshot(snapshot).gradients
 
@@ -252,7 +279,8 @@ def main(argv: list[str] | None = None) -> None:
             f"{result.label:24s} samples={result.sample_count:3d} "
             f"dirs={str(result.direction_count):>4s} "
             f"mean={result.mean_ms:7.3f}ms p50={result.p50_ms:7.3f}ms "
-            f"p90={result.p90_ms:7.3f}ms max={result.max_ms:7.3f}ms"
+            f"p95={result.p95_ms:7.3f}ms p99={result.p99_ms:7.3f}ms "
+            f"max={result.max_ms:7.3f}ms"
         )
     print(json.dumps([asdict(result) for result in results], indent=2))
 
