@@ -712,24 +712,17 @@ class PandaPregraspController:
         compute_running_cost: bool = True,
         compute_task_diagnostics: bool = True,
         ocp_config=None,
-        seed_pace_velocity_fraction=None,
     ) -> None:
         self.planner = PandaPregraspPlanner() if planner is None else planner
         if ocp_config is None:
             ocp_config = load_ocp_config("pregrasp")
         self.objective = PandaPregraspObjective(self.planner, ocp_config=ocp_config)
-        # Optional velocity-paced warm-start seed. Explicit arg overrides the OCP's
-        # field; None/<=0 keeps the original within-horizon seed (off by default).
-        pace_fraction = (
-            seed_pace_velocity_fraction
-            if seed_pace_velocity_fraction is not None
-            else getattr(ocp_config, "seed_pace_velocity_fraction", None)
-        )
-        self._seed_pace_velocity = (
-            None
-            if pace_fraction is None or pace_fraction <= 0.0
-            else jnp.asarray(pace_fraction, dtype=jnp.float32) * self.planner.velocity_limits
-        )
+        if reseed_every_step:
+            raise ValueError(
+                "reseed_every_step is no longer supported for pregrasp. "
+                "Use torque-limit-scaled MPPI sampling and let the receding-horizon "
+                "solution carry itself forward."
+            )
         self.config = (
             make_panda_pregrasp_config(
                 self.planner,
@@ -748,7 +741,6 @@ class PandaPregraspController:
         )
         self._default_num_steps = self._validate_num_steps(num_steps)
         self._solution_initialized = False
-        self._reseed_every_step = reseed_every_step
         self._started = False
         self._async_warmup_complete = False
         self._compute_running_cost = compute_running_cost
@@ -858,8 +850,8 @@ class PandaPregraspController:
         effective_num_steps = self._default_num_steps if num_steps is None else num_steps
         effective_num_steps = self._validate_num_steps(effective_num_steps)
         reset_gain_state = reset_guess or not self._solution_initialized
-        if reset_guess or self._reseed_every_step or not self._solution_initialized:
-            self._seed_nominal_solution(state)
+        if reset_guess or not self._solution_initialized:
+            self._seed_gravity_comp_solution(state)
         if reset_gain_state:
             self.controller.reset_published_gains()
             if self.gain_mode == GAIN_MODE_EXACT_ASYNC_FEEDBACK:
@@ -1039,12 +1031,13 @@ class PandaPregraspController:
         predicted = np.asarray(jax.block_until_ready(predicted), dtype=np.float32)
         return predicted[: self.planner.nq], predicted[self.planner.nq :]
 
-    def _seed_nominal_solution(self, state: jax.Array) -> None:
-        self.controller.sampler.optimal_samples = self.planner.nominal_torque_sequence_from_state(
-            state,
-            self.config.MPC.horizon,
-            self.config.MPC.dt,
-            pace_velocity=self._seed_pace_velocity,
+    def _seed_gravity_comp_solution(self, state: jax.Array) -> None:
+        q = jnp.asarray(state[: self.planner.nq], dtype=jnp.float32)
+        tau = self.planner.gravity_torques(q)
+        tau = jnp.clip(tau, -self.planner.torque_limits, self.planner.torque_limits)
+        self.controller.sampler.optimal_samples = jnp.tile(
+            tau.astype(jnp.float32),
+            (self.config.MPC.horizon, 1),
         )
 
     def _warmup_exact_async_until_ready(

@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sbmpc.examples.franka_emika_panda.planner_api import PandaPickAndPlaceController, PandaPregraspController, TaskPose
 from sbmpc.examples.franka_emika_panda.panda_pregrasp import PandaPregraspPlanner, make_panda_pregrasp_config
@@ -244,7 +245,7 @@ def test_panda_pregrasp_controller_can_skip_task_diagnostics() -> None:
     assert output.diagnostics.goal_position.shape == (3,)
 
 
-def test_panda_pregrasp_controller_reuses_solution_guess() -> None:
+def test_panda_pregrasp_controller_does_not_use_cubic_trajectory_seed() -> None:
     controller = build_pregrasp_controller(gains=True)
     call_count = 0
     original = controller.planner.nominal_torque_sequence_from_state
@@ -261,10 +262,10 @@ def test_panda_pregrasp_controller_reuses_solution_guess() -> None:
     controller.step(q, v)
     controller.step(q, v)
 
-    assert call_count == 1
+    assert call_count == 0
 
 
-def test_panda_pregrasp_controller_can_reseed_every_step() -> None:
+def test_panda_pregrasp_controller_rejects_per_step_trajectory_reseed() -> None:
     planner = PandaPregraspPlanner()
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
     config.MPC.horizon = 4
@@ -272,29 +273,13 @@ def test_panda_pregrasp_controller_can_reseed_every_step() -> None:
     config.MPC.num_control_points = 2
     config.MPC.gain_samples_per_cycle = 4
     config.MPC.gain_buffer_size = 8
-    controller = track_controller(
+
+    with pytest.raises(ValueError, match="reseed_every_step"):
         PandaPregraspController(
             planner=planner,
             config=config,
             reseed_every_step=True,
         )
-    )
-    call_count = 0
-    original = controller.planner.nominal_torque_sequence_from_state
-
-    def wrapped(state, horizon, dt):
-        nonlocal call_count
-        call_count += 1
-        return original(state, horizon, dt)
-
-    controller.planner.nominal_torque_sequence_from_state = wrapped
-
-    q = controller.planner.home_q
-    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
-    controller.step(q, v)
-    controller.step(q, v)
-
-    assert call_count == 2
 
 
 def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:
@@ -348,7 +333,7 @@ def test_panda_pregrasp_controller_exact_async_mode_does_not_start_worker() -> N
     assert not controller.controller.background_gain_status()["worker_running"]
 
 
-def test_panda_pregrasp_controller_reset_runtime_state_after_warmup_reseeds_next_step() -> None:
+def test_panda_pregrasp_controller_reset_runtime_state_after_warmup_keeps_optimizer_first_seed() -> None:
     planner = PandaPregraspPlanner()
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
     config.MPC.horizon = 4
@@ -394,4 +379,4 @@ def test_panda_pregrasp_controller_reset_runtime_state_after_warmup_reseeds_next
     controller.planner.nominal_torque_sequence_from_state = wrapped
     controller.step(q, v)
 
-    assert call_count == 1
+    assert call_count == 0

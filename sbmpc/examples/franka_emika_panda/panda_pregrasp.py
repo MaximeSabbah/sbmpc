@@ -414,23 +414,25 @@ def make_panda_pregrasp_config(
 
     config.MPC.dt = 0.02
     config.MPC.lambda_mpc = 0.05
-    config.MPC.std_dev_mppi = 0.05 * planner.torque_limits
+    # Optimizer-first default: explore the full admissible torque box. The
+    # applied controls are still clipped by robot.input_min/input_max.
+    config.MPC.std_dev_mppi = planner.torque_limits
     config.MPC.smoothing = "Spline"
     config.MPC.gains = gains
     if gains:
-        config.MPC.horizon = 8
-        config.MPC.num_parallel_computations = 1024
-        config.MPC.num_control_points = 8
+        config.MPC.horizon = 24
+        config.MPC.num_parallel_computations = 4096
+        config.MPC.num_control_points = 12
         config.MPC.gain_method = "exact"
-        config.MPC.gain_samples_per_cycle = 128
+        config.MPC.gain_samples_per_cycle = 512
         config.MPC.gain_buffer_size = 512
     else:
-        config.MPC.horizon = 16
-        config.MPC.num_parallel_computations = 32
-        config.MPC.num_control_points = 4
-    config.MPC.initial_guess = planner.nominal_torque_sequence(
-        config.MPC.horizon,
-        config.MPC.dt,
+        config.MPC.horizon = 24
+        config.MPC.num_parallel_computations = 4096
+        config.MPC.num_control_points = 12
+    config.MPC.initial_guess = jnp.zeros(
+        (config.MPC.horizon, planner.nu),
+        dtype=jnp.float32,
     )
 
     config.solver_dynamics = DynamicsModel.CUSTOM

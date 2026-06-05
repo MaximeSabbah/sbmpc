@@ -47,11 +47,6 @@ class OCPConfig:
     running_terms: tuple[TermSpec, ...]
     terminal_terms: tuple[TermSpec, ...]
     n_weights: int = 0
-    # Velocity-pace the receding-horizon warm-start seed at this fraction of the
-    # joint velocity limit (None/<=0 = reach within the horizon, the original
-    # behavior). This is the dominant lever on reach aggressiveness — cost weights
-    # barely move the feedforward because MPPI only perturbs the seed by ~std_dev.
-    seed_pace_velocity_fraction: float | None = None
 
 
 def _term_specs(items: list[dict[str, Any]] | None) -> tuple[TermSpec, ...]:
@@ -72,13 +67,11 @@ def _term_specs(items: list[dict[str, Any]] | None) -> tuple[TermSpec, ...]:
 
 
 def ocp_config_from_dict(data: dict[str, Any], *, default_name: str = "ocp") -> OCPConfig:
-    pace = data.get("seed_pace_velocity_fraction")
     return OCPConfig(
         name=str(data.get("name", default_name)),
         running_terms=_term_specs(data.get("running_terms")),
         terminal_terms=_term_specs(data.get("terminal_terms")),
         n_weights=int(data.get("n_weights", 0)),
-        seed_pace_velocity_fraction=None if pace is None else float(pace),
     )
 
 

@@ -4,11 +4,6 @@
 name: pregrasp
 n_weights: 0
 
-# Optional: velocity-pace the warm-start seed at this fraction of the joint
-# velocity limit. It strongly reduces reach aggressiveness, but it also dictates
-# the trajectory (MPPI then mostly tracks the seed) — kept OFF by default while we
-# prefer letting the optimizer resolve the reach. Set e.g. 0.6 to enable.
-seed_pace_velocity_fraction: null
 
 running_terms:
   - {name: ee_translation_xy, weight: 120.0}

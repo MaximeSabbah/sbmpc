@@ -91,9 +91,9 @@ if __name__ == "__main__":
         value is not None
         for value in (args.horizon, args.samples, args.control_points)
     ):
-        config.MPC.initial_guess = planner.nominal_torque_sequence(
-            config.MPC.horizon,
-            config.MPC.dt,
+        config.MPC.initial_guess = jnp.zeros(
+            (config.MPC.horizon, planner.nu),
+            dtype=jnp.float32,
         )
 
     sim = build_all(
