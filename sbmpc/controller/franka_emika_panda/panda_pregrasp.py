@@ -389,11 +389,38 @@ class PandaPregraspObjective(FactoryObjective):
         return self.planner.reference_vec
 
 
+def _initial_guess(planner: PandaPregraspPlanner, mpc) -> jax.Array:
+    """Warm start for the MPPI control sequence (shape (horizon, nu)).
+
+    ``zeros`` = apply nothing (the optimizer must find everything, incl. gravity).
+    ``gravity`` = hold against gravity at the home pose — a stable starting point,
+    NOT a trajectory to the goal; the optimizer still resolves the reach.
+    """
+    if mpc.initial_guess == "gravity":
+        g = jnp.asarray(planner.gravity_torques(planner.home_q), dtype=jnp.float32)
+        return jnp.tile(g, (mpc.horizon, 1))
+    if mpc.initial_guess == "zeros":
+        return jnp.zeros((mpc.horizon, planner.nu), dtype=jnp.float32)
+    raise ValueError(f"unknown initial_guess '{mpc.initial_guess}' (use 'zeros' or 'gravity').")
+
+
 def make_panda_pregrasp_config(
     planner: PandaPregraspPlanner,
     visualize: bool = True,
-    gains: bool = True,
+    gains: bool | None = None,
+    ocp=None,
 ) -> Config:
+    """Build the sbmpc Config from the OCP yaml (``mpc:`` / ``sim:`` sections).
+
+    All MPPI/solver/sim knobs come from the OCP (default: ``pregrasp.yaml``), so the
+    controller is tuned by editing the yaml. ``gains`` overrides the yaml's
+    ``mpc.gains`` when given (the ROS/controller API uses this); ``None`` = use yaml.
+    """
+    if ocp is None:
+        ocp = load_ocp_config("pregrasp")
+    mpc, sim = ocp.mpc, ocp.sim
+    use_gains = mpc.gains if gains is None else gains
+
     robot_config = RobotConfig()
     robot_config.robot_scene_path = planner.scene_path
     robot_config.mjx_kinematic = False
@@ -407,33 +434,24 @@ def make_panda_pregrasp_config(
     config = Config(robot_config)
     config.general.visualize = visualize
     config.general.verbose = False
-    config.general.integrator_type = "si_euler"
+    config.general.integrator_type = sim.integrator
 
-    config.sim.dt = 0.02
-    config.sim_iterations = 400
+    config.sim.dt = sim.dt
+    config.sim_iterations = sim.iterations
 
-    config.MPC.dt = 0.02
-    config.MPC.lambda_mpc = 0.05
-    # Optimizer-first default: explore the full admissible torque box. The
-    # applied controls are still clipped by robot.input_min/input_max.
-    config.MPC.std_dev_mppi = planner.torque_limits
-    config.MPC.smoothing = "Spline"
-    config.MPC.gains = gains
-    if gains:
-        config.MPC.horizon = 24
-        config.MPC.num_parallel_computations = 4096
-        config.MPC.num_control_points = 12
+    config.MPC.dt = mpc.dt
+    config.MPC.horizon = mpc.horizon
+    config.MPC.num_parallel_computations = mpc.num_samples
+    config.MPC.num_control_points = mpc.num_control_points
+    config.MPC.lambda_mpc = mpc.lambda_mpc
+    config.MPC.std_dev_mppi = mpc.std_dev_scale * planner.torque_limits
+    config.MPC.smoothing = mpc.smoothing
+    config.MPC.gains = use_gains
+    if use_gains:
         config.MPC.gain_method = "exact"
-        config.MPC.gain_samples_per_cycle = 512
-        config.MPC.gain_buffer_size = 512
-    else:
-        config.MPC.horizon = 24
-        config.MPC.num_parallel_computations = 4096
-        config.MPC.num_control_points = 12
-    config.MPC.initial_guess = jnp.zeros(
-        (config.MPC.horizon, planner.nu),
-        dtype=jnp.float32,
-    )
+        config.MPC.gain_samples_per_cycle = mpc.gain_samples_per_cycle
+        config.MPC.gain_buffer_size = mpc.gain_buffer_size
+    config.MPC.initial_guess = _initial_guess(planner, mpc)
 
     config.solver_dynamics = DynamicsModel.CUSTOM
     config.sim_dynamics = DynamicsModel.CUSTOM

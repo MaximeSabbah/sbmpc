@@ -728,6 +728,7 @@ class PandaPregraspController:
                 self.planner,
                 visualize=visualize,
                 gains=gains,
+                ocp=ocp_config,
             )
             if config is None
             else config

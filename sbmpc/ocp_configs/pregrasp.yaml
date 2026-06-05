@@ -1,9 +1,26 @@
-# PREGRASP OCP cost — weights equal to the original hand-rolled
-# PandaPregraspObjective (behavior-preserving default). Tune by editing weights;
-# new opt-in terms (mechanical_power, ...) can be added with their weight.
+# PREGRASP controller config 
 name: pregrasp
 n_weights: 0
 
+# --- MPPI / solver knobs ---
+mpc:
+  horizon: 24
+  num_samples: 1024          # parallel MPPI rollouts
+  num_control_points: 12     # spline control points (<= horizon)
+  dt: 0.02
+  lambda: 0.05               # temperature: higher = greedier (commits), lower = averages
+  std_dev_scale: 1.0         # sampling std-dev = std_dev_scale * torque_limit
+  smoothing: Spline          # Spline | null
+  initial_guess: gravity     # warm start: zeros | gravity (hold against gravity)
+  gains: true                # compute F-MPPI feedback gains (slower)
+  gain_samples_per_cycle: 64
+  gain_buffer_size: 256
+
+# --- closed-loop sandbox (scripts/panda_pregrasp.py) ---
+sim:
+  dt: 0.02
+  iterations: 400
+  integrator: si_euler
 
 running_terms:
   - {name: ee_translation_xy, weight: 120.0}

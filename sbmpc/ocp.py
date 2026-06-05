@@ -42,11 +42,39 @@ class TermSpec:
 
 
 @dataclass(frozen=True)
+class MpcSpec:
+    """MPPI / solver hyperparameters (the ``mpc:`` yaml section)."""
+
+    horizon: int = 24
+    num_samples: int = 4096          # MPC.num_parallel_computations
+    num_control_points: int = 12
+    dt: float = 0.02
+    lambda_mpc: float = 0.05         # yaml key: ``lambda``
+    std_dev_scale: float = 1.0       # std_dev_mppi = std_dev_scale * torque_limits
+    smoothing: str | None = "Spline"
+    initial_guess: str = "zeros"     # warm start: "zeros" | "gravity"
+    gains: bool = False
+    gain_samples_per_cycle: int = 512
+    gain_buffer_size: int = 512
+
+
+@dataclass(frozen=True)
+class SimSpec:
+    """Closed-loop sandbox settings (the ``sim:`` yaml section)."""
+
+    dt: float = 0.02
+    iterations: int = 400
+    integrator: str = "si_euler"
+
+
+@dataclass(frozen=True)
 class OCPConfig:
     name: str
     running_terms: tuple[TermSpec, ...]
     terminal_terms: tuple[TermSpec, ...]
     n_weights: int = 0
+    mpc: MpcSpec = field(default_factory=MpcSpec)
+    sim: SimSpec = field(default_factory=SimSpec)
 
 
 def _term_specs(items: list[dict[str, Any]] | None) -> tuple[TermSpec, ...]:
@@ -66,12 +94,47 @@ def _term_specs(items: list[dict[str, Any]] | None) -> tuple[TermSpec, ...]:
     return tuple(specs)
 
 
+def _normalize_smoothing(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in {"", "none", "null", "off"} else text
+
+
+def _mpc_spec(d: dict[str, Any] | None) -> MpcSpec:
+    d = d or {}
+    return MpcSpec(
+        horizon=int(d.get("horizon", MpcSpec.horizon)),
+        num_samples=int(d.get("num_samples", MpcSpec.num_samples)),
+        num_control_points=int(d.get("num_control_points", MpcSpec.num_control_points)),
+        dt=float(d.get("dt", MpcSpec.dt)),
+        lambda_mpc=float(d.get("lambda", MpcSpec.lambda_mpc)),
+        std_dev_scale=float(d.get("std_dev_scale", MpcSpec.std_dev_scale)),
+        smoothing=_normalize_smoothing(d.get("smoothing", MpcSpec.smoothing)),
+        initial_guess=str(d.get("initial_guess", MpcSpec.initial_guess)),
+        gains=bool(d.get("gains", MpcSpec.gains)),
+        gain_samples_per_cycle=int(d.get("gain_samples_per_cycle", MpcSpec.gain_samples_per_cycle)),
+        gain_buffer_size=int(d.get("gain_buffer_size", MpcSpec.gain_buffer_size)),
+    )
+
+
+def _sim_spec(d: dict[str, Any] | None) -> SimSpec:
+    d = d or {}
+    return SimSpec(
+        dt=float(d.get("dt", SimSpec.dt)),
+        iterations=int(d.get("iterations", SimSpec.iterations)),
+        integrator=str(d.get("integrator", SimSpec.integrator)),
+    )
+
+
 def ocp_config_from_dict(data: dict[str, Any], *, default_name: str = "ocp") -> OCPConfig:
     return OCPConfig(
         name=str(data.get("name", default_name)),
         running_terms=_term_specs(data.get("running_terms")),
         terminal_terms=_term_specs(data.get("terminal_terms")),
         n_weights=int(data.get("n_weights", 0)),
+        mpc=_mpc_spec(data.get("mpc")),
+        sim=_sim_spec(data.get("sim")),
     )
 
 
