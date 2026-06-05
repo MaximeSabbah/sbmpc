@@ -12,7 +12,8 @@ from mujoco import mjx
 from robot_descriptions.panda_description import URDF_PATH as PANDA_URDF_PATH
 
 from sbmpc.settings import Config, DynamicsModel, RobotConfig
-from sbmpc.solvers import BaseObjective
+from sbmpc.costs import FactoryObjective
+from sbmpc.ocp import build_cost_model, load_ocp_config
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -341,101 +342,25 @@ class PandaPregraspPlanner:
         return features[:3], features[3:6], features[6:9]
 
 
-class PandaPregraspObjective(BaseObjective):
-    """Pregrasp objective shaped after Hydrax's first pick-and-place phase."""
+class PandaPregraspObjective(FactoryObjective):
+    """Pregrasp objective assembled from the declarative ``pregrasp`` OCP.
 
-    def __init__(self, planner: PandaPregraspPlanner):
-        super().__init__()
+    Defaults reproduce the original hand-rolled weights (see
+    ``sbmpc/ocp_configs/pregrasp.yaml``). Pass ``ocp_config`` to retune the cost
+    without changing code.
+    """
+
+    def __init__(self, planner: PandaPregraspPlanner, ocp_config=None):
         self.planner = planner
         self.nq = planner.nq
         self.nv = planner.nv
+        if ocp_config is None:
+            ocp_config = load_ocp_config("pregrasp")
+        self.ocp_config = ocp_config
+        super().__init__(build_cost_model(ocp_config, planner))
 
     def reference_vector(self) -> jax.Array:
         return self.planner.reference_vec
-
-    def _goal_pos(self, reference: jax.Array) -> jax.Array:
-        return reference[:3]
-
-    def _goal_q(self, reference: jax.Array) -> jax.Array:
-        return reference[3 : 3 + self.nq]
-
-    def _goal_x_axis(self, reference: jax.Array) -> jax.Array:
-        start = 3 + self.nq
-        return reference[start : start + 3]
-
-    def _goal_z_axis(self, reference: jax.Array) -> jax.Array:
-        start = 6 + self.nq
-        return reference[start : start + 3]
-
-    def _goal_tau(self, reference: jax.Array) -> jax.Array:
-        start = 9 + self.nq
-        return reference[start : start + self.nv]
-
-    def _axis_alignment_cost(
-        self, axis: jax.Array, target_axis: jax.Array
-    ) -> jax.Array:
-        return 1.0 - jnp.clip(jnp.dot(axis, target_axis), -1.0, 1.0)
-
-    def _smooth_norm(self, vec: jax.Array) -> jax.Array:
-        return jnp.sqrt(jnp.sum(jnp.square(vec)) + 1e-8)
-
-    def running_cost(
-        self, state: jax.Array, inputs: jax.Array, reference: jax.Array
-    ) -> jax.Array:
-        q = state[: self.nq]
-        v = state[self.nq :]
-
-        goal_pos = self._goal_pos(reference)
-        goal_q = self._goal_q(reference)
-        goal_x = self._goal_x_axis(reference)
-        goal_z = self._goal_z_axis(reference)
-        goal_tau = self._goal_tau(reference)
-
-        ee_pos, ee_x, ee_z = self.planner.ee_features(q)
-
-        pos_err = goal_pos - ee_pos
-        xy_err = self._smooth_norm(pos_err[:2])
-        z_err = jnp.abs(pos_err[2])
-        orientation_cost = self._axis_alignment_cost(
-            ee_z, goal_z
-        ) + 0.5 * self._axis_alignment_cost(ee_x, goal_x)
-        posture_cost = jnp.sum(jnp.square(q - goal_q))
-        torque_scale = jnp.maximum(self.planner.torque_limits, 1.0)
-        control_cost = jnp.sum(jnp.square((inputs - goal_tau) / torque_scale))
-        velocity_cost = jnp.sum(jnp.square(v))
-
-        return jnp.asarray(
-            120.0 * xy_err
-            + 90.0 * z_err
-            + 70.0 * orientation_cost
-            + 12.0 * posture_cost
-            + 0.25 * control_cost
-            + 0.1 * velocity_cost,
-            dtype=jnp.float32,
-        )
-
-    def final_cost(self, state: jax.Array, reference: jax.Array) -> jax.Array:
-        q = state[: self.nq]
-        v = state[self.nq :]
-
-        goal_pos = self._goal_pos(reference)
-        goal_q = self._goal_q(reference)
-        goal_x = self._goal_x_axis(reference)
-        goal_z = self._goal_z_axis(reference)
-
-        ee_pos, ee_x, ee_z = self.planner.ee_features(q)
-
-        orientation_cost = self._axis_alignment_cost(
-            ee_z, goal_z
-        ) + 0.5 * self._axis_alignment_cost(ee_x, goal_x)
-
-        return jnp.asarray(
-            1500.0 * jnp.sum(jnp.square(goal_pos - ee_pos))
-            + 220.0 * orientation_cost
-            + 90.0 * jnp.sum(jnp.square(q - goal_q))
-            + 15.0 * jnp.sum(jnp.square(v)),
-            dtype=jnp.float32,
-        )
 
 
 def make_panda_pregrasp_config(

@@ -1,0 +1,20 @@
+# PICK-AND-PLACE OCP cost — weights equal to the original hand-rolled
+# PandaPickAndPlaceObjective. Per-phase scaling comes from the 6-vector packed
+# into the reference (ref_weight_index selects the component):
+#   0: ee, 1: orientation, 2: posture, 3: control, 4: velocity, 5: final_position
+name: pick_and_place
+n_weights: 6
+
+running_terms:
+  - {name: ee_translation_xy, weight: 100.0, ref_weight_index: 0}
+  - {name: ee_translation_z, weight: 70.0, ref_weight_index: 0}
+  - {name: orientation, weight: 70.0, ref_weight_index: 1, params: {x_axis_weight: 0.5}}
+  - {name: posture, weight: 1.0, ref_weight_index: 2}
+  - {name: control_regularization, weight: 1.0, ref_weight_index: 3}
+  - {name: joint_velocity, weight: 1.0, ref_weight_index: 4}
+
+terminal_terms:
+  - {name: ee_position_sq, weight: 1.0, ref_weight_index: 5}
+  - {name: orientation, weight: 220.0, ref_weight_index: 1, params: {x_axis_weight: 0.5}}
+  - {name: posture, weight: 90.0}
+  - {name: joint_velocity, weight: 15.0}

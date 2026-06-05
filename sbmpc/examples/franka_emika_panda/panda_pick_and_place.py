@@ -9,7 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from sbmpc.settings import Config, DynamicsModel, RobotConfig
-from sbmpc.solvers import BaseObjective
+from sbmpc.costs import FactoryObjective
+from sbmpc.ocp import build_cost_model, load_ocp_config
 
 from .panda_pregrasp import PandaPregraspPlanner
 
@@ -366,93 +367,24 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
         return self.phase == Phase.DONE
 
 
-class PandaPickAndPlaceObjective(BaseObjective):
-    """Phase-conditioned arm objective for scripted pick-and-place."""
+class PandaPickAndPlaceObjective(FactoryObjective):
+    """Phase-conditioned arm objective assembled from the ``pick_and_place`` OCP.
 
-    def __init__(self, planner: PandaPickAndPlacePlanner):
-        super().__init__()
+    Per-phase weights are carried in the reference (6-vector); defaults reproduce
+    the original hand-rolled weights (see ``sbmpc/ocp_configs/pick_and_place.yaml``).
+    """
+
+    def __init__(self, planner: PandaPickAndPlacePlanner, ocp_config=None):
         self.planner = planner
         self.nq = planner.nq
         self.nv = planner.nv
+        if ocp_config is None:
+            ocp_config = load_ocp_config("pick_and_place")
+        self.ocp_config = ocp_config
+        super().__init__(build_cost_model(ocp_config, planner))
 
     def reference_vector(self, phase: Phase | None = None) -> jax.Array:
         return self.planner.reference_vector(phase)
-
-    def _goal_pos(self, reference: jax.Array) -> jax.Array:
-        return reference[:3]
-
-    def _goal_q(self, reference: jax.Array) -> jax.Array:
-        return reference[3 : 3 + self.nq]
-
-    def _goal_x_axis(self, reference: jax.Array) -> jax.Array:
-        start = 3 + self.nq
-        return reference[start : start + 3]
-
-    def _goal_z_axis(self, reference: jax.Array) -> jax.Array:
-        start = 6 + self.nq
-        return reference[start : start + 3]
-
-    def _goal_tau(self, reference: jax.Array) -> jax.Array:
-        start = 9 + self.nq
-        return reference[start : start + self.nv]
-
-    def _weights(self, reference: jax.Array) -> jax.Array:
-        start = 9 + self.nq + self.nv
-        return reference[start : start + 6]
-
-    def _axis_alignment_cost(self, axis: jax.Array, target_axis: jax.Array) -> jax.Array:
-        return 1.0 - jnp.clip(jnp.dot(axis, target_axis), -1.0, 1.0)
-
-    def _smooth_norm(self, vec: jax.Array) -> jax.Array:
-        return jnp.sqrt(jnp.sum(jnp.square(vec)) + 1e-8)
-
-    def running_cost(self, state: jax.Array, inputs: jax.Array, reference: jax.Array) -> jax.Array:
-        q = state[: self.nq]
-        v = state[self.nq :]
-        goal_pos = self._goal_pos(reference)
-        goal_q = self._goal_q(reference)
-        goal_x = self._goal_x_axis(reference)
-        goal_z = self._goal_z_axis(reference)
-        goal_tau = self._goal_tau(reference)
-        ee_w, ori_w, posture_w, control_w, velocity_w, _ = self._weights(reference)
-
-        ee_pos, ee_x, ee_z = self.planner.ee_features(q)
-        pos_err = goal_pos - ee_pos
-        ee_cost = 100.0 * self._smooth_norm(pos_err[:2]) + 70.0 * jnp.abs(pos_err[2])
-        orientation_cost = self._axis_alignment_cost(ee_z, goal_z) + 0.5 * self._axis_alignment_cost(ee_x, goal_x)
-        posture_cost = jnp.sum(jnp.square(q - goal_q))
-        torque_scale = jnp.maximum(self.planner.torque_limits, 1.0)
-        control_cost = jnp.sum(jnp.square((inputs - goal_tau) / torque_scale))
-        velocity_cost = jnp.sum(jnp.square(v))
-
-        return jnp.asarray(
-            ee_w * ee_cost
-            + 70.0 * ori_w * orientation_cost
-            + posture_w * posture_cost
-            + control_w * control_cost
-            + velocity_w * velocity_cost,
-            dtype=jnp.float32,
-        )
-
-    def final_cost(self, state: jax.Array, reference: jax.Array) -> jax.Array:
-        q = state[: self.nq]
-        v = state[self.nq :]
-        goal_pos = self._goal_pos(reference)
-        goal_q = self._goal_q(reference)
-        goal_x = self._goal_x_axis(reference)
-        goal_z = self._goal_z_axis(reference)
-        _, ori_w, _, _, _, final_pos_w = self._weights(reference)
-
-        ee_pos, ee_x, ee_z = self.planner.ee_features(q)
-        orientation_cost = self._axis_alignment_cost(ee_z, goal_z) + 0.5 * self._axis_alignment_cost(ee_x, goal_x)
-
-        return jnp.asarray(
-            final_pos_w * jnp.sum(jnp.square(goal_pos - ee_pos))
-            + 220.0 * ori_w * orientation_cost
-            + 90.0 * jnp.sum(jnp.square(q - goal_q))
-            + 15.0 * jnp.sum(jnp.square(v)),
-            dtype=jnp.float32,
-        )
 
 
 def make_panda_pick_and_place_config(

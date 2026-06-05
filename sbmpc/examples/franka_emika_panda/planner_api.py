@@ -710,9 +710,10 @@ class PandaPregraspController:
         gain_mode: str | None = None,
         compute_running_cost: bool = True,
         compute_task_diagnostics: bool = True,
+        ocp_config=None,
     ) -> None:
         self.planner = PandaPregraspPlanner() if planner is None else planner
-        self.objective = PandaPregraspObjective(self.planner)
+        self.objective = PandaPregraspObjective(self.planner, ocp_config=ocp_config)
         self.config = (
             make_panda_pregrasp_config(
                 self.planner,
