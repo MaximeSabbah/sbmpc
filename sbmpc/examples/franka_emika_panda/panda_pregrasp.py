@@ -26,6 +26,9 @@ PANDA_TCP_FRAME_NAME = "panda_hand_tcp"
 _DESIRED_X = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)
 _DESIRED_Z = jnp.array([0.0, 0.0, -1.0], dtype=jnp.float32)
 _ARM_TORQUE_LIMITS = jnp.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], dtype=jnp.float32)
+_ARM_VELOCITY_LIMITS = jnp.array(
+    [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26], dtype=jnp.float32
+)  # FR3 ("fer") joint velocity limits, used to pace the warm-start seed.
 PREGRASP_CLEARANCE = 0.05
 
 
@@ -81,6 +84,7 @@ class PandaPregraspPlanner:
             np.asarray(self.home_q_full[: self.nq]), dtype=jnp.float32
         )
         self.torque_limits = _ARM_TORQUE_LIMITS
+        self.velocity_limits = _ARM_VELOCITY_LIMITS
 
         self._dynamics_jax, self._ee_features_jax = self._build_mjx_functions(
             str(PANDA_XML_PATH)
@@ -260,16 +264,30 @@ class PandaPregraspPlanner:
         q_goal: jax.Array,
         horizon: int,
         dt: float,
+        pace_velocity: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Cubic joint trajectory with current velocity and zero terminal velocity."""
+        """Cubic joint trajectory with current velocity and zero terminal velocity.
+
+        With ``pace_velocity`` (per-joint max), the cubic spans a *velocity-feasible*
+        duration ``max_j |Δq_j| / pace_velocity_j`` (never shorter than the horizon),
+        and the first ``horizon`` samples ride its gentle early portion. This is what
+        keeps the receding-horizon seed from demanding a full-speed reach inside the
+        short horizon. ``None`` reproduces the original behavior (reach within horizon).
+        """
         q_start = jnp.asarray(q_start, dtype=jnp.float32)
         v_start = jnp.asarray(v_start, dtype=jnp.float32)
         q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
         time = (jnp.arange(horizon, dtype=jnp.float32) * jnp.float32(dt))[:, jnp.newaxis]
-        t_final = jnp.maximum(time[-1, 0], 1e-6)
+        horizon_span = jnp.maximum(time[-1, 0], 1e-6)
+        delta_q = q_goal - q_start
+        if pace_velocity is None:
+            t_final = horizon_span
+        else:
+            pace_velocity = jnp.asarray(pace_velocity, dtype=jnp.float32)
+            pace_duration = jnp.max(jnp.abs(delta_q) / jnp.maximum(pace_velocity, 1e-6))
+            t_final = jnp.maximum(pace_duration, horizon_span)
 
         v_goal = jnp.zeros_like(v_start)
-        delta_q = q_goal - q_start
         c0 = q_start
         c1 = v_start
         c2 = (3.0 * delta_q - (2.0 * v_start + v_goal) * t_final) / (t_final**2)
@@ -281,10 +299,16 @@ class PandaPregraspPlanner:
         return q.astype(jnp.float32), v.astype(jnp.float32), ddq.astype(jnp.float32)
 
     def nominal_torque_sequence_from_state(
-        self, state: jax.Array, horizon: int, dt: float | jax.Array
+        self,
+        state: jax.Array,
+        horizon: int,
+        dt: float | jax.Array,
+        pace_velocity: jax.Array | None = None,
     ) -> jax.Array:
         """Receding inverse-dynamics seed from the current arm state to PREGRASP."""
-        return self.nominal_torque_sequence_to_goal(state, self.goal_q, horizon, dt)
+        return self.nominal_torque_sequence_to_goal(
+            state, self.goal_q, horizon, dt, pace_velocity=pace_velocity
+        )
 
     def nominal_torque_sequence_to_goal(
         self,
@@ -292,6 +316,7 @@ class PandaPregraspPlanner:
         goal_q: jax.Array,
         horizon: int,
         dt: float,
+        pace_velocity: jax.Array | None = None,
     ) -> jax.Array:
         """Receding inverse-dynamics seed from the current arm state to a goal pose."""
         state = jnp.asarray(state, dtype=jnp.float32)
@@ -301,6 +326,7 @@ class PandaPregraspPlanner:
             jnp.asarray(goal_q, dtype=jnp.float32),
             horizon,
             dt,
+            pace_velocity=pace_velocity,
         )
         q_np = np.asarray(q, dtype=np.float64)
         v_np = np.asarray(v, dtype=np.float64)

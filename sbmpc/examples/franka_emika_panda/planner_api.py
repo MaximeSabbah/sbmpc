@@ -23,6 +23,7 @@ from .panda_pregrasp import (
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
 )
+from sbmpc.ocp import load_ocp_config
 
 
 @dataclass(frozen=True)
@@ -711,9 +712,24 @@ class PandaPregraspController:
         compute_running_cost: bool = True,
         compute_task_diagnostics: bool = True,
         ocp_config=None,
+        seed_pace_velocity_fraction=None,
     ) -> None:
         self.planner = PandaPregraspPlanner() if planner is None else planner
+        if ocp_config is None:
+            ocp_config = load_ocp_config("pregrasp")
         self.objective = PandaPregraspObjective(self.planner, ocp_config=ocp_config)
+        # Optional velocity-paced warm-start seed. Explicit arg overrides the OCP's
+        # field; None/<=0 keeps the original within-horizon seed (off by default).
+        pace_fraction = (
+            seed_pace_velocity_fraction
+            if seed_pace_velocity_fraction is not None
+            else getattr(ocp_config, "seed_pace_velocity_fraction", None)
+        )
+        self._seed_pace_velocity = (
+            None
+            if pace_fraction is None or pace_fraction <= 0.0
+            else jnp.asarray(pace_fraction, dtype=jnp.float32) * self.planner.velocity_limits
+        )
         self.config = (
             make_panda_pregrasp_config(
                 self.planner,
@@ -1028,6 +1044,7 @@ class PandaPregraspController:
             state,
             self.config.MPC.horizon,
             self.config.MPC.dt,
+            pace_velocity=self._seed_pace_velocity,
         )
 
     def _warmup_exact_async_until_ready(

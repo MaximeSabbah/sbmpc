@@ -128,6 +128,24 @@ def main():
     p.add_argument("--plant-scene", default=str(PANDA_SCENE_PATH))
     p.add_argument("--control-dt", type=float, default=0.025)
     p.add_argument("--steps", type=int, default=160)
+    p.add_argument("--pace", type=float, default=0.0,
+                   help="velocity-pace the seed at this fraction of the velocity "
+                        "limit (0 = off / original behavior)")
+    p.add_argument("--std-dev-scale", type=float, default=0.0,
+                   help="override MPPI sampling std-dev as this fraction of torque "
+                        "limits (0 = config default). Larger = more exploration.")
+    p.add_argument("--horizon", type=int, default=0, help="override MPC horizon (0=default)")
+    p.add_argument("--dt", type=float, default=0.0, help="override MPC dt (0=default)")
+    p.add_argument("--lambda", dest="lambda_mpc", type=float, default=0.0,
+                   help="override MPPI temperature lambda (0=default; higher=greedier, "
+                        "lets the cost actually weight samples instead of averaging)")
+    p.add_argument("--no-reseed", action="store_true",
+                   help="warm-start from the shifted previous solution instead of "
+                        "re-seeding the inverse-dynamics cubic every step (lets MPPI "
+                        "carry its own optimized solution forward).")
+    p.add_argument("--no-gains", action="store_true",
+                   help="feedforward-only (skip exact gains) for fast behavior iteration")
+    p.add_argument("--samples", type=int, default=0, help="override MPPI sample count (0=default)")
     args = p.parse_args()
 
     ocp = load_ocp_config(args.ocp)
@@ -138,16 +156,44 @@ def main():
     if overrides:
         ocp = with_weight_overrides(ocp, overrides)
 
+    from sbmpc.examples.franka_emika_panda.panda_pregrasp import (
+        PandaPregraspPlanner,
+        make_panda_pregrasp_config,
+    )
+
+    use_gains = not args.no_gains
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=use_gains)
+    if args.horizon > 0 or args.dt > 0:
+        h = args.horizon if args.horizon > 0 else config.MPC.horizon
+        dt = args.dt if args.dt > 0 else config.MPC.dt
+        config.MPC.horizon = h
+        config.MPC.dt = dt
+        config.MPC.num_control_points = min(config.MPC.num_control_points, h)
+        config.MPC.initial_guess = planner.nominal_torque_sequence(h, dt)
+    if args.samples > 0:
+        config.MPC.num_parallel_computations = args.samples
+    if args.std_dev_scale > 0:
+        config.MPC.std_dev_mppi = args.std_dev_scale * planner.torque_limits
+    if args.lambda_mpc > 0:
+        config.MPC.lambda_mpc = args.lambda_mpc
+
     ctrl = PandaPregraspController(
-        gains=True,
-        gain_mode="exact_async_feedback",
-        reseed_every_step=True,
+        planner=planner,
+        config=config,
+        gains=use_gains,
+        gain_mode="exact_async_feedback" if use_gains else "feedforward",
+        reseed_every_step=(not args.no_reseed),
         compute_running_cost=False,
         compute_task_diagnostics=False,
         ocp_config=ocp,
+        seed_pace_velocity_fraction=(None if args.pace <= 0.0 else args.pace),
     )
-    print(f"warming up controller (ocp={ocp.name}, overrides={overrides or 'none'}) ...",
-          flush=True)
+    print(
+        f"warming up (ocp={ocp.name}, overrides={overrides or 'none'}, pace={args.pace}, "
+        f"std_dev={args.std_dev_scale}, horizon={config.MPC.horizon}, dt={config.MPC.dt}) ...",
+        flush=True,
+    )
     ctrl.warmup()
 
     model, data, qa, va = build_plant(args.plant_scene)
