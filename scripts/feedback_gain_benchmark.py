@@ -10,8 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sbmpc.examples.franka_emika_panda.planner_api import PandaPickAndPlaceController
-from sbmpc.examples.franka_emika_panda.panda_pick_and_place import (
+from sbmpc.controller.franka_emika_panda.planner_api import PandaPickAndPlaceController
+from sbmpc.controller.franka_emika_panda.panda_pick_and_place import (
     PandaPickAndPlacePlanner,
     Phase,
     make_panda_pick_and_place_config,

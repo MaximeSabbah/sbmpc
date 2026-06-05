@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sbmpc.examples.franka_emika_panda.panda_pregrasp import (
+from sbmpc.controller.franka_emika_panda.panda_pregrasp import (
     PandaPregraspObjective,
     PandaPregraspPlanner,
     make_panda_pregrasp_config,

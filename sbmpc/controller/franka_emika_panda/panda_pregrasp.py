@@ -17,8 +17,8 @@ from sbmpc.ocp import build_cost_model, load_ocp_config
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PANDA_SCENE_PATH = ROOT / "examples" / "panda_pick_place" / "scene.xml"
-PANDA_XML_PATH = ROOT / "examples" / "panda_pick_place" / "panda.xml"
+PANDA_SCENE_PATH = ROOT / "models" / "panda_pick_place" / "scene.xml"
+PANDA_XML_PATH = ROOT / "models" / "panda_pick_place" / "panda.xml"
 PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{i}" for i in range(1, 8))
 PANDA_FINGER_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
 PANDA_TCP_FRAME_NAME = "panda_hand_tcp"

@@ -2,9 +2,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sbmpc.examples.franka_emika_panda.planner_api import PandaPickAndPlaceController, PandaPregraspController, TaskPose
-from sbmpc.examples.franka_emika_panda.panda_pregrasp import PandaPregraspPlanner, make_panda_pregrasp_config
-from sbmpc.examples.franka_emika_panda.panda_pick_and_place import (
+from sbmpc.controller.franka_emika_panda.planner_api import PandaPickAndPlaceController, PandaPregraspController, TaskPose
+from sbmpc.controller.franka_emika_panda.panda_pregrasp import PandaPregraspPlanner, make_panda_pregrasp_config
+from sbmpc.controller.franka_emika_panda.panda_pick_and_place import (
     Phase,
     PandaPickAndPlacePlanner,
     make_panda_pick_and_place_config,
