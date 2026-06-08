@@ -385,3 +385,24 @@ def test_background_gain_lifecycle_noops_when_not_configured():
     solver.stop_background_gains()
     solver.close()
     assert not solver.background_gain_status()["worker_running"]
+
+
+def test_exact_gain_sanitizes_nonfinite_rollout_gradients():
+    _, terminal_cost = linear_seed()
+    solver = build_solver(
+        "exact",
+        terminal_cost,
+        num_parallel_computations=4,
+    )
+    costs = jnp.arange(4, dtype=jnp.float32)
+    samples_delta = jnp.ones((4, HORIZON, 2), dtype=jnp.float32)
+    gradients = jnp.full((4, 2), jnp.nan, dtype=jnp.float32)
+
+    gains = solver.gains_obj.gains_computation(
+        costs,
+        samples_delta,
+        gradients,
+    )
+
+    assert jnp.all(jnp.isfinite(gains))
+    assert jnp.allclose(gains, jnp.zeros_like(gains))

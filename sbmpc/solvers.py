@@ -16,7 +16,6 @@ from abc import ABC, abstractmethod
 from sbmpc.filter import cubic_spline_matrix
 
 
-
 class BaseObjective(ABC):
     def __init__(self, robot_model=None):
         self.robot_model = robot_model
@@ -29,10 +28,14 @@ class BaseObjective(ABC):
         return jnp.asarray(0.0, dtype=jnp.float32)
 
     def cost_and_constraints(self, state, inputs, reference):
-        return self.running_cost(state, inputs, reference) + jnp.sum(self.make_barrier(self.constraints(state, inputs, reference)))
+        return self.running_cost(state, inputs, reference) + jnp.sum(
+            self.make_barrier(self.constraints(state, inputs, reference))
+        )
 
     def final_cost_and_constraints(self, state, reference):
-        return self.final_cost(state, reference) + jnp.sum(self.make_barrier(self.terminal_constraints(state, reference)))
+        return self.final_cost(state, reference) + jnp.sum(
+            self.make_barrier(self.terminal_constraints(state, reference))
+        )
 
     def make_barrier(self, constraint_array):
         constraint_array = jnp.asarray(constraint_array, dtype=jnp.float32)
@@ -48,7 +51,6 @@ class BaseObjective(ABC):
 
     def terminal_constraints(self, state, reference):
         return jnp.asarray(0.0, dtype=jnp.float32)
-
 
 
 @dataclass(frozen=True)
@@ -127,8 +129,7 @@ class RollingGainWindow:
 
     def ready_to_publish(self):
         return (
-            self.fill >= self.capacity
-            and self.append_count % self.publish_stride == 0
+            self.fill >= self.capacity and self.append_count % self.publish_stride == 0
         )
 
     def compute_gain(self, gains_obj: Gains):
@@ -147,8 +148,7 @@ class RollingGainWindow:
         )
 
 
-class RolloutGenerator():
-
+class RolloutGenerator:
     def __init__(self, model: BaseModel, objective: BaseObjective, config: Config):
         """
         Initializes the rollout generator with the model, the objective, configurations and initial guess.
@@ -173,9 +173,11 @@ class RolloutGenerator():
         # Sampling time for discrete time model
         self.dt = jnp.asarray(config.MPC.dt, dtype=self.dtype_general)
         self.horizon = config.MPC.horizon
-        self.rollout_time_grid = jnp.arange(self.horizon, dtype=self.dtype_general) * self.dt
+        self.rollout_time_grid = (
+            jnp.arange(self.horizon, dtype=self.dtype_general) * self.dt
+        )
         # Control horizon of the MPC (steps)
-        # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel 
+        # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel
         # check if we need to move it
         self.num_parallel_computations = config.MPC.num_parallel_computations
 
@@ -195,10 +197,10 @@ class RolloutGenerator():
             and self.gain_method == "exact"
             and not self.buffered_exact_gains
         )
-        
+
         # Covariance of the input action
         # self.sigma_mppi = jnp.diag(config.MPC.std_dev_mppi**2)
-  
+
         self.num_control_points = config.MPC.num_control_points
         self.control_points_sparsity = self.horizon // self.num_control_points
 
@@ -218,7 +220,7 @@ class RolloutGenerator():
         else:
             self.control_interp_matrix = None
 
-        #self.gains = jnp.zeros((model.nu, model.nx))
+        # self.gains = jnp.zeros((model.nu, model.nx))
         # self.ctrl_sens_to_state = jax.jit(jax.jacfwd(self.compute_control_mppi, argnums=0, has_aux=True), device=self.device)
         if self.compute_gains and self.gain_method == "exact":
             self.rollout_sens_to_state = jax.jit(
@@ -245,25 +247,28 @@ class RolloutGenerator():
         self.cost_and_constraints = self.objective.cost_and_constraints
         self.final_cost_and_constraints = self.objective.final_cost_and_constraints
 
-
-
     @partial(jax.vmap, in_axes=(None, 0), out_axes=0)
     def clip_input(self, control_variables):
-        return jnp.clip(control_variables, self.input_min_full_horizon, self.input_max_full_horizon)
+        return jnp.clip(
+            control_variables, self.input_min_full_horizon, self.input_max_full_horizon
+        )
 
     def clip_input_single(self, control_variables):
-        return jnp.clip(control_variables, self.input_min_full_horizon, self.input_max_full_horizon)
-    
+        return jnp.clip(
+            control_variables, self.input_min_full_horizon, self.input_max_full_horizon
+        )
 
     @partial(jax.vmap, in_axes=(None, None, None, 0), out_axes=(0, 0))
     def rollout_all(self, initial_state, reference, control_variables):
         if self.config.MPC.sensitivity:
-            return self.rollout_single_with_sensitivity(initial_state, reference, control_variables)
+            return self.rollout_single_with_sensitivity(
+                initial_state, reference, control_variables
+            )
         else:
             return self.rollout_single(initial_state, reference, control_variables)
-    
+
     def interpolate_control(self, control_variables):
-        """"
+        """ "
         Interpolates the control variables over the full horizon or passes the control variables directly
         """
         if self.config.MPC.smoothing == "Spline":
@@ -271,27 +276,35 @@ class RolloutGenerator():
             return self.clip_input_single(control_interp)
         else:
             return self.clip_input_single(control_variables)
-    
+
     def rollout_single(self, initial_state, reference, control_variables):
         cost = jnp.asarray(0.0, dtype=self.dtype_general)
         curr_state = initial_state
 
         control_variables = self.interpolate_control(control_variables)
-        
+
         def cost_and_state_rollout(idx, cost_and_state):
             cost, curr_state = cost_and_state
-            cost += self.dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
-            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], self.dt)
+            cost += self.dt * self.cost_and_constraints(
+                curr_state, control_variables[idx, :], reference[idx, :]
+            )
+            next_state = self.model.integrate_rollout_single(
+                curr_state, control_variables[idx, :], self.dt
+            )
 
             return cost, next_state
 
-        cost, final_state = jax.lax.fori_loop(0, self.horizon, cost_and_state_rollout, (cost, curr_state))
+        cost, final_state = jax.lax.fori_loop(
+            0, self.horizon, cost_and_state_rollout, (cost, curr_state)
+        )
 
-        cost += self.dt*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
+        cost += self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
 
-    def rollout_single_with_state_gradient(self, initial_state, reference, control_variables):
+    def rollout_single_with_state_gradient(
+        self, initial_state, reference, control_variables
+    ):
         """Rollout cost plus dJ/dx using forward-mode AD.
 
         This is the Feedback-MPPI gain path from the original implementation,
@@ -299,7 +312,9 @@ class RolloutGenerator():
         differentiable. Reverse-mode AD through MJX's internal solver while
         loops is not supported by JAX.
         """
-        cost_and_control = self.rollout_single(initial_state, reference, control_variables)
+        cost_and_control = self.rollout_single(
+            initial_state, reference, control_variables
+        )
 
         def cost_from_state(state):
             cost, _ = self.rollout_single(state, reference, control_variables)
@@ -311,8 +326,11 @@ class RolloutGenerator():
         )(basis)
         return cost_and_control, gradient
 
-    def rollout_single_state_gradient(self, initial_state, reference, control_variables):
+    def rollout_single_state_gradient(
+        self, initial_state, reference, control_variables
+    ):
         """Compute only dJ/dx for one already-scored control sample."""
+
         def cost_from_state(state):
             cost, _ = self.rollout_single(state, reference, control_variables)
             return cost
@@ -322,8 +340,9 @@ class RolloutGenerator():
             lambda tangent: jax.jvp(cost_from_state, (initial_state,), (tangent,))[1]
         )(basis)
 
-
-    def rollout_single_with_sensitivity(self, initial_state, reference, control_variables):
+    def rollout_single_with_sensitivity(
+        self, initial_state, reference, control_variables
+    ):
         cost = jnp.asarray(0.0, dtype=self.dtype_general)
         curr_state = initial_state
         curr_state_sens = jnp.zeros((self.model.nx, self.model.np))
@@ -332,14 +351,20 @@ class RolloutGenerator():
 
         def cost_and_state_rollout(idx, cost_and_state):
             cost, curr_state = cost_and_state
-            cost += self.dt*self.cost_and_constraints(curr_state, control_variables[idx, :], reference[idx, :])
-            next_state = self.model.integrate_rollout_single(curr_state, control_variables[idx, :], self.dt)
+            cost += self.dt * self.cost_and_constraints(
+                curr_state, control_variables[idx, :], reference[idx, :]
+            )
+            next_state = self.model.integrate_rollout_single(
+                curr_state, control_variables[idx, :], self.dt
+            )
 
             return cost, next_state
 
-        cost, final_state = jax.lax.fori_loop(0, self.horizon, cost_and_state_rollout, (cost, curr_state))
+        cost, final_state = jax.lax.fori_loop(
+            0, self.horizon, cost_and_state_rollout, (cost, curr_state)
+        )
 
-        cost += self.dt*self.final_cost_and_constraints(final_state, reference[self.horizon, :])
+        cost += self.final_cost_and_constraints(final_state, reference[self.horizon, :])
 
         return cost, control_variables
 
@@ -378,37 +403,45 @@ class RolloutGenerator():
 
     #     return cost, input_sequence
 
-    @partial(jax.jit, static_argnums=(0,))  
+    @partial(jax.jit, static_argnums=(0,))
     def do_rollout(self, state, reference, optimal_samples, samples_delta, gains):
         gradients = None
 
         if self.config.MPC.smoothing == "Spline":
-            control_vars_all = optimal_samples[self.control_spline_indices, :] + samples_delta
+            control_vars_all = (
+                optimal_samples[self.control_spline_indices, :] + samples_delta
+            )
         else:
             control_vars_all = optimal_samples + samples_delta
 
         # If the reference is just a state, repeat it along the horizon
         if reference.ndim == 1:
-            reference = jnp.tile(reference, (self.horizon+1, 1))
+            reference = jnp.tile(reference, (self.horizon + 1, 1))
 
         if self.compute_exact_gains:
-            (costs, control_vars_all), gradients = self.rollout_sens_to_state(state, reference, control_vars_all)
+            (costs, control_vars_all), gradients = self.rollout_sens_to_state(
+                state, reference, control_vars_all
+            )
         else:
-            costs, control_vars_all = self.rollout_all(state, reference, control_vars_all)
+            costs, control_vars_all = self.rollout_all(
+                state, reference, control_vars_all
+            )
 
-        samples_delta_clipped = self.compute_samples_delta(control_vars_all, optimal_samples)
-        
+        samples_delta_clipped = self.compute_samples_delta(
+            control_vars_all, optimal_samples
+        )
 
         return samples_delta_clipped, costs, gradients
-    
 
     def compute_samples_delta(self, control_action, optimal_samples):
-        samples_delta_clipped = (control_action - optimal_samples)
+        samples_delta_clipped = control_action - optimal_samples
         return samples_delta_clipped
 
 
 class Controller:
-    def __init__(self, rollout_gen : RolloutGenerator, sampler : Sampler, gains_obj: Gains):
+    def __init__(
+        self, rollout_gen: RolloutGenerator, sampler: Sampler, gains_obj: Gains
+    ):
 
         self.rollout_gen = rollout_gen
         self.objective = rollout_gen.objective
@@ -556,12 +589,20 @@ class Controller:
 
         for i in range(num_steps):
             previous_optimal_samples = optimal_samples
-            raw_samples_delta = self.sampler.sample_input_sequence(self.sampler.master_key)
+            raw_samples_delta = self.sampler.sample_input_sequence(
+                self.sampler.master_key
+            )
             samples, costs, gradients = self.rollout_gen.do_rollout(
                 state, reference, previous_optimal_samples, raw_samples_delta, gains
             )
-            optimal_samples = self.sampler.update(previous_optimal_samples, samples, costs)
-            if capture_gain_context and self._gain_buffered and self.rollout_gen.gain_method == "exact":
+            optimal_samples = self.sampler.update(
+                previous_optimal_samples, samples, costs
+            )
+            if (
+                capture_gain_context
+                and self._gain_buffered
+                and self.rollout_gen.gain_method == "exact"
+            ):
                 self._capture_exact_gain_context(
                     state,
                     reference,
@@ -569,11 +610,15 @@ class Controller:
                     raw_samples_delta,
                     samples,
                     costs,
-            )
+                )
             # update gains
             if not update_gains:
                 new_gains = None
-            elif self._gain_buffered and self.gains_obj.compute_gains and self.rollout_gen.gain_method == "exact":
+            elif (
+                self._gain_buffered
+                and self.gains_obj.compute_gains
+                and self.rollout_gen.gain_method == "exact"
+            ):
                 new_gains = self._buffered_exact_gains(
                     state,
                     reference,
@@ -586,13 +631,13 @@ class Controller:
                 new_gains = self.gains_obj.gains_computation(costs, samples, gradients)
             if new_gains is not None:
                 self._set_current_gains(new_gains)
-       
+
         # update sampler best control vars
         if shift_guess:
             self.sampler.optimal_samples = self._shift_guess(optimal_samples)
         else:
             self.sampler.optimal_samples = optimal_samples
-        
+
         return optimal_samples
 
     def _make_exact_gain_context(
@@ -675,7 +720,9 @@ class Controller:
             gradients=gradients,
         )
 
-    def _refresh_exact_gain_context(self, context: ExactGainPlanContext, window: RollingGainWindow):
+    def _refresh_exact_gain_context(
+        self, context: ExactGainPlanContext, window: RollingGainWindow
+    ):
         t_select = time.perf_counter()
         sample_indices = self._select_exact_gain_sample_indices(
             context.cycle_id,
@@ -885,7 +932,7 @@ class Controller:
         else:
             result.update(self._empty_exact_gain_refresh_status())
         return result
-    
+
     def start_async_exact_gain_worker(self, reset_published_gain=True):
         if not self._gain_buffered or self.rollout_gen.gain_method != "exact":
             raise ValueError("Async exact-gain worker requires buffered exact gains.")
@@ -1045,7 +1092,9 @@ class Controller:
                 result.update(self._empty_exact_gain_refresh_status())
             return result
 
-    def wait_for_async_exact_gain_batches(self, min_completed_batches, timeout_sec=10.0):
+    def wait_for_async_exact_gain_batches(
+        self, min_completed_batches, timeout_sec=10.0
+    ):
         deadline = time.perf_counter() + timeout_sec
         with self._async_condition:
             while self._async_completed_batch_count < min_completed_batches:
@@ -1056,7 +1105,6 @@ class Controller:
                     return False
                 self._async_condition.wait(timeout=remaining)
             return True
-
 
     def _buffered_exact_gains(
         self,
@@ -1093,9 +1141,10 @@ class Controller:
     def _shift_guess(self, optimal_samples):
         optimal_samples_shifted = jnp.roll(optimal_samples, shift=-1, axis=0)
         optimal_samples_shifted = optimal_samples_shifted.at[-1, :].set(
-            optimal_samples_shifted[-2:-1, :].reshape(-1))
+            optimal_samples_shifted[-2:-1, :].reshape(-1)
+        )
         return optimal_samples_shifted
-    
+
     @property
     def gains(self):
         return self._get_current_gains()

@@ -25,7 +25,9 @@ PANDA_TCP_FRAME_NAME = "panda_hand_tcp"
 
 _DESIRED_X = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)
 _DESIRED_Z = jnp.array([0.0, 0.0, -1.0], dtype=jnp.float32)
-_ARM_TORQUE_LIMITS = jnp.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], dtype=jnp.float32)
+_ARM_TORQUE_LIMITS = jnp.array(
+    [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], dtype=jnp.float32
+)
 _ARM_VELOCITY_LIMITS = jnp.array(
     [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26], dtype=jnp.float32
 )  # FR3 ("fer") joint velocity limits, used to pace the warm-start seed.
@@ -66,9 +68,14 @@ class PandaPregraspPlanner:
         self.joint_names = PANDA_ARM_JOINT_NAMES
         self.frame_name = PANDA_TCP_FRAME_NAME
 
-        self.home_q_full, self.object_pos, self.target_pos, self.object_half_height = (
-            self._load_mujoco_defaults()
-        )
+        (
+            self.home_q_full,
+            self.object_pos,
+            self.target_pos,
+            self.object_half_height,
+            self.joint_position_min,
+            self.joint_position_max,
+        ) = self._load_mujoco_defaults()
 
         self.pin_model, self.pin_data = self._build_pinocchio_model()
         self.model = self.pin_model
@@ -86,8 +93,8 @@ class PandaPregraspPlanner:
         self.torque_limits = _ARM_TORQUE_LIMITS
         self.velocity_limits = _ARM_VELOCITY_LIMITS
 
-        self._dynamics_jax, self._ee_features_jax = self._build_mjx_functions(
-            str(PANDA_XML_PATH)
+        (self._dynamics_jax, self._step_jax, self._ee_features_jax) = (
+            self._build_mjx_functions(str(PANDA_XML_PATH))
         )
 
         home_pos, home_rot = self.forward_kinematics(self.home_q)
@@ -119,7 +126,16 @@ class PandaPregraspPlanner:
         )
         self.reference_vec = self.reference.as_vector()
 
-    def _load_mujoco_defaults(self) -> tuple[jax.Array, jax.Array, jax.Array, float]:
+    def _load_mujoco_defaults(
+        self,
+    ) -> tuple[
+        jax.Array,
+        jax.Array,
+        jax.Array,
+        float,
+        jax.Array,
+        jax.Array,
+    ]:
         mj_model = mujoco.MjModel.from_xml_path(self.scene_path)
         key_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
         home_q = jnp.asarray(mj_model.key_qpos[key_id][:9], dtype=jnp.float32)
@@ -129,7 +145,16 @@ class PandaPregraspPlanner:
         object_pos = jnp.asarray(mj_model.body_pos[object_body_idx], dtype=jnp.float32)
         target_pos = jnp.asarray(mj_model.body_pos[target_body_idx], dtype=jnp.float32)
         object_half_height = float(mj_model.geom_size[object_geom_idx, 2])
-        return home_q, object_pos, target_pos, object_half_height
+        arm_joint_ids = [mj_model.joint(f"joint{i}").id for i in range(1, 8)]
+        joint_ranges = jnp.asarray(mj_model.jnt_range[arm_joint_ids], dtype=jnp.float32)
+        return (
+            home_q,
+            object_pos,
+            target_pos,
+            object_half_height,
+            joint_ranges[:, 0],
+            joint_ranges[:, 1],
+        )
 
     def _build_pinocchio_model(self) -> tuple[pin.Model, pin.Data]:
         full_model = pin.buildModelFromUrdf(self.urdf_path)
@@ -143,7 +168,9 @@ class PandaPregraspPlanner:
         )
         return reduced_model, reduced_model.createData()
 
-    def _build_mjx_functions(self, panda_xml_path: str) -> tuple[callable, callable]:
+    def _build_mjx_functions(
+        self, panda_xml_path: str
+    ) -> tuple[callable, callable, callable]:
         mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
         torque_limits_np = np.asarray(self.torque_limits)
         mj_model.actuator_gainprm[:7, 0] = 1.0
@@ -153,12 +180,12 @@ class PandaPregraspPlanner:
         mj_model.actuator_biasprm[7:, :] = 0.0
         mj_model.actuator_ctrlrange[:7, 0] = -torque_limits_np
         mj_model.actuator_ctrlrange[:7, 1] = torque_limits_np
-        mj_model.dof_damping[:] = 0.0
-        mj_model.dof_armature[:] = 0.0
         mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         mjx_model = mjx.put_model(mj_model)
         mjx_data_template = mjx.put_data(mj_model, mujoco.MjData(mj_model))
-        gripper_site_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
+        gripper_site_id = mujoco.mj_name2id(
+            mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper"
+        )
         nq_arm = self.nq
         n_pad = mj_model.nq - nq_arm
         n_ctrl_pad = mj_model.nu - nq_arm
@@ -177,18 +204,34 @@ class PandaPregraspPlanner:
             return jnp.concatenate([v, data.qacc[:nq_arm]]).astype(jnp.float32)
 
         @jax.jit
+        def step_fn(state: jax.Array, inputs: jax.Array, dt: jax.Array) -> jax.Array:
+            q = state[:nq_arm].astype(jnp.float32)
+            v = state[nq_arm:].astype(jnp.float32)
+            q_full = jnp.concatenate([q, finger_pad])
+            v_full = jnp.concatenate([v, finger_pad])
+            ctrl_full = jnp.concatenate([inputs.astype(jnp.float32), ctrl_pad])
+            model = mjx_model.replace(opt=mjx_model.opt.replace(timestep=dt))
+            data = mjx_data_template.replace(qpos=q_full, qvel=v_full, ctrl=ctrl_full)
+            data = mjx.step(model, data)
+            return jnp.concatenate([data.qpos[:nq_arm], data.qvel[:nq_arm]]).astype(
+                jnp.float32
+            )
+
+        @jax.jit
         def ee_features_fn(q: jax.Array) -> jax.Array:
             q_full = jnp.concatenate([q.astype(jnp.float32), finger_pad])
             data = mjx_data_template.replace(qpos=q_full)
             data = mjx.forward(mjx_model, data)
             ee_xmat = data.site_xmat[gripper_site_id].reshape(3, 3)
-            return jnp.concatenate([
-                data.site_xpos[gripper_site_id],
-                ee_xmat[:, 0],
-                ee_xmat[:, 2],
-            ]).astype(jnp.float32)
+            return jnp.concatenate(
+                [
+                    data.site_xpos[gripper_site_id],
+                    ee_xmat[:, 0],
+                    ee_xmat[:, 2],
+                ]
+            ).astype(jnp.float32)
 
-        return dynamics_fn, ee_features_fn
+        return dynamics_fn, step_fn, ee_features_fn
 
     def forward_kinematics(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         q_np = np.asarray(q, dtype=np.float64)
@@ -246,11 +289,10 @@ class PandaPregraspPlanner:
         pin.computeGeneralizedGravity(self.pin_model, self.pin_data, q_np)
         return jnp.asarray(self.pin_data.g, dtype=jnp.float32)
 
-    def inverse_dynamics(
-        self, q: jax.Array, v: jax.Array, ddq: jax.Array
-    ) -> jax.Array:
+    def inverse_dynamics(self, q: jax.Array, v: jax.Array, ddq: jax.Array) -> jax.Array:
         tau = pin.rnea(
-            self.pin_model, self.pin_data,
+            self.pin_model,
+            self.pin_data,
             np.asarray(q, dtype=np.float64),
             np.asarray(v, dtype=np.float64),
             np.asarray(ddq, dtype=np.float64),
@@ -277,7 +319,9 @@ class PandaPregraspPlanner:
         q_start = jnp.asarray(q_start, dtype=jnp.float32)
         v_start = jnp.asarray(v_start, dtype=jnp.float32)
         q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
-        time = (jnp.arange(horizon, dtype=jnp.float32) * jnp.float32(dt))[:, jnp.newaxis]
+        time = (jnp.arange(horizon, dtype=jnp.float32) * jnp.float32(dt))[
+            :, jnp.newaxis
+        ]
         horizon_span = jnp.maximum(time[-1, 0], 1e-6)
         delta_q = q_goal - q_start
         if pace_velocity is None:
@@ -331,16 +375,18 @@ class PandaPregraspPlanner:
         q_np = np.asarray(q, dtype=np.float64)
         v_np = np.asarray(v, dtype=np.float64)
         ddq_np = np.asarray(ddq, dtype=np.float64)
-        tau = np.stack([
-            pin.rnea(self.pin_model, self.pin_data, q_np[i], v_np[i], ddq_np[i])
-            for i in range(horizon)
-        ])
+        tau = np.stack(
+            [
+                pin.rnea(self.pin_model, self.pin_data, q_np[i], v_np[i], ddq_np[i])
+                for i in range(horizon)
+            ]
+        )
         tau = jnp.asarray(tau, dtype=jnp.float32)
-        return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(jnp.float32)
+        return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(
+            jnp.float32
+        )
 
-    def nominal_torque_sequence(
-        self, horizon: int, dt: float | jax.Array
-    ) -> jax.Array:
+    def nominal_torque_sequence(self, horizon: int, dt: float | jax.Array) -> jax.Array:
         """Smooth inverse-dynamics seed from home to the PREGRASP IK pose."""
         state = jnp.concatenate(
             [self.home_q, jnp.zeros(self.nv, dtype=jnp.float32)],
@@ -349,10 +395,16 @@ class PandaPregraspPlanner:
         return self.nominal_torque_sequence_from_state(state, horizon, dt)
 
     def dynamics(
-        self, state: jax.Array, inputs: jax.Array, params: jax.Array
+        self,
+        state: jax.Array,
+        inputs: jax.Array,
+        params: jax.Array,
+        dt: jax.Array | None = None,
     ) -> jax.Array:
         del params
-        return self._dynamics_jax(state, inputs)
+        if dt is None:
+            return self._dynamics_jax(state, inputs)
+        return self._step_jax(state, inputs, dt)
 
     def ee_position(self, q: jax.Array) -> jax.Array:
         return self._ee_features_jax(q)[:3]
@@ -401,7 +453,9 @@ def _initial_guess(planner: PandaPregraspPlanner, mpc) -> jax.Array:
         return jnp.tile(g, (mpc.horizon, 1))
     if mpc.initial_guess == "zeros":
         return jnp.zeros((mpc.horizon, planner.nu), dtype=jnp.float32)
-    raise ValueError(f"unknown initial_guess '{mpc.initial_guess}' (use 'zeros' or 'gravity').")
+    raise ValueError(
+        f"unknown initial_guess '{mpc.initial_guess}' (use 'zeros' or 'gravity')."
+    )
 
 
 def make_panda_pregrasp_config(

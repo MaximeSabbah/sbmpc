@@ -9,7 +9,7 @@ mpc:
   num_control_points: 12     # spline control points (<= horizon)
   dt: 0.02
   lambda: 0.05               # temperature: higher = greedier (commits), lower = averages
-  std_dev_scale: 1.0         # sampling std-dev = std_dev_scale * torque_limit
+  std_dev_scale: 0.1         # sampling std-dev = std_dev_scale * torque_limit
   smoothing: Spline          # Spline | null
   initial_guess: gravity     # warm start: zeros | gravity (hold against gravity)
   gains: true                # compute F-MPPI feedback gains (slower)
@@ -20,7 +20,7 @@ mpc:
 sim:
   dt: 0.02
   iterations: 400
-  integrator: si_euler
+  integrator: custom_discrete
 
 running_terms:
   - {name: ee_translation_xy, weight: 120.0}

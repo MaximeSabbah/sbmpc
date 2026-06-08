@@ -13,6 +13,8 @@ def test_panda_pregrasp_solver_step() -> None:
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner)
     config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
+    assert config.general.integrator_type == "custom_discrete"
+
 
     config.MPC.horizon = 8
     config.MPC.num_parallel_computations = 16
