@@ -429,7 +429,6 @@ def build_all(
     reference: jnp.array,
     custom_dynamics_fn: Optional[Callable] = None,
     obstacles: bool = True,
-    warm_start_gains: bool = True,
 ):
     system, x_init, state_init = (None, None, None)
     solver_dynamics_model_setting = config.solver_dynamics
@@ -481,7 +480,6 @@ def build_all(
         solver_x_init,
         reference,
         False,
-        update_gains=warm_start_gains,
     ).block_until_ready()
 
     return sim

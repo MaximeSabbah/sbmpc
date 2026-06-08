@@ -503,8 +503,7 @@ def make_panda_pregrasp_config(
     config.MPC.gains = use_gains
     if use_gains:
         config.MPC.gain_method = "exact"
-        config.MPC.gain_samples_per_cycle = mpc.gain_samples_per_cycle
-        config.MPC.gain_buffer_size = mpc.gain_buffer_size
+        config.MPC.num_gain_samples = mpc.num_gain_samples
     config.MPC.initial_guess = _initial_guess(planner, mpc)
 
     config.solver_dynamics = DynamicsModel.CUSTOM

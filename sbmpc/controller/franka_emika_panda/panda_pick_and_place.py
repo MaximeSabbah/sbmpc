@@ -419,8 +419,7 @@ def make_panda_pick_and_place_config(
         config.MPC.num_parallel_computations = 14
         config.MPC.num_control_points = 4
         config.MPC.gain_method = "exact"
-        config.MPC.gain_samples_per_cycle = 14
-        config.MPC.gain_buffer_size = 14
+        config.MPC.num_gain_samples = 14
     else:
         config.MPC.horizon = 16
         config.MPC.num_parallel_computations = 32

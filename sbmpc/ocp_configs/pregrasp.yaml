@@ -4,21 +4,20 @@ n_weights: 0
 
 # --- MPPI / solver knobs ---
 mpc:
-  horizon: 24
+  horizon: 10
   num_samples: 1024          # parallel MPPI rollouts
-  num_control_points: 12     # spline control points (<= horizon)
-  dt: 0.02
+  num_gain_samples: 512      # same-cycle rollouts differentiated for feedback gains
+  num_control_points: 10     # spline control points (<= horizon)
+  dt: 0.04
   lambda: 0.05               # temperature: higher = greedier (commits), lower = averages
   std_dev_scale: 0.1         # sampling std-dev = std_dev_scale * torque_limit
   smoothing: Spline          # Spline | null
   initial_guess: gravity     # warm start: zeros | gravity (hold against gravity)
-  gains: true                # compute F-MPPI feedback gains (slower)
-  gain_samples_per_cycle: 64
-  gain_buffer_size: 256
+  gains: true                # compute F-MPPI feedback gains in the same control cycle
 
 # --- closed-loop sandbox (scripts/panda_pregrasp.py) ---
 sim:
-  dt: 0.02
+  dt: 0.04
   iterations: 400
   integrator: custom_discrete
 

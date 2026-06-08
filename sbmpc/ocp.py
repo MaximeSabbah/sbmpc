@@ -54,8 +54,7 @@ class MpcSpec:
     smoothing: str | None = "Spline"
     initial_guess: str = "zeros"     # warm start: "zeros" | "gravity"
     gains: bool = False
-    gain_samples_per_cycle: int = 512
-    gain_buffer_size: int = 512
+    num_gain_samples: int = 512
 
 
 @dataclass(frozen=True)
@@ -113,8 +112,7 @@ def _mpc_spec(d: dict[str, Any] | None) -> MpcSpec:
         smoothing=_normalize_smoothing(d.get("smoothing", MpcSpec.smoothing)),
         initial_guess=str(d.get("initial_guess", MpcSpec.initial_guess)),
         gains=bool(d.get("gains", MpcSpec.gains)),
-        gain_samples_per_cycle=int(d.get("gain_samples_per_cycle", MpcSpec.gain_samples_per_cycle)),
-        gain_buffer_size=int(d.get("gain_buffer_size", MpcSpec.gain_buffer_size)),
+        num_gain_samples=int(d.get("num_gain_samples", MpcSpec.num_gain_samples)),
     )
 
 

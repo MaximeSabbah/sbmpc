@@ -134,8 +134,7 @@ def main() -> None:
         f"samples={config.MPC.num_parallel_computations} "
         f"control_points={config.MPC.num_control_points} "
         f"gain_method={config.MPC.gain_method} "
-        f"gK={config.MPC.gain_samples_per_cycle} "
-        f"gM={config.MPC.gain_buffer_size}"
+        f"gain_samples={config.MPC.num_gain_samples}"
     )
     print(f"visualize: {config.general.visualize}")
     print(f"object: {planner.initial_object_pos} -> target: {planner.default_target_pos}")
