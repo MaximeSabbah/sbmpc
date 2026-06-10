@@ -19,8 +19,7 @@ def test_panda_pregrasp_solver_step() -> None:
     config.MPC.horizon = 8
     config.MPC.num_parallel_computations = 16
     config.MPC.num_control_points = 3
-    config.MPC.gain_samples_per_cycle = 8
-    config.MPC.gain_buffer_size = 8
+    config.MPC.num_gain_samples = 8
 
     _, solver = build_model_and_solver(
         config,

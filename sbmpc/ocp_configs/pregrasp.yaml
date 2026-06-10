@@ -6,7 +6,7 @@ n_weights: 0
 mpc:
   horizon: 10
   num_samples: 1024          # parallel MPPI rollouts
-  num_gain_samples: 256      # same-cycle rollouts differentiated for feedback gains
+  num_gain_samples: 128      # same-cycle rollouts differentiated for feedback gains
   num_control_points: 10     # spline control points (<= horizon)
   dt: 0.04
   lambda: 0.05               # temperature: higher = greedier (commits), lower = averages

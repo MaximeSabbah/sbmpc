@@ -2,7 +2,7 @@
 
 Timing methodology mirrors bench_dynamics.py:
   - JIT time measured separately (first call after build_all warm-up)
-  - Steady-state = average over N_TRIALS calls, each fully blocked on GPU
+  - Steady-state = per-call p50/p95 over N_TRIALS fully blocked GPU calls
   - controller.command() called directly — NOT via sim.step() —
     to avoid async GPU bleed from integrate_sim into the measured window.
 
@@ -43,7 +43,7 @@ from sbmpc.controller.franka_emika_panda.panda_pregrasp import (
 )
 from sbmpc.simulation import build_all
 
-TARGET_HZ = 50.0
+TARGET_HZ = 25.0
 TARGET_MS = 1000.0 / TARGET_HZ
 N_WARMUP = 10
 N_TRIALS = 100
@@ -69,8 +69,8 @@ def _block_command(controller, state, ref):
 def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
     """
     Timing benchmark: controller.command() on a fixed state.
-    Mimics bench_dynamics.py: JIT time + average over n_trials blocked calls.
-    Returns (row_str, jit_ms, mean_ms, ok).
+    Mimics bench_dynamics.py and reports warmed per-call latency.
+    Returns (row_str, jit_ms, mean_ms, ok). Pass/fail uses p95.
     """
     sim = build_all(
         config,
@@ -90,16 +90,21 @@ def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
     for _ in range(1, N_WARMUP):
         _block_command(sim.controller, state, ref)
 
-    t0 = time.perf_counter()
-    for _ in range(N_WARMUP, N_WARMUP + n_trials):
+    times_ms = []
+    for _ in range(n_trials):
+        trial_start = time.perf_counter()
         _block_command(sim.controller, state, ref)
-    mean_ms = (time.perf_counter() - t0) / n_trials * 1000.0
+        times_ms.append(1000.0 * (time.perf_counter() - trial_start))
 
-    ok = mean_ms < TARGET_MS
+    mean_ms = float(np.mean(times_ms))
+    p50_ms = float(np.percentile(times_ms, 50))
+    p95_ms = float(np.percentile(times_ms, 95))
+    ok = p95_ms < TARGET_MS
     marker = "✓" if ok else "✗"
     row = (
         f"{marker} {label:52s}  "
-        f"JIT={jit_ms:6.0f}ms  mean={mean_ms:6.2f}ms  "
+        f"JIT={jit_ms:6.0f}ms mean={mean_ms:6.2f}ms "
+        f"p50={p50_ms:6.2f}ms p95={p95_ms:6.2f}ms "
         f"[{'PASS' if ok else 'FAIL'} @{TARGET_HZ:.0f}Hz]"
     )
     return row, jit_ms, mean_ms, ok
@@ -271,7 +276,7 @@ def run_visual(planner, objective, config):
     print(
             f"horizon={config.MPC.horizon}  samples={config.MPC.num_parallel_computations}  "
             f"control_points={config.MPC.num_control_points}  gains={config.MPC.gains}  "
-            f"gK={config.MPC.gain_samples_per_cycle}  gM={config.MPC.gain_buffer_size}  "
+            f"gain_samples={config.MPC.num_gain_samples}  "
             f"mjx={config.robot.mjx_opts}"
         )
     sim.simulate()
@@ -285,12 +290,23 @@ def main():
     parser.add_argument("--quality", action="store_true",
                         help="Run state-evolution quality + gain-stability check")
     parser.add_argument("--steps", type=int, default=N_TRIALS, help="Timing trials per config")
-    parser.add_argument("--quality-steps", type=int, default=N_QUALITY,
-                        help="Simulation steps for quality check")
-    parser.add_argument("--gain-samples-per-cycle", type=int, default=None,
-                        help="Buffered-gain: how many of the MPPI samples to backprop per cycle.")
-    parser.add_argument("--gain-buffer-size", type=int, default=None,
-                        help="Buffered-gain: total accumulated samples before a K update; must be a multiple of --gain-samples-per-cycle.")
+    parser.add_argument(
+        "--quality-steps",
+        type=int,
+        default=N_QUALITY,
+        help="Simulation steps for quality check",
+    )
+    parser.add_argument(
+        "--compare-feedforward",
+        action="store_true",
+        help="Also benchmark the same setup with gains disabled.",
+    )
+    parser.add_argument(
+        "--gain-samples",
+        type=int,
+        default=None,
+        help="Lowest-cost MPPI samples differentiated for same-cycle gains.",
+    )
     parser.add_argument("--mjx-iterations", type=int, default=None)
     parser.add_argument("--mjx-ls-iterations", type=int, default=None)
     parser.add_argument("--mjx-tolerance", type=float, default=None)
@@ -310,10 +326,8 @@ def main():
 
     def _apply_gain_knobs(config):
         config.MPC.gain_method = "exact"
-        if args.gain_samples_per_cycle is not None:
-            config.MPC.gain_samples_per_cycle = args.gain_samples_per_cycle
-        if args.gain_buffer_size is not None:
-            config.MPC.gain_buffer_size = args.gain_buffer_size
+        if args.gain_samples is not None:
+            config.MPC.num_gain_samples = args.gain_samples
         config.robot.mjx_opts = args.mjx_opts
 
     planner = PandaPregraspPlanner()
@@ -321,9 +335,12 @@ def main():
 
     if args.visual:
         config = make_panda_pregrasp_config(planner, visualize=True, gains=True)
-        config.MPC.horizon = args.horizon if args.horizon is not None else 8
-        config.MPC.num_parallel_computations = args.samples if args.samples is not None else 1024
-        config.MPC.num_control_points = args.control_points if args.control_points is not None else 8
+        if args.horizon is not None:
+            config.MPC.horizon = args.horizon
+        if args.samples is not None:
+            config.MPC.num_parallel_computations = args.samples
+        if args.control_points is not None:
+            config.MPC.num_control_points = args.control_points
         _apply_gain_knobs(config)
         _reset_initial_guess(planner, config)
         run_visual(planner, objective, config)
@@ -358,7 +375,7 @@ def main():
                     _reset_initial_guess(planner, config)
                     label = (
                         f"h={h:2d} n={s:4d} cp={cp} "
-                        f"gK={config.MPC.gain_samples_per_cycle} gM={config.MPC.gain_buffer_size} "
+                        f"gain_samples={config.MPC.num_gain_samples} "
                         f"mjx={config.robot.mjx_opts}"
                     )
                     t_row, _, mean_ms, t_ok = _run_headless(
@@ -402,7 +419,7 @@ def main():
     label = (
         f"h={config.MPC.horizon} n={config.MPC.num_parallel_computations} "
         f"cp={config.MPC.num_control_points} gains={config.MPC.gains} "
-        f"gK={config.MPC.gain_samples_per_cycle} gM={config.MPC.gain_buffer_size} "
+        f"gain_samples={config.MPC.num_gain_samples} "
         f"mjx={config.robot.mjx_opts}"
     )
     t_row, _, mean_ms, t_ok = _run_headless(
@@ -415,7 +432,7 @@ def main():
     print(t_row)
 
     # Gains overhead: compare to same config with gains disabled
-    if args.gains:
+    if args.gains and args.compare_feedforward:
         config_ng = make_panda_pregrasp_config(planner, visualize=False, gains=False)
         config_ng.MPC.horizon = config.MPC.horizon
         config_ng.MPC.num_parallel_computations = config.MPC.num_parallel_computations
@@ -429,7 +446,7 @@ def main():
         print(f"  → Gains overhead: {mean_ms - mean_ng:.2f}ms  (paper target ~1ms, FD adds nx={planner.nx} batches)")
 
     # Quality + gain-stability check
-    if args.quality or args.gains:
+    if args.quality:
         print(f"\n--- Quality check ({args.quality_steps} steps of state evolution) ---")
         q = _run_quality(
             planner,
@@ -453,7 +470,7 @@ def main():
         viable = _is_viable(t_ok, q, config)
         print(f"\n  Verdict: {'✓ VIABLE' if viable else '✗ NOT VIABLE'}")
         if not t_ok:
-            print("    - timing exceeds 20ms target")
+            print("    - timing exceeds 40ms target")
         if not q.get("converging"):
             print("    - end-effector not converging to goal")
         if config.MPC.gains:

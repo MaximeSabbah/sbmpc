@@ -51,6 +51,26 @@ class BaseObjective(ABC):
 
 
 
+@partial(jax.jit, static_argnums=(1,))
+def select_nominal_and_lowest_cost_indices(costs, sample_count):
+    """Keep sample 0 and fill the gain batch with the lowest-cost samples."""
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive")
+    if sample_count > costs.shape[0]:
+        raise ValueError("sample_count cannot exceed the number of costs")
+    if sample_count == 1:
+        return jnp.zeros((1,), dtype=jnp.int32)
+
+    finite_costs = jnp.where(jnp.isfinite(costs[1:]), costs[1:], jnp.inf)
+    _, lowest_indices = jax.lax.top_k(-finite_costs, sample_count - 1)
+    return jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.int32),
+            lowest_indices.astype(jnp.int32) + 1,
+        ]
+    )
+
+
 class RolloutGenerator:
     def __init__(self, model: BaseModel, objective: BaseObjective, config: Config):
         """
@@ -86,18 +106,21 @@ class RolloutGenerator:
 
         self.compute_gains = config.MPC.gains
         self.gain_method = config.MPC.gain_method
+        self.compute_exact_gains = self.compute_gains and self.gain_method == "exact"
         configured_gain_samples = config.MPC.num_gain_samples
         self.num_gain_samples = (
             self.num_parallel_computations
             if configured_gain_samples is None
             else int(configured_gain_samples)
         )
-        if self.num_gain_samples > self.num_parallel_computations:
+        if (
+            self.compute_exact_gains
+            and self.num_gain_samples > self.num_parallel_computations
+        ):
             raise ValueError(
                 f"num_gain_samples ({self.num_gain_samples}) cannot exceed "
                 f"num_parallel_computations ({self.num_parallel_computations})."
             )
-        self.compute_exact_gains = self.compute_gains and self.gain_method == "exact"
 
         # Covariance of the input action
         # self.sigma_mppi = jnp.diag(config.MPC.std_dev_mppi**2)
@@ -307,20 +330,25 @@ class RolloutGenerator:
         if reference.ndim == 1:
             reference = jnp.tile(reference, (self.horizon + 1, 1))
 
-        costs, control_vars_all = self.rollout_all(
-            state, reference, control_vars_all
+        sampled_control_vars = control_vars_all
+        costs, control_actions_all = self.rollout_all(
+            state, reference, sampled_control_vars
         )
         samples_delta_clipped = self.compute_samples_delta(
-            control_vars_all, optimal_samples
+            control_actions_all, optimal_samples
         )
 
         if self.compute_exact_gains:
-            gain_control_vars = control_vars_all[: self.num_gain_samples]
+            gain_indices = select_nominal_and_lowest_cost_indices(
+                costs,
+                self.num_gain_samples,
+            )
+            gain_control_vars = sampled_control_vars[gain_indices]
             gradients = self.rollout_gradients_to_state(
                 state, reference, gain_control_vars
             )
-            gain_costs = costs[: self.num_gain_samples]
-            gain_samples = samples_delta_clipped[: self.num_gain_samples]
+            gain_costs = costs[gain_indices]
+            gain_samples = samples_delta_clipped[gain_indices]
         else:
             gradients = None
             gain_costs = None
