@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import numpy as np
+import jax
 import jax.numpy as jnp
 import mujoco
 import mujoco.mjx as mjx
@@ -312,6 +313,10 @@ class Simulation(Simulator):
         input_sequence = self.controller.command(
             state_vec, self.const_reference, num_steps=1
         ).block_until_ready()
+        if self.controller.gains_obj.compute_gains:
+            # Synchronize the independent gain result before reporting latency.
+            jax.block_until_ready(self.controller.gains)
+
         ctrl = jnp.clip(
             input_sequence[0, :], self.model.input_min, self.model.input_max
         ).block_until_ready()
@@ -423,12 +428,53 @@ def build_model_and_solver(
     return solver_dynamics_model, Controller(rollout_generator, sampler, gains)
 
 
+def warmup_controller(
+    controller: Controller,
+    state: jnp.ndarray,
+    reference: jnp.ndarray,
+    *,
+    iterations: int = 3,
+) -> jnp.ndarray:
+    """Compile and execute every synchronous controller output used at runtime."""
+    if iterations < 1:
+        raise ValueError("controller warmup iterations must be positive")
+
+    sampler = controller.sampler
+    initial_optimal_samples = sampler.optimal_samples
+    initial_master_key = sampler.master_key
+    initial_gains = controller.gains_obj.cur_gains
+    input_sequence = initial_optimal_samples
+
+    try:
+        for _ in range(iterations):
+            input_sequence = controller.command(
+                state,
+                reference,
+                shift_guess=True,
+                num_steps=1,
+            )
+            jax.block_until_ready(input_sequence)
+            if controller.gains_obj.compute_gains:
+                jax.block_until_ready(controller.gains)
+            jax.block_until_ready(sampler.optimal_samples)
+        jax.effects_barrier()
+    finally:
+        # Warmup must not consume samples or change the initial MPC solution.
+        sampler.optimal_samples = initial_optimal_samples
+        sampler.master_key = initial_master_key
+        controller.gains_obj.cur_gains = initial_gains
+
+    return input_sequence
+
+
 def build_all(
     config: settings.Config,
     objective: BaseObjective,
     reference: jnp.array,
     custom_dynamics_fn: Optional[Callable] = None,
     obstacles: bool = True,
+    controller_warmup_iterations: int = 1,
+    integrated_state_warmup_iterations: int = 0,
 ):
     system, x_init, state_init = (None, None, None)
     solver_dynamics_model_setting = config.solver_dynamics
@@ -475,11 +521,29 @@ def build_all(
         obstacles,
     )
 
-    # dummy for jitting
-    input_sequence = sim.controller.command(
+    input_sequence = warmup_controller(
+        sim.controller,
         solver_x_init,
         reference,
-        False,
-    ).block_until_ready()
+        iterations=controller_warmup_iterations,
+    )
+
+    # Runtime simulation uses a Python float dt, which is a distinct JAX
+    # specialization from the strongly typed rollout dt. Compile it before the
+    # closed loop starts, without changing the actual initial state.
+    if isinstance(sim_state_init, (np.ndarray, jnp.ndarray)):
+        warm_control = jnp.clip(
+            input_sequence[0], sim.model.input_min, sim.model.input_max
+        )
+        warm_state = sim.model.integrate_sim(sim_state_init, warm_control, sim.dt)
+        jax.block_until_ready(warm_state)
+        jax.effects_barrier()
+        if integrated_state_warmup_iterations > 0:
+            warmup_controller(
+                sim.controller,
+                warm_state,
+                reference,
+                iterations=integrated_state_warmup_iterations,
+            )
 
     return sim

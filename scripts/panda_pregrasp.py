@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import time
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,7 @@ from sbmpc.controller.franka_emika_panda.panda_pregrasp import (
     PandaPregraspPlanner,
     make_panda_pregrasp_config,
 )
+from sbmpc.jax_runtime import configure_jax_compilation_cache
 from sbmpc.ocp import load_ocp_config
 from sbmpc.simulation import build_all
 
@@ -75,6 +77,7 @@ def validate(
     gains_enabled,
     success_tol,
     limit_fraction,
+    control_period_ms,
 ) -> bool:
     tau_lim = np.asarray(planner.torque_limits, dtype=float)
     vel_lim = np.asarray(planner.velocity_limits, dtype=float)
@@ -147,16 +150,25 @@ def validate(
         print("  disabled in yaml")
 
     timing = np.asarray(planning_ms)
+    steady_timing = timing[1:] if timing.size > 1 else timing
+    timing_p95 = float(np.percentile(steady_timing, 95))
+    timing_ok = bool(
+        np.all(np.isfinite(steady_timing)) and timing_p95 <= control_period_ms
+    )
     print("\n-- 4. MPC COMPUTATION TIME --")
     print(
-        f"  median={np.median(timing):.1f} ms  p95={np.percentile(timing, 95):.1f} ms  "
-        f"max={np.max(timing):.1f} ms"
+        f"  steady median={np.median(steady_timing):.1f} ms  p95={timing_p95:.1f} ms  "
+        f"max={np.max(steady_timing):.1f} ms"
+    )
+    print(
+        f"  budget={control_period_ms:.1f} ms -> {'OK' if timing_ok else 'TOO SLOW'}"
     )
 
-    ok = reached and within and gains_ok
+    ok = reached and within and gains_ok and timing_ok
     print("\n" + "-" * 66)
     print(
-        f"VERDICT: {'PASS' if ok else 'FAIL'}  (reached={reached}, within_limits={within}, gains_ok={gains_ok})"
+        f"VERDICT: {'PASS' if ok else 'FAIL'}  (reached={reached}, within_limits={within}, "
+        f"gains_ok={gains_ok}, timing_ok={timing_ok})"
     )
     print("-" * 66)
     return ok
@@ -164,12 +176,14 @@ def validate(
 
 def main() -> None:
     args = parse_args()
+    cache_dir = configure_jax_compilation_cache()
     ocp = load_ocp_config(args.ocp)
     planner = PandaPregraspPlanner()
     objective = PandaPregraspObjective(planner, ocp_config=ocp)
     config = make_panda_pregrasp_config(planner, visualize=not args.headless, ocp=ocp)
 
     print(f"JAX backend: {jax.default_backend()}  |  ocp={ocp.name}")
+    print(f"JAX compilation cache: {cache_dir or 'disabled'}")
     print(
         f"mpc: horizon={ocp.mpc.horizon} samples={ocp.mpc.num_samples} "
         f"lambda={ocp.mpc.lambda_mpc} std_dev_scale={ocp.mpc.std_dev_scale} "
@@ -178,16 +192,24 @@ def main() -> None:
     print(f"goal_pos = {np.asarray(planner.goal_pos)}")
     if config.MPC.gains:
         print(
-            "note: gains=true compiles the exact-gain backprop on the first step "
-            "(can take ~1 min — not a hang)."
+            "note: the first run compiles exact-gain kernels during explicit warmup; "
+            "subsequent runs reuse the persistent cache."
         )
 
+    print("compiling and warming controller kernels ...", flush=True)
+    warmup_start = time.perf_counter()
     sim = build_all(
         config,
         objective,
         objective.reference_vector(),
         custom_dynamics_fn=planner.dynamics,
         obstacles=False,
+        controller_warmup_iterations=3,
+        integrated_state_warmup_iterations=3,
+    )
+    print(
+        f"controller warmup complete in {time.perf_counter() - warmup_start:.1f} s",
+        flush=True,
     )
     sim.planner = planner
     gain_norm: list[float] = []
@@ -226,6 +248,7 @@ def main() -> None:
         gains_enabled=config.MPC.gains,
         success_tol=args.success_tol,
         limit_fraction=args.limit_fraction,
+        control_period_ms=1000.0 * config.MPC.dt,
     )
 
 
