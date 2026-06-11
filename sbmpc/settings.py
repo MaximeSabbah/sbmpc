@@ -150,13 +150,10 @@ class MPCConfig:
         self._horizon = 1
         self._num_parallel_computations = 1000
         self._lambda_mpc = 1.0
-        self._filter = None
         self._gains = False
         self._gain_method = "exact"
         self._num_gain_samples = None
-        self._sensitivity = False
         self._smoothing = None
-        self._augmented_reference = None
         self._num_control_points = 0
         self._nu = config.nu
 
@@ -236,14 +233,6 @@ class MPCConfig:
         self._initial_guess = value
 
     @property
-    def filter(self):
-        return self._filter
-
-    @filter.setter
-    def filter(self, value):
-        self._filter = value
-
-    @property
     def gains(self):
         return self._gains
 
@@ -277,16 +266,6 @@ class MPCConfig:
         self._num_gain_samples = value
 
     @property
-    def sensitivity(self):
-        return self._sensitivity
-
-    @sensitivity.setter
-    def sensitivity(self, value):
-        if not isinstance(value, bool):
-            raise ValueError("bool type is expected")
-        self._sensitivity = value
-
-    @property
     def smoothing(self):
         return self._smoothing
 
@@ -298,14 +277,6 @@ class MPCConfig:
         if value not in supported_smoothing:
             raise ValueError(f"smoothing not supported. Choose from {supported_smoothing}")
         self._smoothing = value
-
-    @property
-    def augmented_reference(self):
-        return self._augmented_reference
-
-    @augmented_reference.setter
-    def augmented_reference(self, value):
-        self._augmented_reference = value
 
     @property
     def num_control_points(self):

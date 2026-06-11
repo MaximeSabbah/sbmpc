@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import time
 
 import jax
@@ -41,6 +41,15 @@ class GripperCommand:
 
 @dataclass(frozen=True)
 class PlannerDiagnostics:
+    """Per-step planner report.
+
+    ``planning_time_ms`` is the foreground planning latency: the blocked
+    ``controller.command`` call plus fetching the feedback gains.
+    ``planner_prepare_time_ms`` (input conversion/seeding) and
+    ``planner_command_time_ms`` (the blocked command call alone) are its
+    main components.
+    """
+
     planning_time_ms: float
     running_cost: float | None
     gain_norm: float
@@ -50,14 +59,8 @@ class PlannerDiagnostics:
     object_error: float | None
     goal_position: np.ndarray
     gain_mode: str | None = None
-    foreground_planning_time_ms: float | None = None
-    planner_api_wall_time_ms: float | None = None
     planner_prepare_time_ms: float | None = None
     planner_command_time_ms: float | None = None
-    planner_tau_extract_time_ms: float | None = None
-    planner_gain_fetch_time_ms: float | None = None
-    planner_task_diagnostics_time_ms: float | None = None
-    planner_output_build_time_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -193,7 +196,6 @@ class PandaPickAndPlaceController:
         num_steps: int | None = None,
         reset_guess: bool = False,
     ) -> PlannerOutput:
-        api_start = time.perf_counter()
         prepare_start = time.perf_counter()
         phase = Phase(phase)
         q = self._joint_vector(q, self.planner.nq, "q")
@@ -229,15 +231,10 @@ class PandaPickAndPlaceController:
         self._solution_initialized = True
         self._last_reference_signature = reference_signature
 
-        tau_start = time.perf_counter()
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
-        planner_tau_extract_time_ms = 1000.0 * (time.perf_counter() - tau_start)
-        gain_start = time.perf_counter()
         gains_array = _current_gains_numpy(self.controller)
-        planner_gain_fetch_time_ms = 1000.0 * (time.perf_counter() - gain_start)
         planning_time_ms = 1000.0 * (time.perf_counter() - command_start)
 
-        diagnostics_start = time.perf_counter()
         position_error = None
         orientation_error = None
         object_error = None
@@ -269,13 +266,9 @@ class PandaPickAndPlaceController:
                     )
                 )
             )
-        planner_task_diagnostics_time_ms = 1000.0 * (
-            time.perf_counter() - diagnostics_start
-        )
 
-        build_start = time.perf_counter()
         gripper_width = float(self.planner.gripper_target(phase))
-        output = PlannerOutput(
+        return PlannerOutput(
             tau_ff=tau_ff,
             K=gains_array,
             phase=phase,
@@ -298,25 +291,10 @@ class PandaPickAndPlaceController:
                 object_error=object_error,
                 goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
                 gain_mode=self.gain_mode,
-                foreground_planning_time_ms=planning_time_ms,
                 planner_prepare_time_ms=planner_prepare_time_ms,
                 planner_command_time_ms=planner_command_time_ms,
-                planner_tau_extract_time_ms=planner_tau_extract_time_ms,
-                planner_gain_fetch_time_ms=planner_gain_fetch_time_ms,
-                planner_task_diagnostics_time_ms=planner_task_diagnostics_time_ms,
             ),
         )
-        output_build_ms = 1000.0 * (time.perf_counter() - build_start)
-        api_wall_ms = 1000.0 * (time.perf_counter() - api_start)
-        return replace(
-            output,
-            diagnostics=replace(
-                output.diagnostics,
-                planner_api_wall_time_ms=api_wall_ms,
-                planner_output_build_time_ms=output_build_ms,
-            ),
-        )
-
 
     @staticmethod
     def _joint_vector(values: np.ndarray, size: int, name: str) -> jax.Array:
@@ -389,7 +367,6 @@ class PandaPregraspController:
         gains: bool = True,
         num_steps: int = 1,
         visualize: bool = False,
-        reseed_every_step: bool = False,
         gain_mode: str | None = None,
         compute_running_cost: bool = True,
         compute_task_diagnostics: bool = True,
@@ -399,11 +376,6 @@ class PandaPregraspController:
         if ocp_config is None:
             ocp_config = load_ocp_config("pregrasp")
         self.objective = PandaPregraspObjective(self.planner, ocp_config=ocp_config)
-        if reseed_every_step:
-            raise ValueError(
-                "reseed_every_step is not supported. The shifted MPPI solution "
-                "is the controller warm start."
-            )
         self.config = (
             make_panda_pregrasp_config(
                 self.planner, visualize=visualize, gains=gains, ocp=ocp_config
@@ -461,7 +433,6 @@ class PandaPregraspController:
         reset_guess: bool = False,
     ) -> PlannerOutput:
         del phase, object_pose, target_pose
-        api_start = time.perf_counter()
         prepare_start = time.perf_counter()
         q = PandaPickAndPlaceController._joint_vector(q, self.planner.nq, "q")
         v = PandaPickAndPlaceController._joint_vector(v, self.planner.nv, "v")
@@ -484,15 +455,10 @@ class PandaPregraspController:
         planner_command_time_ms = 1000.0 * (time.perf_counter() - command_start)
         self._solution_initialized = True
 
-        tau_start = time.perf_counter()
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
-        planner_tau_extract_time_ms = 1000.0 * (time.perf_counter() - tau_start)
-        gain_start = time.perf_counter()
         gains_array = _current_gains_numpy(self.controller)
-        planner_gain_fetch_time_ms = 1000.0 * (time.perf_counter() - gain_start)
         planning_time_ms = 1000.0 * (time.perf_counter() - command_start)
 
-        diagnostics_start = time.perf_counter()
         reference = self.planner.reference
         position_error = None
         orientation_error = None
@@ -519,12 +485,8 @@ class PandaPregraspController:
                     )
                 )
             )
-        planner_task_diagnostics_time_ms = 1000.0 * (
-            time.perf_counter() - diagnostics_start
-        )
 
-        build_start = time.perf_counter()
-        output = PlannerOutput(
+        return PlannerOutput(
             tau_ff=tau_ff,
             K=gains_array,
             phase=self.PHASE_NAME,
@@ -540,22 +502,8 @@ class PandaPregraspController:
                 object_error=None,
                 goal_position=np.asarray(reference.goal_pos, dtype=np.float32),
                 gain_mode=self.gain_mode,
-                foreground_planning_time_ms=planning_time_ms,
                 planner_prepare_time_ms=planner_prepare_time_ms,
                 planner_command_time_ms=planner_command_time_ms,
-                planner_tau_extract_time_ms=planner_tau_extract_time_ms,
-                planner_gain_fetch_time_ms=planner_gain_fetch_time_ms,
-                planner_task_diagnostics_time_ms=planner_task_diagnostics_time_ms,
-            ),
-        )
-        output_build_ms = 1000.0 * (time.perf_counter() - build_start)
-        api_wall_ms = 1000.0 * (time.perf_counter() - api_start)
-        return replace(
-            output,
-            diagnostics=replace(
-                output.diagnostics,
-                planner_api_wall_time_ms=api_wall_ms,
-                planner_output_build_time_ms=output_build_ms,
             ),
         )
 

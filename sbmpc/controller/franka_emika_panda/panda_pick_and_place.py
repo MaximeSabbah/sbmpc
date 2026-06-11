@@ -7,6 +7,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pinocchio as pin
 
 from sbmpc.settings import Config, DynamicsModel, RobotConfig
 from sbmpc.costs import FactoryObjective
@@ -289,6 +290,65 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
         if phase == Phase.PLACE:
             return target_pos + self.place_offset
         return target_pos
+
+    def _cubic_joint_trajectory(
+        self,
+        q_start: jax.Array,
+        v_start: jax.Array,
+        q_goal: jax.Array,
+        horizon: int,
+        dt: float,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Cubic joint trajectory with current velocity and zero terminal velocity."""
+        q_start = jnp.asarray(q_start, dtype=jnp.float32)
+        v_start = jnp.asarray(v_start, dtype=jnp.float32)
+        q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
+        time = (jnp.arange(horizon, dtype=jnp.float32) * jnp.float32(dt))[
+            :, jnp.newaxis
+        ]
+        t_final = jnp.maximum(time[-1, 0], 1e-6)
+        delta_q = q_goal - q_start
+
+        v_goal = jnp.zeros_like(v_start)
+        c0 = q_start
+        c1 = v_start
+        c2 = (3.0 * delta_q - (2.0 * v_start + v_goal) * t_final) / (t_final**2)
+        c3 = (-2.0 * delta_q + (v_start + v_goal) * t_final) / (t_final**3)
+
+        q = c0 + c1 * time + c2 * time**2 + c3 * time**3
+        v = c1 + 2.0 * c2 * time + 3.0 * c3 * time**2
+        ddq = 2.0 * c2 + 6.0 * c3 * time
+        return q.astype(jnp.float32), v.astype(jnp.float32), ddq.astype(jnp.float32)
+
+    def nominal_torque_sequence_to_goal(
+        self,
+        state: jax.Array,
+        goal_q: jax.Array,
+        horizon: int,
+        dt: float,
+    ) -> jax.Array:
+        """Receding inverse-dynamics seed from the current arm state to a goal pose."""
+        state = jnp.asarray(state, dtype=jnp.float32)
+        q, v, ddq = self._cubic_joint_trajectory(
+            state[: self.nq],
+            state[self.nq : self.nq + self.nv],
+            jnp.asarray(goal_q, dtype=jnp.float32),
+            horizon,
+            dt,
+        )
+        q_np = np.asarray(q, dtype=np.float64)
+        v_np = np.asarray(v, dtype=np.float64)
+        ddq_np = np.asarray(ddq, dtype=np.float64)
+        tau = np.stack(
+            [
+                pin.rnea(self.pin_model, self.pin_data, q_np[i], v_np[i], ddq_np[i])
+                for i in range(horizon)
+            ]
+        )
+        tau = jnp.asarray(tau, dtype=jnp.float32)
+        return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(
+            jnp.float32
+        )
 
     def nominal_torque_sequence_from_state(
         self,

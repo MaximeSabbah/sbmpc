@@ -40,10 +40,6 @@ class BaseModel(ABC):
     def integrate_rollout_single(self, state, inputs, dt):
         pass
 
-    def sensitivity_step(self, state, inputs, params, state_sensitivity, input_sensitivity, dt):
-        pass
-
-
 
 class ModelParametric(BaseModel):
     def __init__(self, model_dynamics_parametric,
@@ -73,8 +69,6 @@ class ModelParametric(BaseModel):
             Available types: si_euler, euler, rk4, custom_discrete, mjx
             """)
 
-        self.partial_sens_all = jax.jacfwd(self.integrate_parametric, argnums=(0, 1, 2))
-
     def integrate_rk4(self, state, inputs, params, dt: float):
         """
         One-step integration of the dynamics using Rk4 method
@@ -99,15 +93,6 @@ class ModelParametric(BaseModel):
         v_kp1 = state[self.nq:] + dt * state_dot[self.nq:]
         q_kp1 = state[:self.nq] + dt * v_kp1
         return jnp.concatenate([q_kp1, v_kp1])
-
-    def sensitivity_step(self, state, inputs, params, state_sensitivity, input_sensitivity, dt):
-
-        p_sens_all = self.partial_sens_all(state, inputs, params, dt)
-        p_sens_state = p_sens_all[0]
-        p_sens_inputs = p_sens_all[1]
-        p_sens_params = p_sens_all[2]
-
-        return p_sens_state @ state_sensitivity + p_sens_inputs @ input_sensitivity + p_sens_params
 
 
 class Model(ModelParametric):

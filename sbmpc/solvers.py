@@ -122,15 +122,11 @@ class RolloutGenerator:
                 f"num_parallel_computations ({self.num_parallel_computations})."
             )
 
-        # Covariance of the input action
-        # self.sigma_mppi = jnp.diag(config.MPC.std_dev_mppi**2)
-
         self.num_control_points = config.MPC.num_control_points
         self.control_points_sparsity = self.horizon // self.num_control_points
 
         self.input_max_full_horizon = jnp.tile(model.input_max, (self.horizon, 1))
         self.input_min_full_horizon = jnp.tile(model.input_min, (self.horizon, 1))
-        self.clip_input = jax.jit(self.clip_input, device=self.device)
 
         self.control_spline_indices = jnp.round(
             jnp.linspace(0, self.horizon - 1, self.num_control_points)
@@ -144,8 +140,6 @@ class RolloutGenerator:
         else:
             self.control_interp_matrix = None
 
-        # self.gains = jnp.zeros((model.nu, model.nx))
-        # self.ctrl_sens_to_state = jax.jit(jax.jacfwd(self.compute_control_mppi, argnums=0, has_aux=True), device=self.device)
         if self.compute_exact_gains:
             self.rollout_gradients_to_state = jax.jit(
                 jax.vmap(
@@ -162,12 +156,6 @@ class RolloutGenerator:
         self.cost_and_constraints = self.objective.cost_and_constraints
         self.final_cost_and_constraints = self.objective.final_cost_and_constraints
 
-    @partial(jax.vmap, in_axes=(None, 0), out_axes=0)
-    def clip_input(self, control_variables):
-        return jnp.clip(
-            control_variables, self.input_min_full_horizon, self.input_max_full_horizon
-        )
-
     def clip_input_single(self, control_variables):
         return jnp.clip(
             control_variables, self.input_min_full_horizon, self.input_max_full_horizon
@@ -175,12 +163,7 @@ class RolloutGenerator:
 
     @partial(jax.vmap, in_axes=(None, None, None, 0), out_axes=(0, 0))
     def rollout_all(self, initial_state, reference, control_variables):
-        if self.config.MPC.sensitivity:
-            return self.rollout_single_with_sensitivity(
-                initial_state, reference, control_variables
-            )
-        else:
-            return self.rollout_single(initial_state, reference, control_variables)
+        return self.rollout_single(initial_state, reference, control_variables)
 
     def interpolate_control(self, control_variables):
         """ "
@@ -217,34 +200,15 @@ class RolloutGenerator:
 
         return cost, control_variables
 
-    def rollout_single_with_state_gradient(
-        self, initial_state, reference, control_variables
-    ):
-        """Rollout cost plus dJ/dx using forward-mode AD.
-
-        This is the Feedback-MPPI gain path from the original implementation,
-        but computed with forward sensitivities so MJX dynamics remain
-        differentiable. Reverse-mode AD through MJX's internal solver while
-        loops is not supported by JAX.
-        """
-        cost_and_control = self.rollout_single(
-            initial_state, reference, control_variables
-        )
-
-        def cost_from_state(state):
-            cost, _ = self.rollout_single(state, reference, control_variables)
-            return cost
-
-        basis = jnp.eye(self.model.nx, dtype=self.dtype_general)
-        gradient = jax.vmap(
-            lambda tangent: jax.jvp(cost_from_state, (initial_state,), (tangent,))[1]
-        )(basis)
-        return cost_and_control, gradient
-
     def rollout_single_state_gradient(
         self, initial_state, reference, control_variables
     ):
-        """Compute only dJ/dx for one already-scored control sample."""
+        """Compute dJ/dx for one already-scored control sample.
+
+        This is the Feedback-MPPI gain path, computed with forward-mode AD
+        (jvp) so MJX dynamics remain differentiable. Reverse-mode AD through
+        MJX's internal solver while loops is not supported by JAX.
+        """
 
         def cost_from_state(state):
             cost, _ = self.rollout_single(state, reference, control_variables)
@@ -254,69 +218,6 @@ class RolloutGenerator:
         return jax.vmap(
             lambda tangent: jax.jvp(cost_from_state, (initial_state,), (tangent,))[1]
         )(basis)
-
-    def rollout_single_with_sensitivity(
-        self, initial_state, reference, control_variables
-    ):
-        cost = jnp.asarray(0.0, dtype=self.dtype_general)
-        curr_state = initial_state
-        curr_state_sens = jnp.zeros((self.model.nx, self.model.np))
-
-        control_variables = self.interpolate_control(control_variables)
-
-        def cost_and_state_rollout(idx, cost_and_state):
-            cost, curr_state = cost_and_state
-            cost += self.dt * self.cost_and_constraints(
-                curr_state, control_variables[idx, :], reference[idx, :]
-            )
-            next_state = self.model.integrate_rollout_single(
-                curr_state, control_variables[idx, :], self.dt
-            )
-
-            return cost, next_state
-
-        cost, final_state = jax.lax.fori_loop(
-            0, self.horizon, cost_and_state_rollout, (cost, curr_state)
-        )
-
-        cost += self.final_cost_and_constraints(final_state, reference[self.horizon, :])
-
-        return cost, control_variables
-
-    # TODO UPDATE
-    # @partial(jax.vmap, in_axes=(None, None, None, 0, None), out_axes=(0, 0))
-    # def rollout_with_sensitivity(self, initial_state, reference, control_variables, mppi_gains):
-    #     """
-    #     Rollout of the system and associated parametric sensitivity dynamics
-    #     :param initial_state:
-    #     :param reference:
-    #     :param control_variables:
-    #     :param mppi_gains:
-    #     :return:
-    #     """
-    #     cost = 0
-    #     curr_state_sens = jnp.zeros((self.model.nx, self.model.np))
-    #     curr_state = initial_state
-    #     input_sequence = jnp.zeros((self.horizon, self.model.nu), dtype=self.dtype_general)
-    #     if self.config.MPC["smoothing"] == "Spline":
-    #         control_interp = cubic_spline(jnp.arange(0, self.horizon, self.control_points_sparsity),
-    #                                     control_variables,
-    #                                     jnp.arange(0, self.horizon))
-    #         control_variables = self.clip_input_single(control_interp)
-
-    #     for idx in range(self.horizon):
-    #         curr_input = jax.lax.dynamic_slice(control_variables, (idx, 0), (1, self.model.nu)).reshape(-1)
-    #         curr_input_sens = mppi_gains @ curr_state_sens
-    #         cost_and_constraints = self.cost_and_constraints((curr_state, curr_state_sens), (curr_input, curr_input_sens), reference[idx, :])
-    #         # Integrate the dynamics
-    #         curr_state = self.model.integrate_rollout_single(curr_state[:self.model.nx], curr_input, self.dt)
-    #         curr_state_sens = self.model.sensitivity_step(curr_state, curr_input, self.model.nominal_parameters, curr_state_sens, curr_input_sens, self.dt)
-    #         cost += cost_and_constraints
-    #         input_sequence = input_sequence.at[idx, :].set(curr_input)
-
-    #     cost += self.final_cost_and_constraints((curr_state, curr_state_sens), reference[self.horizon, :])
-
-    #     return cost, input_sequence
 
     @partial(jax.jit, static_argnums=(0,))
     def do_rollout(self, state, reference, optimal_samples, samples_delta):

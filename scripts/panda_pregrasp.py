@@ -203,7 +203,6 @@ def main() -> None:
         objective,
         objective.reference_vector(),
         custom_dynamics_fn=planner.dynamics,
-        obstacles=False,
         controller_warmup_iterations=3,
         integrated_state_warmup_iterations=3,
     )

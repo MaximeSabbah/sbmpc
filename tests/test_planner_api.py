@@ -1,6 +1,5 @@
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from sbmpc.controller.franka_emika_panda.planner_api import PandaPickAndPlaceController, PandaPregraspController, TaskPose
 from sbmpc.controller.franka_emika_panda.panda_pregrasp import PandaPregraspPlanner, make_panda_pregrasp_config
@@ -163,7 +162,7 @@ def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     assert np.all(np.isfinite(output.tau_ff))
     assert np.all(np.isfinite(output.K))
     assert output.diagnostics.gain_mode == "exact_feedback"
-    assert output.diagnostics.foreground_planning_time_ms is not None
+    assert output.diagnostics.planner_command_time_ms is not None
 
 
 
@@ -193,40 +192,13 @@ def test_panda_pregrasp_controller_can_skip_task_diagnostics() -> None:
     assert output.diagnostics.goal_position.shape == (3,)
 
 
-def test_panda_pregrasp_controller_does_not_use_cubic_trajectory_seed() -> None:
-    controller = build_pregrasp_controller(gains=True)
-    call_count = 0
-    original = controller.planner.nominal_torque_sequence_from_state
-
-    def wrapped(state, horizon, dt):
-        nonlocal call_count
-        call_count += 1
-        return original(state, horizon, dt)
-
-    controller.planner.nominal_torque_sequence_from_state = wrapped
-
-    q = controller.planner.home_q
-    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
-    controller.step(q, v)
-    controller.step(q, v)
-
-    assert call_count == 0
-
-
-def test_panda_pregrasp_controller_rejects_per_step_trajectory_reseed() -> None:
+def test_panda_pregrasp_planner_has_no_inverse_dynamics_seed() -> None:
+    # The pregrasp controller optimizes from a gravity-hold warm start; the
+    # cubic/inverse-dynamics tracking seed was removed on purpose.
     planner = PandaPregraspPlanner()
-    config = make_panda_pregrasp_config(planner, visualize=False, gains=True)
-    config.MPC.horizon = 4
-    config.MPC.num_parallel_computations = 8
-    config.MPC.num_control_points = 2
-    config.MPC.num_gain_samples = 4
-
-    with pytest.raises(ValueError, match="reseed_every_step"):
-        PandaPregraspController(
-            planner=planner,
-            config=config,
-            reseed_every_step=True,
-        )
+    assert not hasattr(planner, "nominal_torque_sequence_from_state")
+    assert not hasattr(planner, "nominal_torque_sequence_to_goal")
+    assert not hasattr(planner, "nominal_torque_sequence")
 
 
 def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:
@@ -277,15 +249,7 @@ def test_panda_pregrasp_controller_reset_runtime_state_after_warmup_keeps_optimi
     assert controller._started is False
     assert controller._solution_initialized is False
 
-    call_count = 0
-    original = controller.planner.nominal_torque_sequence_from_state
+    output = controller.step(q, v)
 
-    def wrapped(state, horizon, dt):
-        nonlocal call_count
-        call_count += 1
-        return original(state, horizon, dt)
-
-    controller.planner.nominal_torque_sequence_from_state = wrapped
-    controller.step(q, v)
-
-    assert call_count == 0
+    assert controller._solution_initialized is True
+    assert np.all(np.isfinite(output.tau_ff))

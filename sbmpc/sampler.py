@@ -16,7 +16,6 @@ class Sampler(ABC):
         self.dtype_general = config.general.dtype
         self.lam = jnp.asarray(config.MPC.lambda_mpc, dtype=self.dtype_general)
         self.std_dev = jnp.asarray(config.MPC.std_dev_mppi, dtype=self.dtype_general)
-        self.std_dev_horizon = jnp.tile(self.std_dev, self.num_control_points)
         # Monte-carlo samples, that is the number of trajectories that are evaluated in parallel
         self.num_parallel_computations = config.MPC.num_parallel_computations
         if config.MPC.initial_guess is None:
@@ -41,19 +40,11 @@ class Sampler(ABC):
         # scaffolding for storing all the control actions on the prediction horizon for each rollout
         self.zero_random_deviations = jnp.zeros((self.num_parallel_computations, self.num_control_points, self.model_nu), dtype=self.dtype_general)
 
-        # this is initialized at the first interation
-        self.additional_random_samples_clipped = None
-
         self.master_key = jax.random.PRNGKey(420)
 
-        
-
     @abstractmethod
-    def sample_input_sequence(self,key) -> jnp.ndarray:
+    def sample_input_sequence(self, key) -> jnp.ndarray:
         pass
-
-    #def compute_next_best(self,samples, costs) -> jnp.ndarray:
-    #    pass
 
     @abstractmethod
     def update(self, initial_guess, samples, costs) -> jnp.ndarray:
@@ -62,22 +53,6 @@ class Sampler(ABC):
     def _update_key(self):
         newkey, subkey = jax.random.split(self.master_key)
         self.master_key = newkey
-
-
-class CEMSampler(Sampler):
-
-    def __init__(self,config: Config) -> None:
-        super().__init__(config)
-
-    def sample_input_sequence(self, key) -> jnp.ndarray:
-        # Return zero or your logic
-        return jnp.zeros(
-            (self.num_parallel_computations - 1, self.num_control_points, self.model_nu)
-        )
-
-    def update(self, initial_guess, samples, costs)-> jnp.ndarray:
-        return initial_guess
-
 
 
 class MPPISampler(Sampler):
@@ -115,10 +90,3 @@ class MPPISampler(Sampler):
 
     def _exp_costs_shifted(self, costs, best_cost) -> jnp.ndarray:
         return jnp.exp(- self.lam * (costs - best_cost))
-    
-
-        
-
-  
-
-

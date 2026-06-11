@@ -50,13 +50,6 @@ N_TRIALS = 100
 N_QUALITY = 60   # simulation steps for convergence / gain-stability check
 
 
-def _reset_initial_guess(planner, config):
-    config.MPC.initial_guess = planner.nominal_torque_sequence(
-        config.MPC.horizon,
-        config.MPC.dt,
-    )
-
-
 def _block_command(controller, state, ref):
     """Run one command step and block until all GPU work is done."""
     result = controller.command(state, ref, num_steps=1)
@@ -77,7 +70,6 @@ def _run_headless(planner, objective, config, n_trials=N_TRIALS, label=""):
         objective,
         objective.reference_vector(),
         custom_dynamics_fn=planner.dynamics,
-        obstacles=False,
     )
     state = sim.current_state_vec()
     ref = sim.const_reference
@@ -122,12 +114,6 @@ def _run_quality(planner, objective, config, n_steps=N_QUALITY):
         objective,
         objective.reference_vector(),
         custom_dynamics_fn=planner.dynamics,
-        obstacles=False,
-    )
-    sim.warm_start_fn = lambda state: planner.nominal_torque_sequence_from_state(
-        state,
-        config.MPC.horizon,
-        config.MPC.dt,
     )
 
     errors = []
@@ -247,12 +233,6 @@ def run_visual(planner, objective, config):
         objective,
         objective.reference_vector(),
         custom_dynamics_fn=planner.dynamics,
-        obstacles=False,
-    )
-    sim.warm_start_fn = lambda state: planner.nominal_torque_sequence_from_state(
-        state,
-        config.MPC.horizon,
-        config.MPC.dt,
     )
 
     def post_update(s):
@@ -342,7 +322,6 @@ def main():
         if args.control_points is not None:
             config.MPC.num_control_points = args.control_points
         _apply_gain_knobs(config)
-        _reset_initial_guess(planner, config)
         run_visual(planner, objective, config)
         return
 
@@ -372,7 +351,6 @@ def main():
                     config.MPC.num_parallel_computations = s
                     config.MPC.num_control_points = cp
                     _apply_gain_knobs(config)
-                    _reset_initial_guess(planner, config)
                     label = (
                         f"h={h:2d} n={s:4d} cp={cp} "
                         f"gain_samples={config.MPC.num_gain_samples} "
@@ -413,8 +391,6 @@ def main():
     if args.control_points is not None:
         config.MPC.num_control_points = args.control_points
     _apply_gain_knobs(config)
-    if any(v is not None for v in (args.horizon, args.samples, args.control_points)):
-        _reset_initial_guess(planner, config)
 
     label = (
         f"h={config.MPC.horizon} n={config.MPC.num_parallel_computations} "
@@ -437,7 +413,6 @@ def main():
         config_ng.MPC.horizon = config.MPC.horizon
         config_ng.MPC.num_parallel_computations = config.MPC.num_parallel_computations
         config_ng.MPC.num_control_points = config.MPC.num_control_points
-        _reset_initial_guess(planner, config_ng)
         label_ng = (
             f"h={config_ng.MPC.horizon} n={config_ng.MPC.num_parallel_computations} "
             f"cp={config_ng.MPC.num_control_points} gains=False"

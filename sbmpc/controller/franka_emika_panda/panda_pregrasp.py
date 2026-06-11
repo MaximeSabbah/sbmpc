@@ -30,7 +30,7 @@ _ARM_TORQUE_LIMITS = jnp.array(
 )
 _ARM_VELOCITY_LIMITS = jnp.array(
     [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26], dtype=jnp.float32
-)  # FR3 ("fer") joint velocity limits, used to pace the warm-start seed.
+)  # FR3 ("fer") joint velocity limits, used by the validation criteria.
 PREGRASP_CLEARANCE = 0.05
 
 
@@ -288,111 +288,6 @@ class PandaPregraspPlanner:
         q_np = np.asarray(q, dtype=np.float64)
         pin.computeGeneralizedGravity(self.pin_model, self.pin_data, q_np)
         return jnp.asarray(self.pin_data.g, dtype=jnp.float32)
-
-    def inverse_dynamics(self, q: jax.Array, v: jax.Array, ddq: jax.Array) -> jax.Array:
-        tau = pin.rnea(
-            self.pin_model,
-            self.pin_data,
-            np.asarray(q, dtype=np.float64),
-            np.asarray(v, dtype=np.float64),
-            np.asarray(ddq, dtype=np.float64),
-        )
-        return jnp.asarray(tau, dtype=jnp.float32)
-
-    def _cubic_joint_trajectory(
-        self,
-        q_start: jax.Array,
-        v_start: jax.Array,
-        q_goal: jax.Array,
-        horizon: int,
-        dt: float,
-        pace_velocity: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Cubic joint trajectory with current velocity and zero terminal velocity.
-
-        With ``pace_velocity`` (per-joint max), the cubic spans a *velocity-feasible*
-        duration ``max_j |Δq_j| / pace_velocity_j`` (never shorter than the horizon),
-        and the first ``horizon`` samples ride its gentle early portion. This is what
-        keeps the receding-horizon seed from demanding a full-speed reach inside the
-        short horizon. ``None`` reproduces the original behavior (reach within horizon).
-        """
-        q_start = jnp.asarray(q_start, dtype=jnp.float32)
-        v_start = jnp.asarray(v_start, dtype=jnp.float32)
-        q_goal = jnp.asarray(q_goal, dtype=jnp.float32)
-        time = (jnp.arange(horizon, dtype=jnp.float32) * jnp.float32(dt))[
-            :, jnp.newaxis
-        ]
-        horizon_span = jnp.maximum(time[-1, 0], 1e-6)
-        delta_q = q_goal - q_start
-        if pace_velocity is None:
-            t_final = horizon_span
-        else:
-            pace_velocity = jnp.asarray(pace_velocity, dtype=jnp.float32)
-            pace_duration = jnp.max(jnp.abs(delta_q) / jnp.maximum(pace_velocity, 1e-6))
-            t_final = jnp.maximum(pace_duration, horizon_span)
-
-        v_goal = jnp.zeros_like(v_start)
-        c0 = q_start
-        c1 = v_start
-        c2 = (3.0 * delta_q - (2.0 * v_start + v_goal) * t_final) / (t_final**2)
-        c3 = (-2.0 * delta_q + (v_start + v_goal) * t_final) / (t_final**3)
-
-        q = c0 + c1 * time + c2 * time**2 + c3 * time**3
-        v = c1 + 2.0 * c2 * time + 3.0 * c3 * time**2
-        ddq = 2.0 * c2 + 6.0 * c3 * time
-        return q.astype(jnp.float32), v.astype(jnp.float32), ddq.astype(jnp.float32)
-
-    def nominal_torque_sequence_from_state(
-        self,
-        state: jax.Array,
-        horizon: int,
-        dt: float | jax.Array,
-        pace_velocity: jax.Array | None = None,
-    ) -> jax.Array:
-        """Receding inverse-dynamics seed from the current arm state to PREGRASP."""
-        return self.nominal_torque_sequence_to_goal(
-            state, self.goal_q, horizon, dt, pace_velocity=pace_velocity
-        )
-
-    def nominal_torque_sequence_to_goal(
-        self,
-        state: jax.Array,
-        goal_q: jax.Array,
-        horizon: int,
-        dt: float,
-        pace_velocity: jax.Array | None = None,
-    ) -> jax.Array:
-        """Receding inverse-dynamics seed from the current arm state to a goal pose."""
-        state = jnp.asarray(state, dtype=jnp.float32)
-        q, v, ddq = self._cubic_joint_trajectory(
-            state[: self.nq],
-            state[self.nq : self.nq + self.nv],
-            jnp.asarray(goal_q, dtype=jnp.float32),
-            horizon,
-            dt,
-            pace_velocity=pace_velocity,
-        )
-        q_np = np.asarray(q, dtype=np.float64)
-        v_np = np.asarray(v, dtype=np.float64)
-        ddq_np = np.asarray(ddq, dtype=np.float64)
-        tau = np.stack(
-            [
-                pin.rnea(self.pin_model, self.pin_data, q_np[i], v_np[i], ddq_np[i])
-                for i in range(horizon)
-            ]
-        )
-        tau = jnp.asarray(tau, dtype=jnp.float32)
-        return jnp.clip(tau, -self.torque_limits, self.torque_limits).astype(
-            jnp.float32
-        )
-
-    def nominal_torque_sequence(self, horizon: int, dt: float | jax.Array) -> jax.Array:
-        """Smooth inverse-dynamics seed from home to the PREGRASP IK pose."""
-        state = jnp.concatenate(
-            [self.home_q, jnp.zeros(self.nv, dtype=jnp.float32)],
-            axis=0,
-        )
-        return self.nominal_torque_sequence_from_state(state, horizon, dt)
 
     def dynamics(
         self,
