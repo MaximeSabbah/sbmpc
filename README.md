@@ -45,15 +45,17 @@ pixi install -e cuda
 ```
 
 ## Running examples
-Run examples directly with pixi:
+Run the Franka pregrasp controller (viewer + validation) with the CUDA
+environment:
 ```bash
-pixi run python examples/quadrotor.py
+pixi run -e cuda python scripts/panda_pregrasp.py            # viewer
+pixi run -e cuda python scripts/panda_pregrasp.py --headless # metrics only
 ```
 
-Or with the CUDA environment:
-```bash
-pixi run -e cuda python examples/quadrotor.py
-```
+The whole controller (cost terms, weights, MPPI knobs) is declared in
+`sbmpc/ocp_configs/pregrasp.yaml`. **See [docs/OCP_REFERENCE.md](docs/OCP_REFERENCE.md)**
+for the yaml schema, the catalog of available cost terms, the available tasks,
+and the recipe to author and validate a new OCP.
 
 Refer to the [Jax documentation](https://jax.readthedocs.io/) for more details
 on GPU acceleration.
