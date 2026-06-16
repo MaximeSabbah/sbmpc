@@ -9,6 +9,7 @@ from sbmpc.ocp import (
     OCPConfig,
     TermSpec,
     build_cost_model,
+    load_ocp_config,
     ocp_config_from_dict,
     with_weight_overrides,
 )
@@ -107,3 +108,23 @@ def test_with_weight_overrides_replaces_by_name() -> None:
     patched = with_weight_overrides(ocp, {"joint_velocity": 5.0, "unknown": 9.0})
     weights = {t.name: t.weight for t in patched.running_terms}
     assert weights == {"posture": 1.0, "joint_velocity": 5.0}
+
+
+def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
+    ocp = load_ocp_config("pregrasp")
+    running = {term.name: term.weight for term in ocp.running_terms}
+    terminal = {term.name: term.weight for term in ocp.terminal_terms}
+
+    assert ocp.mpc.dt == 0.04
+    assert ocp.mpc.horizon == 10
+    assert ocp.mpc.std_dev_scale == 0.08
+    assert running["ee_translation_xy"] == 100.0
+    assert running["orientation"] == 60.0
+    assert running["posture"] == 10.0
+    assert running["control_regularization"] == 1.0
+    assert running["joint_velocity"] == 5.0
+    assert running["mechanical_power"] == 0.005
+    assert terminal["ee_position_sq"] == 1200.0
+    assert terminal["orientation"] == 60.0
+    assert terminal["posture"] == 10.0
+    assert terminal["joint_velocity"] == 5.0

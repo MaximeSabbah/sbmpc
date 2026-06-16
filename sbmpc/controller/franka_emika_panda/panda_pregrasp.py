@@ -29,8 +29,8 @@ _ARM_TORQUE_LIMITS = jnp.array(
     [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], dtype=jnp.float32
 )
 _ARM_VELOCITY_LIMITS = jnp.array(
-    [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26], dtype=jnp.float32
-)  # FR3 ("fer") joint velocity limits, used by the validation criteria.
+    [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61], dtype=jnp.float32
+)  # FER limits from the pinned agimus_franka_description.
 PREGRASP_CLEARANCE = 0.05
 
 
