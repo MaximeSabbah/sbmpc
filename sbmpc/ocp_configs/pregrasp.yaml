@@ -27,8 +27,8 @@ sim:
   integrator: custom_discrete
 
 running_terms:
-  - {name: ee_translation_xy, weight: 100.0}
-  - {name: ee_translation_z, weight: 70.0}
+  - {name: ee_translation_xy, weight: 70.0}
+  - {name: ee_translation_z, weight: 60.0}
   - {name: orientation, weight: 70.0, params: {x_axis_weight: 0.5}}
   - {name: posture, weight: 12.0}
   - {name: control_regularization, weight: 5.0}
@@ -36,7 +36,7 @@ running_terms:
   - {name: mechanical_power, weight: 0.005}
 
 terminal_terms:
-  - {name: ee_position_sq, weight: 1000.0}
+  - {name: ee_position_sq, weight: 300.0}
   - {name: orientation, weight: 200.0, params: {x_axis_weight: 0.5}}
   - {name: posture, weight: 90.0}
   - {name: joint_velocity, weight: 150.0}
