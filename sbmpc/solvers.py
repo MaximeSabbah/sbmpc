@@ -24,10 +24,15 @@ class BaseObjective(ABC):
     def final_cost(self, state, reference):
         return jnp.asarray(0.0, dtype=jnp.float32)
 
-    def cost_and_constraints(self, state, inputs, reference):
+    def cost_and_constraints(self, state, inputs, reference, previous_inputs=None):
+        del previous_inputs
         return self.running_cost(state, inputs, reference) + jnp.sum(
             self.make_barrier(self.constraints(state, inputs, reference))
         )
+
+    def initial_previous_input_reference(self, reference, fallback):
+        del reference
+        return fallback
 
     def final_cost_and_constraints(self, state, reference):
         return self.final_cost(state, reference) + jnp.sum(
@@ -181,19 +186,30 @@ class RolloutGenerator:
 
         control_variables = self.interpolate_control(control_variables)
 
+        previous_input = self.objective.initial_previous_input_reference(
+            reference[0, :], control_variables[0, :]
+        )
+
         def cost_and_state_rollout(idx, cost_and_state):
-            cost, curr_state = cost_and_state
+            cost, curr_state, previous_input = cost_and_state
+            inputs = control_variables[idx, :]
             cost += self.dt * self.cost_and_constraints(
-                curr_state, control_variables[idx, :], reference[idx, :]
+                curr_state,
+                inputs,
+                reference[idx, :],
+                previous_input,
             )
             next_state = self.model.integrate_rollout_single(
-                curr_state, control_variables[idx, :], self.dt
+                curr_state, inputs, self.dt
             )
 
-            return cost, next_state
+            return cost, next_state, inputs
 
-        cost, final_state = jax.lax.fori_loop(
-            0, self.horizon, cost_and_state_rollout, (cost, curr_state)
+        cost, final_state, _ = jax.lax.fori_loop(
+            0,
+            self.horizon,
+            cost_and_state_rollout,
+            (cost, curr_state, previous_input),
         )
 
         cost += self.final_cost_and_constraints(final_state, reference[self.horizon, :])

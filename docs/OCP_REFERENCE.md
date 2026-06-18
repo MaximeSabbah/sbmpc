@@ -89,6 +89,7 @@ references:               # generic state/control refs used by regularization te
   q_ref: measured          # measured | goal_ik
   v_ref: zero              # zero | measured
   u_ref: gravity_q_ref     # gravity_q_ref | zero
+  u_prev_ref: previous_control  # previous_control | u_ref | zero
 
 running_terms:            # weighted sum, integrated as dt * sum(...) per step
   - {name: <term>, weight: <float>, params: {...}, ref_weight_index: <int>}
@@ -105,6 +106,9 @@ Constraints enforced at build time:
 - `references.v_ref` must be `zero` or `measured`.
 - `references.u_ref` must be `gravity_q_ref` or `zero`; `gravity_q_ref`
   means gravity compensation evaluated at the selected `q_ref`.
+- `references.u_prev_ref` must be `previous_control`, `u_ref`, or `zero`.
+  It initializes the first step of `command_rate_regularization`; after that,
+  the term compares each planned torque with the preceding planned torque.
 - All terms must stay JAX-differentiable: the exact-gain path takes a jvp of
   the rollout cost w.r.t. the initial state.
 
@@ -129,6 +133,7 @@ stage), and `ctx` is the decoded reference (§5). Contribution =
 | `orientation` | `(1 − ee_z·ee_z_axis_ref) + x_axis_weight·(1 − ee_x·ee_x_axis_ref)` | `ee_x_axis_ref`, `ee_z_axis_ref` | `x_axis_weight` (default 0.5) | axis alignment of the TCP frame; z axis is the tool axis |
 | `position_regularization` | `‖q − q_ref‖²` | `q_ref` | — | joint-position regularization; the planner decides whether `q_ref` is the measured state, IK goal, nominal trajectory sample, etc. |
 | `control_regularization` | `Σ w_i(τ_i − u_ref_i)²` | `u_ref` | `weights` (optional per joint) | **running-only**; by default pregrasp sets `u_ref = gravity(q_measured_now)` |
+| `command_rate_regularization` | `Σ w_i(τ_k,i − τ_{k−1,i})²` | `u_prev_ref` for `k=0` | `weights` (optional per joint) | **running-only**; penalizes command jumps. For `k>0`, `τ_{k−1}` is the previous planned torque inside the same horizon. |
 | `velocity_regularization` | `Σ w_i(v_i − v_ref_i)²` | `v_ref` | `weights` (optional per joint) | damps motion; pregrasp uses zero velocity as the reference |
 | `mechanical_power` | `‖τ ⊙ v‖²` | — | — | joint mechanical power penalty; opt-in (not used by the shipped OCPs), useful against power-limit violations on the real robot |
 
@@ -158,7 +163,7 @@ The planner packs a flat reference vector consumed by `ReferenceLayout`:
 
 ```
 [ ee_pos_ref(3) | q_ref(nq) | ee_x_axis_ref(3) | ee_z_axis_ref(3) |
-  u_ref(nv) | v_ref(nv) | weights(n_weights, optional) ]
+  u_ref(nv) | u_prev_ref(nv) | v_ref(nv) | weights(n_weights, optional) ]
 ```
 
 - `ee_pos_ref`: target TCP position.
@@ -168,6 +173,9 @@ The planner packs a flat reference vector consumed by `ReferenceLayout`:
   `references:` policy does. In the deployed pregrasp configuration they are
   refreshed at every MPC cycle as `q_measured`, zero velocity, and
   `gravity(q_measured)`.
+- `u_prev_ref`: first-step command-rate reference. In deployed pregrasp this is
+  the previous `tau_ff` published by the planner, falling back to `u_ref` on the
+  first active cycle.
 - `weights` (only when `n_weights > 0`): a per-phase scaling vector. A term
   with `ref_weight_index: i` gets its yaml weight multiplied by `weights[i]`.
   This is how one yaml serves a multi-phase task: the planner switches the

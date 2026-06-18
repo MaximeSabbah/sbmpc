@@ -37,6 +37,7 @@ class PandaPickAndPlaceReference:
     ee_x_axis_ref: jax.Array
     ee_z_axis_ref: jax.Array
     u_ref: jax.Array
+    u_prev_ref: jax.Array
     v_ref: jax.Array
     weights: jax.Array
 
@@ -68,6 +69,7 @@ class PandaPickAndPlaceReference:
                 self.ee_x_axis_ref,
                 self.ee_z_axis_ref,
                 self.u_ref,
+                self.u_prev_ref,
                 self.v_ref,
                 self.weights,
             ]
@@ -283,6 +285,7 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
         q_ref: jax.Array,
         v_ref: jax.Array | None = None,
         u_ref: jax.Array | None = None,
+        u_prev_ref: jax.Array | None = None,
         *,
         phase: Phase | None = None,
         goal_pos: jax.Array | None = None,
@@ -301,12 +304,18 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
             if u_ref is None
             else jnp.asarray(u_ref, dtype=jnp.float32)
         )
+        u_prev_ref = (
+            u_ref
+            if u_prev_ref is None
+            else jnp.asarray(u_prev_ref, dtype=jnp.float32)
+        )
         return PandaPickAndPlaceReference(
             ee_pos_ref=goal_pos,
             q_ref=q_ref,
             ee_x_axis_ref=jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
             ee_z_axis_ref=jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
             u_ref=u_ref,
+            u_prev_ref=u_prev_ref,
             v_ref=v_ref,
             weights=self.phase_weights_map[phase],
         )
@@ -316,10 +325,13 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
         q_ref: jax.Array,
         v_ref: jax.Array | None = None,
         u_ref: jax.Array | None = None,
+        u_prev_ref: jax.Array | None = None,
         *,
         phase: Phase | None = None,
     ) -> jax.Array:
-        return self.reference_for_state(q_ref, v_ref, u_ref, phase=phase).as_vector()
+        return self.reference_for_state(
+            q_ref, v_ref, u_ref, u_prev_ref, phase=phase
+        ).as_vector()
 
     def gripper_target(self, phase: Phase | None = None) -> float:
         phase = self.phase if phase is None else Phase(phase)

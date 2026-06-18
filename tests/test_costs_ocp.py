@@ -42,10 +42,13 @@ def _reference(
     q_ref,
     weights=None,
     u_ref=None,
+    u_prev_ref=None,
     v_ref=None,
 ):
     if u_ref is None:
         u_ref = jnp.zeros(planner.nv, jnp.float32)
+    if u_prev_ref is None:
+        u_prev_ref = u_ref
     if v_ref is None:
         v_ref = jnp.zeros(planner.nv, jnp.float32)
     parts = [
@@ -54,6 +57,7 @@ def _reference(
         jnp.array([1.0, 0.0, 0.0], jnp.float32),   # ee_x_axis_ref
         jnp.array([0.0, 0.0, -1.0], jnp.float32),  # ee_z_axis_ref
         jnp.asarray(u_ref, jnp.float32),
+        jnp.asarray(u_prev_ref, jnp.float32),
         jnp.asarray(v_ref, jnp.float32),
     ]
     if weights is not None:
@@ -135,6 +139,59 @@ def test_control_regularization_uses_local_torque_reference() -> None:
     # sum((inputs - u_ref)^2) = 4 + 4 = 8, weight = 2.
     np.testing.assert_allclose(
         float(model.running(state, inputs, ref)), 16.0, rtol=1e-5
+    )
+
+
+def test_command_rate_regularization_uses_previous_input_reference() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(
+            TermSpec(
+                "command_rate_regularization",
+                2.0,
+                params={"weights": [1.0, 3.0]},
+            ),
+        ),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    state = jnp.zeros(4, jnp.float32)
+    inputs = jnp.array([3.0, 4.0], jnp.float32)
+    ref = _reference(
+        planner,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0],
+        u_prev_ref=[1.0, 2.0],
+    )
+
+    # weighted delta = 1*(3-1)^2 + 3*(4-2)^2 = 16, term weight = 2.
+    np.testing.assert_allclose(
+        float(model.running(state, inputs, ref)), 32.0, rtol=1e-5
+    )
+
+
+def test_command_rate_regularization_prefers_previous_horizon_input() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(TermSpec("command_rate_regularization", 1.0),),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    state = jnp.zeros(4, jnp.float32)
+    inputs = jnp.array([3.0, 4.0], jnp.float32)
+    previous_inputs = jnp.array([2.0, 1.0], jnp.float32)
+    ref = _reference(
+        planner,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0],
+        u_prev_ref=[100.0, 100.0],
+    )
+
+    # Uses previous_inputs, not u_prev_ref: (3-2)^2 + (4-1)^2 = 10.
+    np.testing.assert_allclose(
+        float(model.running(state, inputs, ref, previous_inputs)), 10.0, rtol=1e-5
     )
 
 
@@ -246,6 +303,7 @@ def test_reference_policy_parses_valid_choices() -> None:
                 "q_ref": "measured",
                 "v_ref": "zero",
                 "u_ref": "gravity_q_ref",
+                "u_prev_ref": "previous_control",
             }
         }
     )
@@ -253,6 +311,7 @@ def test_reference_policy_parses_valid_choices() -> None:
     assert ocp.references.q_ref == "measured"
     assert ocp.references.v_ref == "zero"
     assert ocp.references.u_ref == "gravity_q_ref"
+    assert ocp.references.u_prev_ref == "previous_control"
 
 
 def test_reference_policy_rejects_ambiguous_control_reference() -> None:
@@ -265,6 +324,11 @@ def test_reference_policy_rejects_home_position_reference() -> None:
         ocp_config_from_dict({"references": {"q_ref": "home"}})
 
 
+def test_reference_policy_rejects_unknown_previous_control_reference() -> None:
+    with pytest.raises(ValueError, match=r"references\.u_prev_ref"):
+        ocp_config_from_dict({"references": {"u_prev_ref": "gravity_q_ref"}})
+
+
 def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     ocp = load_ocp_config("pregrasp")
     running_terms = {term.name: term for term in ocp.running_terms}
@@ -274,18 +338,29 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
 
     assert ocp.mpc.dt == 0.04
     assert ocp.mpc.horizon == 12
-    assert ocp.mpc.num_control_points == 8
-    assert ocp.mpc.std_dev_scale == 0.06
+    assert ocp.mpc.num_control_points == 4
+    assert ocp.mpc.std_dev_scale == 0.1
     assert ocp.references.q_ref == "measured"
     assert ocp.references.v_ref == "zero"
     assert ocp.references.u_ref == "gravity_q_ref"
+    assert ocp.references.u_prev_ref == "previous_control"
     assert running["ee_translation_xy"] == 500.0
-    assert running["ee_translation_z"] == 15.0
+    assert running["ee_translation_z"] == 50.0
     assert running["orientation"] == 300.0
     assert running_terms["orientation"].params["x_axis_weight"] == 1.0
     assert running["position_regularization"] == 5.0
     assert running["control_regularization"] == 0.00005
     assert running_terms["control_regularization"].params["weights"] == [
+        1.0,
+        3.0,
+        1.0,
+        2.5,
+        0.8,
+        1.5,
+        0.8,
+    ]
+    assert running["command_rate_regularization"] == 0.02
+    assert running_terms["command_rate_regularization"].params["weights"] == [
         1.0,
         3.0,
         1.0,
@@ -316,11 +391,11 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         0.7,
     ]
     assert "ee_position_sq" not in terminal
-    assert "ee_translation_xy" not in terminal
-    assert "ee_translation_z" not in terminal
-    assert "orientation" not in terminal
-    assert "position_regularization" not in terminal
-    assert terminal["velocity_regularization"] == 150.0
+    assert terminal["ee_translation_xy"] == 150.0
+    assert terminal["ee_translation_z"] == 15.0
+    assert terminal["orientation"] == 60.0
+    assert terminal["position_regularization"] == 1.0
+    assert terminal["velocity_regularization"] == 16.0
     assert terminal_terms["velocity_regularization"].params["weights"] == [
         1.0,
         5.0,

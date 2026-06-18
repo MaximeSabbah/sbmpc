@@ -392,6 +392,7 @@ class PandaPregraspController:
         )
         self._default_num_steps = self._validate_num_steps(num_steps)
         self._solution_initialized = False
+        self._last_tau_ff: np.ndarray | None = None
         self._started = False
         self._compute_running_cost = compute_running_cost
         self._compute_task_diagnostics = compute_task_diagnostics
@@ -407,6 +408,7 @@ class PandaPregraspController:
         """Discard warmup state while retaining compiled JAX executables."""
         self._started = False
         self._solution_initialized = False
+        self._last_tau_ff = None
 
     def warmup(
         self,
@@ -444,10 +446,16 @@ class PandaPregraspController:
         )
         if reset_guess or not self._solution_initialized:
             self._seed_gravity_comp_solution(state)
+        previous_u = (
+            None
+            if reset_guess or not self._solution_initialized
+            else self._last_tau_ff
+        )
         reference_vec = self.planner.reference_vector_for_policy(
             q,
             v,
             self.ocp_config.references,
+            previous_u,
         )
         planner_prepare_time_ms = 1000.0 * (time.perf_counter() - prepare_start)
 
@@ -463,6 +471,7 @@ class PandaPregraspController:
         self._solution_initialized = True
 
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
+        self._last_tau_ff = tau_ff.copy()
         gains_array = _current_gains_numpy(self.controller)
         planning_time_ms = 1000.0 * (time.perf_counter() - command_start)
 

@@ -202,7 +202,8 @@ def main() -> None:
         "references: "
         f"q_ref={ocp.references.q_ref} "
         f"v_ref={ocp.references.v_ref} "
-        f"u_ref={ocp.references.u_ref}"
+        f"u_ref={ocp.references.u_ref} "
+        f"u_prev_ref={ocp.references.u_prev_ref}"
     )
     print(f"goal_pos = {np.asarray(planner.goal_pos)}")
     if config.MPC.gains:

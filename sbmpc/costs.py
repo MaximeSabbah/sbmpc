@@ -21,10 +21,15 @@ import jax.numpy as jnp
 from sbmpc.solvers import BaseObjective
 
 
-# A term contribution: (state, inputs, ctx) -> scalar. ``inputs`` is None for
-# terminal terms; terms that need the control (e.g. control_regularization) are
-# running-only.
-TermFn = Callable[[jax.Array, jax.Array | None, "ReferenceContext"], jax.Array]
+# A term contribution: (state, inputs, previous_inputs, ctx) -> scalar.
+# ``inputs`` is None for terminal terms; terms that need the control
+# (e.g. control_regularization) are running-only. ``previous_inputs`` is the
+# preceding command inside the horizon, initialized from ``ctx.u_prev_ref`` for
+# the first running step.
+TermFn = Callable[
+    [jax.Array, jax.Array | None, jax.Array | None, "ReferenceContext"],
+    jax.Array,
+]
 
 
 # --- small numerics shared with the original hand-rolled objectives ---
@@ -50,6 +55,7 @@ class ReferenceContext:
     ee_x_axis_ref: jax.Array
     ee_z_axis_ref: jax.Array
     u_ref: jax.Array
+    u_prev_ref: jax.Array
     v_ref: jax.Array
     weights: jax.Array | None  # per-phase weight vector, or None when not carried
 
@@ -60,7 +66,7 @@ class ReferenceLayout:
 
     Packing:
     ``[ee_pos_ref(3), q_ref(nq), ee_x_ref(3), ee_z_ref(3), u_ref(nv),
-    v_ref(nv), optional weights(n_weights)]``.
+    u_prev_ref(nv), v_ref(nv), optional weights(n_weights)]``.
     """
 
     nq: int
@@ -74,10 +80,11 @@ class ReferenceLayout:
         ee_x_axis_ref = reference[3 + nq : 6 + nq]
         ee_z_axis_ref = reference[6 + nq : 9 + nq]
         u_ref = reference[9 + nq : 9 + nq + nv]
-        v_ref = reference[9 + nq + nv : 9 + nq + 2 * nv]
+        u_prev_ref = reference[9 + nq + nv : 9 + nq + 2 * nv]
+        v_ref = reference[9 + nq + 2 * nv : 9 + nq + 3 * nv]
         weights = None
         if self.n_weights > 0:
-            start = 9 + nq + 2 * nv
+            start = 9 + nq + 3 * nv
             weights = reference[start : start + self.n_weights]
         return ReferenceContext(
             ee_pos_ref=ee_pos_ref,
@@ -85,6 +92,7 @@ class ReferenceLayout:
             ee_x_axis_ref=ee_x_axis_ref,
             ee_z_axis_ref=ee_z_axis_ref,
             u_ref=u_ref,
+            u_prev_ref=u_prev_ref,
             v_ref=v_ref,
             weights=weights,
         )
@@ -104,12 +112,13 @@ class CostTerm:
         self,
         state: jax.Array,
         inputs: jax.Array | None,
+        previous_inputs: jax.Array | None,
         ctx: ReferenceContext,
     ) -> jax.Array:
         weight = jnp.asarray(self.weight, dtype=jnp.float32)
         if self.ref_weight_index is not None and ctx.weights is not None:
             weight = weight * ctx.weights[self.ref_weight_index]
-        return weight * self.fn(state, inputs, ctx)
+        return weight * self.fn(state, inputs, previous_inputs, ctx)
 
 
 class CostModel:
@@ -126,19 +135,23 @@ class CostModel:
         self.layout = layout
 
     def running(
-        self, state: jax.Array, inputs: jax.Array, reference: jax.Array
+        self,
+        state: jax.Array,
+        inputs: jax.Array,
+        reference: jax.Array,
+        previous_inputs: jax.Array | None = None,
     ) -> jax.Array:
         ctx = self.layout.context(reference)
         total = jnp.asarray(0.0, dtype=jnp.float32)
         for term in self.running_terms:
-            total = total + term.contribution(state, inputs, ctx)
+            total = total + term.contribution(state, inputs, previous_inputs, ctx)
         return total.astype(jnp.float32)
 
     def terminal(self, state: jax.Array, reference: jax.Array) -> jax.Array:
         ctx = self.layout.context(reference)
         total = jnp.asarray(0.0, dtype=jnp.float32)
         for term in self.terminal_terms:
-            total = total + term.contribution(state, None, ctx)
+            total = total + term.contribution(state, None, None, ctx)
         return total.astype(jnp.float32)
 
 
@@ -149,8 +162,17 @@ class FactoryObjective(BaseObjective):
         super().__init__()
         self.cost_model = cost_model
 
-    def running_cost(self, state, inputs, reference):
-        return self.cost_model.running(state, inputs, reference)
+    def running_cost(self, state, inputs, reference, previous_inputs=None):
+        return self.cost_model.running(state, inputs, reference, previous_inputs)
+
+    def cost_and_constraints(self, state, inputs, reference, previous_inputs=None):
+        return self.running_cost(state, inputs, reference, previous_inputs) + jnp.sum(
+            self.make_barrier(self.constraints(state, inputs, reference))
+        )
+
+    def initial_previous_input_reference(self, reference, fallback):
+        del fallback
+        return self.cost_model.layout.context(reference).u_prev_ref
 
     def final_cost(self, state, reference):
         return self.cost_model.terminal(state, reference)
@@ -158,7 +180,7 @@ class FactoryObjective(BaseObjective):
 
 # --- term builders (bound to a planner) -------------------------------------
 def _ee_translation_xy(planner, **_):
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         q = state[: planner.nq]
         ee_pos, _, _ = planner.ee_features(q)
         return smooth_norm((ctx.ee_pos_ref - ee_pos)[:2])
@@ -167,7 +189,7 @@ def _ee_translation_xy(planner, **_):
 
 
 def _ee_translation_z(planner, **_):
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         q = state[: planner.nq]
         ee_pos, _, _ = planner.ee_features(q)
         return jnp.abs((ctx.ee_pos_ref - ee_pos)[2])
@@ -176,7 +198,7 @@ def _ee_translation_z(planner, **_):
 
 
 def _ee_position_sq(planner, **_):
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         q = state[: planner.nq]
         ee_pos, _, _ = planner.ee_features(q)
         return jnp.sum(jnp.square(ctx.ee_pos_ref - ee_pos))
@@ -185,7 +207,7 @@ def _ee_position_sq(planner, **_):
 
 
 def _orientation(planner, *, x_axis_weight: float = 0.5, **_):
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         q = state[: planner.nq]
         _, ee_x, ee_z = planner.ee_features(q)
         return axis_alignment_cost(
@@ -199,7 +221,7 @@ def _orientation(planner, *, x_axis_weight: float = 0.5, **_):
 
 
 def _position_regularization(planner, **_):
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         q = state[: planner.nq]
         return jnp.sum(jnp.square(q - ctx.q_ref))
 
@@ -221,8 +243,18 @@ def _joint_weights(planner, weights, *, name: str):
 def _control_regularization(planner, *, weights=None, **_):
     joint_weights = _joint_weights(planner, weights, name="control_regularization")
 
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         return jnp.sum(joint_weights * jnp.square(inputs - ctx.u_ref))
+
+    return fn
+
+
+def _command_rate_regularization(planner, *, weights=None, **_):
+    joint_weights = _joint_weights(planner, weights, name="command_rate_regularization")
+
+    def fn(state, inputs, previous_inputs, ctx):
+        prev = ctx.u_prev_ref if previous_inputs is None else previous_inputs
+        return jnp.sum(joint_weights * jnp.square(inputs - prev))
 
     return fn
 
@@ -231,7 +263,7 @@ def _velocity_regularization(planner, *, weights=None, **_):
     nq = planner.nq
     joint_weights = _joint_weights(planner, weights, name="velocity_regularization")
 
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         v = state[nq:]
         return jnp.sum(joint_weights * jnp.square(v - ctx.v_ref))
 
@@ -248,7 +280,7 @@ def _joint_acceleration(planner, *, weights=None, **_):
     nv = planner.nv
     joint_weights = _joint_weights(planner, weights, name="joint_acceleration")
 
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         del ctx
         if inputs is None:
             return jnp.asarray(0.0, dtype=jnp.float32)
@@ -268,7 +300,7 @@ def _mechanical_power(planner, *, weights=None, **_):
     nq = planner.nq
     joint_weights = _joint_weights(planner, weights, name="mechanical_power")
 
-    def fn(state, inputs, ctx):
+    def fn(state, inputs, previous_inputs, ctx):
         v = state[nq:]
         return jnp.sum(joint_weights * jnp.square(inputs * v))
 
@@ -282,6 +314,7 @@ TERM_BUILDERS: dict[str, Callable[..., TermFn]] = {
     "orientation": _orientation,
     "position_regularization": _position_regularization,
     "control_regularization": _control_regularization,
+    "command_rate_regularization": _command_rate_regularization,
     "velocity_regularization": _velocity_regularization,
     "joint_acceleration": _joint_acceleration,
     "mechanical_power": _mechanical_power,

@@ -73,6 +73,7 @@ class ReferenceSpec:
     q_ref: str = "goal_ik"  # goal_ik | measured
     v_ref: str = "zero"     # zero | measured
     u_ref: str = "zero"     # zero | gravity_q_ref
+    u_prev_ref: str = "u_ref"  # u_ref | zero | previous_control
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,12 @@ def _reference_spec(d: dict[str, Any] | None) -> ReferenceSpec:
         q_ref=_choice(d, "q_ref", ReferenceSpec.q_ref, {"goal_ik", "measured"}),
         v_ref=_choice(d, "v_ref", ReferenceSpec.v_ref, {"zero", "measured"}),
         u_ref=_choice(d, "u_ref", ReferenceSpec.u_ref, {"zero", "gravity_q_ref"}),
+        u_prev_ref=_choice(
+            d,
+            "u_prev_ref",
+            ReferenceSpec.u_prev_ref,
+            {"u_ref", "zero", "previous_control"},
+        ),
     )
 
 

@@ -41,6 +41,7 @@ class PandaPregraspReference:
     ee_x_axis_ref: jax.Array
     ee_z_axis_ref: jax.Array
     u_ref: jax.Array
+    u_prev_ref: jax.Array
     v_ref: jax.Array
 
     @property
@@ -71,6 +72,7 @@ class PandaPregraspReference:
                 self.ee_x_axis_ref,
                 self.ee_z_axis_ref,
                 self.u_ref,
+                self.u_prev_ref,
                 self.v_ref,
             ]
         )
@@ -338,6 +340,7 @@ class PandaPregraspPlanner:
         q_ref: jax.Array,
         v_ref: jax.Array | None = None,
         u_ref: jax.Array | None = None,
+        u_prev_ref: jax.Array | None = None,
     ) -> PandaPregraspReference:
         q_ref = jnp.asarray(q_ref, dtype=jnp.float32)
         v_ref = (
@@ -350,12 +353,18 @@ class PandaPregraspPlanner:
             if u_ref is None
             else jnp.asarray(u_ref, dtype=jnp.float32)
         )
+        u_prev_ref = (
+            u_ref
+            if u_prev_ref is None
+            else jnp.asarray(u_prev_ref, dtype=jnp.float32)
+        )
         return PandaPregraspReference(
             ee_pos_ref=self.goal_pos,
             q_ref=q_ref,
             ee_x_axis_ref=jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
             ee_z_axis_ref=jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
             u_ref=u_ref,
+            u_prev_ref=u_prev_ref,
             v_ref=v_ref,
         )
 
@@ -364,14 +373,16 @@ class PandaPregraspPlanner:
         q_ref: jax.Array,
         v_ref: jax.Array | None = None,
         u_ref: jax.Array | None = None,
+        u_prev_ref: jax.Array | None = None,
     ) -> jax.Array:
-        return self.reference_for_state(q_ref, v_ref, u_ref).as_vector()
+        return self.reference_for_state(q_ref, v_ref, u_ref, u_prev_ref).as_vector()
 
     def reference_for_policy(
         self,
         measured_q: jax.Array,
         measured_v: jax.Array,
         policy: ReferenceSpec,
+        previous_u: jax.Array | None = None,
     ) -> PandaPregraspReference:
         measured_q = jnp.asarray(measured_q, dtype=jnp.float32)
         measured_v = jnp.asarray(measured_v, dtype=jnp.float32)
@@ -397,15 +408,27 @@ class PandaPregraspPlanner:
         else:
             raise ValueError(f"unsupported u_ref policy: {policy.u_ref}")
 
-        return self.reference_for_state(q_ref, v_ref, u_ref)
+        if policy.u_prev_ref == "previous_control":
+            u_prev_ref = u_ref if previous_u is None else previous_u
+        elif policy.u_prev_ref == "u_ref":
+            u_prev_ref = u_ref
+        elif policy.u_prev_ref == "zero":
+            u_prev_ref = jnp.zeros(self.nu, dtype=jnp.float32)
+        else:
+            raise ValueError(f"unsupported u_prev_ref policy: {policy.u_prev_ref}")
+
+        return self.reference_for_state(q_ref, v_ref, u_ref, u_prev_ref)
 
     def reference_vector_for_policy(
         self,
         measured_q: jax.Array,
         measured_v: jax.Array,
         policy: ReferenceSpec,
+        previous_u: jax.Array | None = None,
     ) -> jax.Array:
-        return self.reference_for_policy(measured_q, measured_v, policy).as_vector()
+        return self.reference_for_policy(
+            measured_q, measured_v, policy, previous_u
+        ).as_vector()
 
 
 class PandaPregraspObjective(FactoryObjective):
