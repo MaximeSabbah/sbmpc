@@ -275,37 +275,58 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     assert ocp.mpc.dt == 0.04
     assert ocp.mpc.horizon == 12
     assert ocp.mpc.num_control_points == 8
-    assert ocp.mpc.std_dev_scale == 0.075
+    assert ocp.mpc.std_dev_scale == 0.06
     assert ocp.references.q_ref == "measured"
     assert ocp.references.v_ref == "zero"
     assert ocp.references.u_ref == "gravity_q_ref"
-    assert running["ee_translation_xy"] == 100.0
-    assert running["ee_translation_z"] == 8.0
-    assert running["orientation"] == 60.0
-    assert running["position_regularization"] == 30.0
+    assert running["ee_translation_xy"] == 500.0
+    assert running["ee_translation_z"] == 15.0
+    assert running["orientation"] == 300.0
+    assert running_terms["orientation"].params["x_axis_weight"] == 1.0
+    assert running["position_regularization"] == 5.0
     assert running["control_regularization"] == 0.00005
+    assert running_terms["control_regularization"].params["weights"] == [
+        1.0,
+        3.0,
+        1.0,
+        2.5,
+        0.8,
+        1.5,
+        0.8,
+    ]
     assert running["velocity_regularization"] == 80.0
     assert running_terms["velocity_regularization"].params["weights"] == [
         1.0,
-        3.5,
-        1.2,
-        3.0,
-        0.7,
-        4.0,
-        0.7,
+        5.0,
+        1.4,
+        4.5,
+        0.8,
+        5.0,
+        0.8,
     ]
     assert "joint_acceleration" not in running
     assert running["mechanical_power"] == 0.01
-    assert terminal["ee_position_sq"] == 2500.0
-    assert terminal["orientation"] == 80.0
-    assert terminal["position_regularization"] == 20.0
-    assert terminal["velocity_regularization"] == 90.0
+    assert running_terms["mechanical_power"].params["weights"] == [
+        1.0,
+        2.5,
+        1.0,
+        2.0,
+        0.7,
+        1.5,
+        0.7,
+    ]
+    assert "ee_position_sq" not in terminal
+    assert "ee_translation_xy" not in terminal
+    assert "ee_translation_z" not in terminal
+    assert "orientation" not in terminal
+    assert "position_regularization" not in terminal
+    assert terminal["velocity_regularization"] == 150.0
     assert terminal_terms["velocity_regularization"].params["weights"] == [
         1.0,
-        3.5,
-        1.2,
-        3.0,
-        0.7,
-        4.0,
-        0.7,
+        5.0,
+        1.4,
+        4.5,
+        0.8,
+        5.0,
+        0.8,
     ]
