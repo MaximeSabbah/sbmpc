@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from sbmpc.costs import CostModel, FactoryObjective
 from sbmpc.ocp import (
@@ -28,14 +29,32 @@ class FakePlanner:
         ee_z = jnp.array([0.0, 0.0, -1.0], dtype=jnp.float32)
         return ee_pos, ee_x, ee_z
 
+    def dynamics(self, state, inputs, params):
+        del params
+        v = state[self.nq :]
+        qdd = 2.0 * inputs
+        return jnp.concatenate([v, qdd])
 
-def _reference(planner, goal_pos, goal_q, weights=None):
+
+def _reference(
+    planner,
+    ee_pos_ref,
+    q_ref,
+    weights=None,
+    u_ref=None,
+    v_ref=None,
+):
+    if u_ref is None:
+        u_ref = jnp.zeros(planner.nv, jnp.float32)
+    if v_ref is None:
+        v_ref = jnp.zeros(planner.nv, jnp.float32)
     parts = [
-        jnp.asarray(goal_pos, jnp.float32),
-        jnp.asarray(goal_q, jnp.float32),
-        jnp.array([1.0, 0.0, 0.0], jnp.float32),   # goal_x
-        jnp.array([0.0, 0.0, -1.0], jnp.float32),  # goal_z
-        jnp.zeros(planner.nv, jnp.float32),        # goal_tau
+        jnp.asarray(ee_pos_ref, jnp.float32),
+        jnp.asarray(q_ref, jnp.float32),
+        jnp.array([1.0, 0.0, 0.0], jnp.float32),   # ee_x_axis_ref
+        jnp.array([0.0, 0.0, -1.0], jnp.float32),  # ee_z_axis_ref
+        jnp.asarray(u_ref, jnp.float32),
+        jnp.asarray(v_ref, jnp.float32),
     ]
     if weights is not None:
         parts.append(jnp.asarray(weights, jnp.float32))
@@ -48,7 +67,7 @@ def test_cost_model_weighted_sum_matches_hand_value() -> None:
         name="t",
         running_terms=(
             TermSpec("ee_translation_xy", 2.0),
-            TermSpec("posture", 3.0),
+            TermSpec("position_regularization", 3.0),
         ),
         terminal_terms=(TermSpec("ee_position_sq", 5.0),),
     )
@@ -70,7 +89,7 @@ def test_cost_model_weighted_sum_matches_hand_value() -> None:
 
 def test_factory_objective_delegates() -> None:
     planner = FakePlanner()
-    ocp = OCPConfig("t", (TermSpec("posture", 1.0),), ())
+    ocp = OCPConfig("t", (TermSpec("position_regularization", 1.0),), ())
     obj = FactoryObjective(build_cost_model(ocp, planner))
     ref = _reference(planner, [0.0, 0.0, 0.0], [1.0, 0.0])
     state = jnp.zeros(4, jnp.float32)
@@ -83,16 +102,126 @@ def test_ref_weight_index_scales_term() -> None:
     planner = FakePlanner()
     ocp = OCPConfig(
         name="t",
-        running_terms=(TermSpec("posture", 2.0, ref_weight_index=0),),
+        running_terms=(TermSpec("position_regularization", 2.0, ref_weight_index=0),),
         terminal_terms=(),
         n_weights=1,
     )
     model = build_cost_model(ocp, planner)
     state = jnp.zeros(4, jnp.float32)
-    # posture = (1-0)^2 + 0 = 1; weight 2 * ref_weight 4 = 8
+    # position_regularization = (1-0)^2 + 0 = 1; weight 2 * ref_weight 4 = 8
     ref = _reference(planner, [0.0, 0.0, 0.0], [1.0, 0.0], weights=[4.0])
     np.testing.assert_allclose(
         float(model.running(state, jnp.zeros(2), ref)), 8.0, rtol=1e-5
+    )
+
+
+def test_control_regularization_uses_local_torque_reference() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(TermSpec("control_regularization", 2.0),),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    state = jnp.zeros(4, jnp.float32)
+    inputs = jnp.array([3.0, 4.0], jnp.float32)
+    ref = _reference(
+        planner,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0],
+        u_ref=[1.0, 2.0],
+    )
+
+    # sum((inputs - u_ref)^2) = 4 + 4 = 8, weight = 2.
+    np.testing.assert_allclose(
+        float(model.running(state, inputs, ref)), 16.0, rtol=1e-5
+    )
+
+
+def test_position_regularization_uses_q_reference() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(TermSpec("position_regularization", 3.0),),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    state = jnp.array([2.0, 4.0, 0.0, 0.0], jnp.float32)
+    ref = _reference(
+        planner,
+        [0.0, 0.0, 0.0],
+        [1.0, 2.0],
+    )
+
+    # position_regularization = (2-1)^2 + (4-2)^2 = 5, weight = 3.
+    np.testing.assert_allclose(
+        float(model.running(state, jnp.zeros(2), ref)), 15.0, rtol=1e-5
+    )
+
+
+def test_joint_acceleration_uses_planner_dynamics() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(
+            TermSpec("joint_acceleration", 3.0),
+        ),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    ref = _reference(planner, [0.0, 0.0, 0.0], [0.0, 0.0])
+    state = jnp.array([0.0, 0.0, 0.5, -0.5], jnp.float32)
+    inputs = jnp.array([2.0, 4.0], jnp.float32)
+
+    # Fake dynamics has qdd = 2 * inputs = [4, 8].
+    # Squared sum = 80, weight = 3.
+    np.testing.assert_allclose(
+        float(model.running(state, inputs, ref)), 240.0, rtol=1e-5
+    )
+
+
+def test_velocity_regularization_accepts_per_joint_weights() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(
+            TermSpec("velocity_regularization", 2.0, params={"weights": [1.0, 3.0]}),
+        ),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    state = jnp.array([0.0, 0.0, 2.0, 4.0], jnp.float32)
+    ref = _reference(
+        planner,
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0],
+        v_ref=[0.0, 0.0],
+    )
+
+    # weighted velocity = 1*2^2 + 3*4^2 = 52, term weight = 2.
+    np.testing.assert_allclose(
+        float(model.running(state, jnp.zeros(2), ref)), 104.0, rtol=1e-5
+    )
+
+
+def test_joint_acceleration_accepts_per_joint_weights() -> None:
+    planner = FakePlanner()
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(
+            TermSpec("joint_acceleration", 0.5, params={"weights": [1.0, 4.0]}),
+        ),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    ref = _reference(planner, [0.0, 0.0, 0.0], [0.0, 0.0])
+    state = jnp.array([0.0, 0.0, 0.5, -0.5], jnp.float32)
+    inputs = jnp.array([2.0, 4.0], jnp.float32)
+
+    # Fake dynamics has qdd = 2 * inputs = [4, 8].
+    # weighted acceleration = 1*4^2 + 4*8^2 = 272, term weight = 0.5.
+    np.testing.assert_allclose(
+        float(model.running(state, inputs, ref)), 136.0, rtol=1e-5
     )
 
 
@@ -100,31 +229,83 @@ def test_with_weight_overrides_replaces_by_name() -> None:
     ocp = ocp_config_from_dict(
         {
             "running_terms": [
-                {"name": "posture", "weight": 1.0},
-                {"name": "joint_velocity", "weight": 0.1},
+                {"name": "position_regularization", "weight": 1.0},
+                {"name": "velocity_regularization", "weight": 0.1},
             ]
         }
     )
-    patched = with_weight_overrides(ocp, {"joint_velocity": 5.0, "unknown": 9.0})
+    patched = with_weight_overrides(ocp, {"velocity_regularization": 5.0, "unknown": 9.0})
     weights = {t.name: t.weight for t in patched.running_terms}
-    assert weights == {"posture": 1.0, "joint_velocity": 5.0}
+    assert weights == {"position_regularization": 1.0, "velocity_regularization": 5.0}
+
+
+def test_reference_policy_parses_valid_choices() -> None:
+    ocp = ocp_config_from_dict(
+        {
+            "references": {
+                "q_ref": "measured",
+                "v_ref": "zero",
+                "u_ref": "gravity_q_ref",
+            }
+        }
+    )
+
+    assert ocp.references.q_ref == "measured"
+    assert ocp.references.v_ref == "zero"
+    assert ocp.references.u_ref == "gravity_q_ref"
+
+
+def test_reference_policy_rejects_ambiguous_control_reference() -> None:
+    with pytest.raises(ValueError, match=r"references\.u_ref"):
+        ocp_config_from_dict({"references": {"u_ref": "gravity_measured"}})
+
+
+def test_reference_policy_rejects_home_position_reference() -> None:
+    with pytest.raises(ValueError, match=r"references\.q_ref"):
+        ocp_config_from_dict({"references": {"q_ref": "home"}})
 
 
 def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     ocp = load_ocp_config("pregrasp")
-    running = {term.name: term.weight for term in ocp.running_terms}
-    terminal = {term.name: term.weight for term in ocp.terminal_terms}
+    running_terms = {term.name: term for term in ocp.running_terms}
+    terminal_terms = {term.name: term for term in ocp.terminal_terms}
+    running = {name: term.weight for name, term in running_terms.items()}
+    terminal = {name: term.weight for name, term in terminal_terms.items()}
 
     assert ocp.mpc.dt == 0.04
-    assert ocp.mpc.horizon == 10
-    assert ocp.mpc.std_dev_scale == 0.08
+    assert ocp.mpc.horizon == 12
+    assert ocp.mpc.num_control_points == 8
+    assert ocp.mpc.std_dev_scale == 0.075
+    assert ocp.references.q_ref == "measured"
+    assert ocp.references.v_ref == "zero"
+    assert ocp.references.u_ref == "gravity_q_ref"
     assert running["ee_translation_xy"] == 100.0
+    assert running["ee_translation_z"] == 8.0
     assert running["orientation"] == 60.0
-    assert running["posture"] == 10.0
-    assert running["control_regularization"] == 1.0
-    assert running["joint_velocity"] == 5.0
-    assert running["mechanical_power"] == 0.005
-    assert terminal["ee_position_sq"] == 1200.0
-    assert terminal["orientation"] == 60.0
-    assert terminal["posture"] == 10.0
-    assert terminal["joint_velocity"] == 5.0
+    assert running["position_regularization"] == 30.0
+    assert running["control_regularization"] == 0.00005
+    assert running["velocity_regularization"] == 80.0
+    assert running_terms["velocity_regularization"].params["weights"] == [
+        1.0,
+        3.5,
+        1.2,
+        3.0,
+        0.7,
+        4.0,
+        0.7,
+    ]
+    assert "joint_acceleration" not in running
+    assert running["mechanical_power"] == 0.01
+    assert terminal["ee_position_sq"] == 2500.0
+    assert terminal["orientation"] == 80.0
+    assert terminal["position_regularization"] == 20.0
+    assert terminal["velocity_regularization"] == 90.0
+    assert terminal_terms["velocity_regularization"].params["weights"] == [
+        1.0,
+        3.5,
+        1.2,
+        3.0,
+        0.7,
+        4.0,
+        0.7,
+    ]

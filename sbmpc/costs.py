@@ -38,13 +38,19 @@ def axis_alignment_cost(axis: jax.Array, target_axis: jax.Array) -> jax.Array:
 
 @dataclass(frozen=True)
 class ReferenceContext:
-    """Decoded reference for one rollout step (frame goals + optional weights)."""
+    """Decoded cost reference for one rollout step.
 
-    goal_pos: jax.Array
-    goal_q: jax.Array
-    goal_x_axis: jax.Array
-    goal_z_axis: jax.Array
-    goal_tau: jax.Array
+    Cost terms do not decide where references come from. The planner builds this
+    vector from task targets, measured state, nominal trajectories, or any blend
+    that is appropriate for the controller.
+    """
+
+    ee_pos_ref: jax.Array
+    q_ref: jax.Array
+    ee_x_axis_ref: jax.Array
+    ee_z_axis_ref: jax.Array
+    u_ref: jax.Array
+    v_ref: jax.Array
     weights: jax.Array | None  # per-phase weight vector, or None when not carried
 
 
@@ -52,8 +58,9 @@ class ReferenceContext:
 class ReferenceLayout:
     """Slices the flat reference vector into a :class:`ReferenceContext`.
 
-    Matches the existing Franka packing: ``[goal_pos(3), goal_q(nq), goal_x(3),
-    goal_z(3), goal_tau(nv), (optional) weights(n_weights)]``.
+    Packing:
+    ``[ee_pos_ref(3), q_ref(nq), ee_x_ref(3), ee_z_ref(3), u_ref(nv),
+    v_ref(nv), optional weights(n_weights)]``.
     """
 
     nq: int
@@ -62,21 +69,23 @@ class ReferenceLayout:
 
     def context(self, reference: jax.Array) -> ReferenceContext:
         nq, nv = self.nq, self.nv
-        goal_pos = reference[:3]
-        goal_q = reference[3 : 3 + nq]
-        goal_x = reference[3 + nq : 6 + nq]
-        goal_z = reference[6 + nq : 9 + nq]
-        goal_tau = reference[9 + nq : 9 + nq + nv]
+        ee_pos_ref = reference[:3]
+        q_ref = reference[3 : 3 + nq]
+        ee_x_axis_ref = reference[3 + nq : 6 + nq]
+        ee_z_axis_ref = reference[6 + nq : 9 + nq]
+        u_ref = reference[9 + nq : 9 + nq + nv]
+        v_ref = reference[9 + nq + nv : 9 + nq + 2 * nv]
         weights = None
         if self.n_weights > 0:
-            start = 9 + nq + nv
+            start = 9 + nq + 2 * nv
             weights = reference[start : start + self.n_weights]
         return ReferenceContext(
-            goal_pos=goal_pos,
-            goal_q=goal_q,
-            goal_x_axis=goal_x,
-            goal_z_axis=goal_z,
-            goal_tau=goal_tau,
+            ee_pos_ref=ee_pos_ref,
+            q_ref=q_ref,
+            ee_x_axis_ref=ee_x_axis_ref,
+            ee_z_axis_ref=ee_z_axis_ref,
+            u_ref=u_ref,
+            v_ref=v_ref,
             weights=weights,
         )
 
@@ -152,7 +161,7 @@ def _ee_translation_xy(planner, **_):
     def fn(state, inputs, ctx):
         q = state[: planner.nq]
         ee_pos, _, _ = planner.ee_features(q)
-        return smooth_norm((ctx.goal_pos - ee_pos)[:2])
+        return smooth_norm((ctx.ee_pos_ref - ee_pos)[:2])
 
     return fn
 
@@ -161,7 +170,7 @@ def _ee_translation_z(planner, **_):
     def fn(state, inputs, ctx):
         q = state[: planner.nq]
         ee_pos, _, _ = planner.ee_features(q)
-        return jnp.abs((ctx.goal_pos - ee_pos)[2])
+        return jnp.abs((ctx.ee_pos_ref - ee_pos)[2])
 
     return fn
 
@@ -170,7 +179,7 @@ def _ee_position_sq(planner, **_):
     def fn(state, inputs, ctx):
         q = state[: planner.nq]
         ee_pos, _, _ = planner.ee_features(q)
-        return jnp.sum(jnp.square(ctx.goal_pos - ee_pos))
+        return jnp.sum(jnp.square(ctx.ee_pos_ref - ee_pos))
 
     return fn
 
@@ -179,47 +188,89 @@ def _orientation(planner, *, x_axis_weight: float = 0.5, **_):
     def fn(state, inputs, ctx):
         q = state[: planner.nq]
         _, ee_x, ee_z = planner.ee_features(q)
-        return axis_alignment_cost(ee_z, ctx.goal_z_axis) + x_axis_weight * axis_alignment_cost(
-            ee_x, ctx.goal_x_axis
+        return axis_alignment_cost(
+            ee_z, ctx.ee_z_axis_ref
+        ) + x_axis_weight * axis_alignment_cost(
+            ee_x,
+            ctx.ee_x_axis_ref,
         )
 
     return fn
 
 
-def _posture(planner, **_):
+def _position_regularization(planner, **_):
     def fn(state, inputs, ctx):
         q = state[: planner.nq]
-        return jnp.sum(jnp.square(q - ctx.goal_q))
+        return jnp.sum(jnp.square(q - ctx.q_ref))
 
     return fn
 
 
-def _control_regularization(planner, **_):
-    torque_scale = jnp.maximum(planner.torque_limits, 1.0)
+def _joint_weights(planner, weights, *, name: str):
+    if weights is None:
+        return jnp.ones(planner.nv, dtype=jnp.float32)
+    weights_arr = jnp.asarray(weights, dtype=jnp.float32)
+    if weights_arr.shape != (planner.nv,):
+        raise ValueError(
+            f"{name} weights must contain one value per joint "
+            f"({planner.nv}), got shape {weights_arr.shape}."
+        )
+    return weights_arr
+
+
+def _control_regularization(planner, *, weights=None, **_):
+    joint_weights = _joint_weights(planner, weights, name="control_regularization")
 
     def fn(state, inputs, ctx):
-        return jnp.sum(jnp.square((inputs - ctx.goal_tau) / torque_scale))
+        return jnp.sum(joint_weights * jnp.square(inputs - ctx.u_ref))
 
     return fn
 
 
-def _joint_velocity(planner, **_):
+def _velocity_regularization(planner, *, weights=None, **_):
     nq = planner.nq
+    joint_weights = _joint_weights(planner, weights, name="velocity_regularization")
 
     def fn(state, inputs, ctx):
         v = state[nq:]
-        return jnp.sum(jnp.square(v))
+        return jnp.sum(joint_weights * jnp.square(v - ctx.v_ref))
 
     return fn
 
 
-def _mechanical_power(planner, **_):
+def _joint_acceleration(planner, *, weights=None, **_):
+    """Penalize predicted joint acceleration ``qdd`` from the rollout dynamics."""
+    dynamics = getattr(planner, "dynamics", None)
+    if not callable(dynamics):
+        raise ValueError("joint_acceleration cost requires planner.dynamics")
+
+    nq = planner.nq
+    nv = planner.nv
+    joint_weights = _joint_weights(planner, weights, name="joint_acceleration")
+
+    def fn(state, inputs, ctx):
+        del ctx
+        if inputs is None:
+            return jnp.asarray(0.0, dtype=jnp.float32)
+        xdot = dynamics(
+            state,
+            inputs,
+            jnp.zeros(0, dtype=jnp.asarray(state).dtype),
+        )
+        qdd = xdot[nq : nq + nv]
+        return jnp.sum(joint_weights * jnp.square(qdd))
+
+    return fn
+
+
+def _mechanical_power(planner, *, weights=None, **_):
     """Penalize joint mechanical power tau*omega (opt-in; default weight 0)."""
     nq = planner.nq
+    joint_weights = _joint_weights(planner, weights, name="mechanical_power")
 
     def fn(state, inputs, ctx):
         v = state[nq:]
-        return jnp.sum(jnp.square(inputs * v))
+        return jnp.sum(joint_weights * jnp.square(inputs * v))
 
     return fn
 
@@ -229,8 +280,9 @@ TERM_BUILDERS: dict[str, Callable[..., TermFn]] = {
     "ee_translation_z": _ee_translation_z,
     "ee_position_sq": _ee_position_sq,
     "orientation": _orientation,
-    "posture": _posture,
+    "position_regularization": _position_regularization,
     "control_regularization": _control_regularization,
-    "joint_velocity": _joint_velocity,
+    "velocity_regularization": _velocity_regularization,
+    "joint_acceleration": _joint_acceleration,
     "mechanical_power": _mechanical_power,
 }

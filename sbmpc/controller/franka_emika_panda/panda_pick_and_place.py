@@ -32,21 +32,43 @@ class Phase(IntEnum):
 
 @dataclass(frozen=True)
 class PandaPickAndPlaceReference:
-    goal_pos: jax.Array
-    goal_q: jax.Array
-    goal_x_axis: jax.Array
-    goal_z_axis: jax.Array
-    goal_tau: jax.Array
+    ee_pos_ref: jax.Array
+    q_ref: jax.Array
+    ee_x_axis_ref: jax.Array
+    ee_z_axis_ref: jax.Array
+    u_ref: jax.Array
+    v_ref: jax.Array
     weights: jax.Array
+
+    @property
+    def goal_pos(self) -> jax.Array:
+        return self.ee_pos_ref
+
+    @property
+    def goal_q(self) -> jax.Array:
+        return self.q_ref
+
+    @property
+    def goal_x_axis(self) -> jax.Array:
+        return self.ee_x_axis_ref
+
+    @property
+    def goal_z_axis(self) -> jax.Array:
+        return self.ee_z_axis_ref
+
+    @property
+    def goal_tau(self) -> jax.Array:
+        return self.u_ref
 
     def as_vector(self) -> jax.Array:
         return jnp.concatenate(
             [
-                self.goal_pos,
-                self.goal_q,
-                self.goal_x_axis,
-                self.goal_z_axis,
-                self.goal_tau,
+                self.ee_pos_ref,
+                self.q_ref,
+                self.ee_x_axis_ref,
+                self.ee_z_axis_ref,
+                self.u_ref,
+                self.v_ref,
                 self.weights,
             ]
         )
@@ -147,7 +169,7 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
             Phase.RETREAT: self.RETREAT_HOLD_STEPS,
             Phase.DONE: 0,
         }
-        # weights: ee, orientation, posture, control, velocity, final_position
+        # weights: ee, orientation, position, control, velocity, final_position
         self.phase_weights_map = {
             Phase.PREGRASP: jnp.array([1.0, 1.0, 35.0, 0.20, 0.05, 1000.0], dtype=jnp.float32),
             Phase.DESCEND: jnp.array([1.2, 1.0, 35.0, 0.20, 0.05, 1000.0], dtype=jnp.float32),
@@ -237,13 +259,11 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
                 dtype=jnp.float32,
             )
             goal_tau = self.gravity_torques(goal_q)
-        return PandaPickAndPlaceReference(
+        return self.reference_for_state(
+            goal_q,
+            phase=phase,
             goal_pos=goal_pos,
-            goal_q=goal_q,
-            goal_x_axis=jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
-            goal_z_axis=jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
-            goal_tau=goal_tau,
-            weights=self.phase_weights_map[phase],
+            u_ref=goal_tau,
         )
 
     def reference_vector(
@@ -257,6 +277,49 @@ class PandaPickAndPlacePlanner(PandaPregraspPlanner):
             object_pos=object_pos,
             target_pos=target_pos,
         ).as_vector()
+
+    def reference_for_state(
+        self,
+        q_ref: jax.Array,
+        v_ref: jax.Array | None = None,
+        u_ref: jax.Array | None = None,
+        *,
+        phase: Phase | None = None,
+        goal_pos: jax.Array | None = None,
+    ) -> PandaPickAndPlaceReference:
+        phase = self.phase if phase is None else Phase(phase)
+        if goal_pos is None:
+            goal_pos = self.phase_goal_pos_map[phase]
+        q_ref = jnp.asarray(q_ref, dtype=jnp.float32)
+        v_ref = (
+            jnp.zeros(self.nv, dtype=jnp.float32)
+            if v_ref is None
+            else jnp.asarray(v_ref, dtype=jnp.float32)
+        )
+        u_ref = (
+            self.gravity_torques(q_ref)
+            if u_ref is None
+            else jnp.asarray(u_ref, dtype=jnp.float32)
+        )
+        return PandaPickAndPlaceReference(
+            ee_pos_ref=goal_pos,
+            q_ref=q_ref,
+            ee_x_axis_ref=jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
+            ee_z_axis_ref=jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
+            u_ref=u_ref,
+            v_ref=v_ref,
+            weights=self.phase_weights_map[phase],
+        )
+
+    def reference_vector_for_state(
+        self,
+        q_ref: jax.Array,
+        v_ref: jax.Array | None = None,
+        u_ref: jax.Array | None = None,
+        *,
+        phase: Phase | None = None,
+    ) -> jax.Array:
+        return self.reference_for_state(q_ref, v_ref, u_ref, phase=phase).as_vector()
 
     def gripper_target(self, phase: Phase | None = None) -> float:
         phase = self.phase if phase is None else Phase(phase)

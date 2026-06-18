@@ -36,6 +36,15 @@ from sbmpc.ocp import load_ocp_config
 from sbmpc.simulation import build_all
 
 
+def reference_fn_from_policy(planner: PandaPregraspPlanner, ocp):
+    def reference_fn(state):
+        q = state[: planner.nq]
+        v = state[planner.nq : planner.nq + planner.nv]
+        return planner.reference_vector_for_policy(q, v, ocp.references)
+
+    return reference_fn
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -189,6 +198,12 @@ def main() -> None:
         f"lambda={ocp.mpc.lambda_mpc} std_dev_scale={ocp.mpc.std_dev_scale} "
         f"init_guess={ocp.mpc.initial_guess} gains={ocp.mpc.gains}"
     )
+    print(
+        "references: "
+        f"q_ref={ocp.references.q_ref} "
+        f"v_ref={ocp.references.v_ref} "
+        f"u_ref={ocp.references.u_ref}"
+    )
     print(f"goal_pos = {np.asarray(planner.goal_pos)}")
     if config.MPC.gains:
         print(
@@ -205,6 +220,7 @@ def main() -> None:
         custom_dynamics_fn=planner.dynamics,
         controller_warmup_iterations=3,
         integrated_state_warmup_iterations=3,
+        reference_fn=reference_fn_from_policy(planner, ocp),
     )
     print(
         f"controller warmup complete in {time.perf_counter() - warmup_start:.1f} s",

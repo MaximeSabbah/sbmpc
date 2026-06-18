@@ -67,6 +67,15 @@ class SimSpec:
 
 
 @dataclass(frozen=True)
+class ReferenceSpec:
+    """Reference policy for generic state/control regularization costs."""
+
+    q_ref: str = "goal_ik"  # goal_ik | measured
+    v_ref: str = "zero"     # zero | measured
+    u_ref: str = "zero"     # zero | gravity_q_ref
+
+
+@dataclass(frozen=True)
 class OCPConfig:
     name: str
     running_terms: tuple[TermSpec, ...]
@@ -74,6 +83,7 @@ class OCPConfig:
     n_weights: int = 0
     mpc: MpcSpec = field(default_factory=MpcSpec)
     sim: SimSpec = field(default_factory=SimSpec)
+    references: ReferenceSpec = field(default_factory=ReferenceSpec)
 
 
 def _term_specs(items: list[dict[str, Any]] | None) -> tuple[TermSpec, ...]:
@@ -125,6 +135,23 @@ def _sim_spec(d: dict[str, Any] | None) -> SimSpec:
     )
 
 
+def _choice(d: dict[str, Any], key: str, default: str, valid: set[str]) -> str:
+    value = str(d.get(key, default)).strip().lower()
+    if value not in valid:
+        choices = ", ".join(sorted(valid))
+        raise ValueError(f"references.{key} must be one of: {choices}.")
+    return value
+
+
+def _reference_spec(d: dict[str, Any] | None) -> ReferenceSpec:
+    d = d or {}
+    return ReferenceSpec(
+        q_ref=_choice(d, "q_ref", ReferenceSpec.q_ref, {"goal_ik", "measured"}),
+        v_ref=_choice(d, "v_ref", ReferenceSpec.v_ref, {"zero", "measured"}),
+        u_ref=_choice(d, "u_ref", ReferenceSpec.u_ref, {"zero", "gravity_q_ref"}),
+    )
+
+
 def ocp_config_from_dict(data: dict[str, Any], *, default_name: str = "ocp") -> OCPConfig:
     return OCPConfig(
         name=str(data.get("name", default_name)),
@@ -133,6 +160,7 @@ def ocp_config_from_dict(data: dict[str, Any], *, default_name: str = "ocp") -> 
         n_weights=int(data.get("n_weights", 0)),
         mpc=_mpc_spec(data.get("mpc")),
         sim=_sim_spec(data.get("sim")),
+        references=_reference_spec(data.get("references")),
     )
 
 

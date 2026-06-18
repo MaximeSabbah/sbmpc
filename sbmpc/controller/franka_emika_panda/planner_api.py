@@ -217,12 +217,13 @@ class PandaPickAndPlaceController:
             or reference_signature != self._last_reference_signature
         ):
             self._seed_nominal_solution(state, reference.goal_q)
+        reference_vec = self.planner.reference_vector_for_state(q, phase=phase)
         planner_prepare_time_ms = 1000.0 * (time.perf_counter() - prepare_start)
 
         command_start = time.perf_counter()
         input_sequence = self.controller.command(
             state,
-            self.planner.reference_vec,
+            reference_vec,
             shift_guess=True,
             num_steps=effective_num_steps,
         )
@@ -262,7 +263,7 @@ class PandaPickAndPlaceController:
                     self.objective.running_cost(
                         state,
                         jnp.asarray(tau_ff, dtype=jnp.float32),
-                        self.planner.reference_vec,
+                        reference_vec,
                     )
                 )
             )
@@ -375,6 +376,7 @@ class PandaPregraspController:
         self.planner = PandaPregraspPlanner() if planner is None else planner
         if ocp_config is None:
             ocp_config = load_ocp_config("pregrasp")
+        self.ocp_config = ocp_config
         self.objective = PandaPregraspObjective(self.planner, ocp_config=ocp_config)
         self.config = (
             make_panda_pregrasp_config(
@@ -442,12 +444,17 @@ class PandaPregraspController:
         )
         if reset_guess or not self._solution_initialized:
             self._seed_gravity_comp_solution(state)
+        reference_vec = self.planner.reference_vector_for_policy(
+            q,
+            v,
+            self.ocp_config.references,
+        )
         planner_prepare_time_ms = 1000.0 * (time.perf_counter() - prepare_start)
 
         command_start = time.perf_counter()
         input_sequence = self.controller.command(
             state,
-            self.planner.reference_vec,
+            reference_vec,
             shift_guess=True,
             num_steps=effective_num_steps,
         )
@@ -481,7 +488,7 @@ class PandaPregraspController:
                     self.objective.running_cost(
                         state,
                         jnp.asarray(tau_ff, dtype=jnp.float32),
-                        self.planner.reference_vec,
+                        reference_vec,
                     )
                 )
             )

@@ -231,8 +231,10 @@ class Simulation(Simulator):
         const_reference: jnp.array,
         config: settings.Config,
         visualize_params: Optional[Dict] = None,
+        reference_fn: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None,
     ):
         self.const_reference = const_reference
+        self.reference_fn = reference_fn
         visualizer = None
         if config.general.visualize:
             scene_path = visualize_params.get(ROBOT_SCENE_PATH_KEY, None)
@@ -258,8 +260,13 @@ class Simulation(Simulator):
             print("current state: ", state_vec)
 
         time_start = time.time_ns()
+        reference = (
+            self.const_reference
+            if self.reference_fn is None
+            else self.reference_fn(state_vec)
+        )
         input_sequence = self.controller.command(
-            state_vec, self.const_reference, num_steps=1
+            state_vec, reference, num_steps=1
         ).block_until_ready()
         if self.controller.gains_obj.compute_gains:
             # Synchronize the independent gain result before reporting latency.
@@ -419,6 +426,7 @@ def build_all(
     custom_dynamics_fn: Optional[Callable] = None,
     controller_warmup_iterations: int = 1,
     integrated_state_warmup_iterations: int = 0,
+    reference_fn: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None,
 ):
     system, x_init, state_init = (None, None, None)
     solver_dynamics_model_setting = config.solver_dynamics
@@ -457,12 +465,14 @@ def build_all(
         reference,
         config,
         visualizer_params,
+        reference_fn=reference_fn,
     )
 
+    warmup_reference = reference_fn(solver_x_init) if reference_fn is not None else reference
     input_sequence = warmup_controller(
         sim.controller,
         solver_x_init,
-        reference,
+        warmup_reference,
         iterations=controller_warmup_iterations,
     )
 
@@ -477,10 +487,13 @@ def build_all(
         jax.block_until_ready(warm_state)
         jax.effects_barrier()
         if integrated_state_warmup_iterations > 0:
+            warmup_reference = (
+                reference_fn(warm_state) if reference_fn is not None else reference
+            )
             warmup_controller(
                 sim.controller,
                 warm_state,
-                reference,
+                warmup_reference,
                 iterations=integrated_state_warmup_iterations,
             )
 

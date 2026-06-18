@@ -85,6 +85,11 @@ sim:                      # closed-loop sandbox only (scripts/panda_pregrasp.py)
   iterations: 400         # closed-loop steps
   integrator: custom_discrete   # si_euler | euler | rk4 | custom_discrete
 
+references:               # generic state/control refs used by regularization terms
+  q_ref: measured          # measured | goal_ik
+  v_ref: zero              # zero | measured
+  u_ref: gravity_q_ref     # gravity_q_ref | zero
+
 running_terms:            # weighted sum, integrated as dt * sum(...) per step
   - {name: <term>, weight: <float>, params: {...}, ref_weight_index: <int>}
 terminal_terms:           # added once at the end of the horizon
@@ -96,6 +101,10 @@ Constraints enforced at build time:
 - `num_control_points <= horizon` (raises otherwise).
 - `num_gain_samples <= num_samples` (raises otherwise).
 - Every term `name` must exist in `TERM_BUILDERS`.
+- `references.q_ref` must be `measured` or `goal_ik`.
+- `references.v_ref` must be `zero` or `measured`.
+- `references.u_ref` must be `gravity_q_ref` or `zero`; `gravity_q_ref`
+  means gravity compensation evaluated at the selected `q_ref`.
 - All terms must stay JAX-differentiable: the exact-gain path takes a jvp of
   the rollout cost w.r.t. the initial state.
 
@@ -114,13 +123,13 @@ stage), and `ctx` is the decoded reference (§5). Contribution =
 
 | name | formula | reads from reference | params | notes |
 |---|---|---|---|---|
-| `ee_translation_xy` | `sqrt(‖(goal_pos − ee_pos)[:2]‖² + 1e-8)` | `goal_pos` | — | smooth L2 in the horizontal plane; linear far from goal (steady pull) |
-| `ee_translation_z` | `abs((goal_pos − ee_pos)[2])` | `goal_pos` | — | vertical reach component, kept separate so descend/lift phases can weight it differently |
-| `ee_position_sq` | `‖goal_pos − ee_pos‖²` | `goal_pos` | — | quadratic; sharp near the goal — typical as a **terminal** term |
-| `orientation` | `(1 − ee_z·goal_z) + x_axis_weight·(1 − ee_x·goal_x)` | `goal_x_axis`, `goal_z_axis` | `x_axis_weight` (default 0.5) | axis alignment of the TCP frame; z axis is the tool axis |
-| `posture` | `‖q − goal_q‖²` | `goal_q` | — | joint-space regularization toward the IK solution; resolves redundancy |
-| `control_regularization` | `‖(τ − goal_tau) / max(torque_limits, 1)‖²` | `goal_tau` | — | **running-only** (needs `inputs`); penalizes deviation from gravity torque at the goal, normalized per joint |
-| `joint_velocity` | `‖v‖²` | — | — | damps the motion; raise it (or its terminal weight) if velocity limits are grazed |
+| `ee_translation_xy` | `sqrt(‖(ee_pos_ref − ee_pos)[:2]‖² + 1e-8)` | `ee_pos_ref` | — | smooth L2 in the horizontal plane; linear far from reference (steady pull) |
+| `ee_translation_z` | `abs((ee_pos_ref − ee_pos)[2])` | `ee_pos_ref` | — | vertical reach component, kept separate so descend/lift phases can weight it differently |
+| `ee_position_sq` | `‖ee_pos_ref − ee_pos‖²` | `ee_pos_ref` | — | quadratic; sharp near the reference — typical as a **terminal** term |
+| `orientation` | `(1 − ee_z·ee_z_axis_ref) + x_axis_weight·(1 − ee_x·ee_x_axis_ref)` | `ee_x_axis_ref`, `ee_z_axis_ref` | `x_axis_weight` (default 0.5) | axis alignment of the TCP frame; z axis is the tool axis |
+| `position_regularization` | `‖q − q_ref‖²` | `q_ref` | — | joint-position regularization; the planner decides whether `q_ref` is the measured state, IK goal, nominal trajectory sample, etc. |
+| `control_regularization` | `Σ w_i(τ_i − u_ref_i)²` | `u_ref` | `weights` (optional per joint) | **running-only**; by default pregrasp sets `u_ref = gravity(q_measured_now)` |
+| `velocity_regularization` | `Σ w_i(v_i − v_ref_i)²` | `v_ref` | `weights` (optional per joint) | damps motion; pregrasp uses zero velocity as the reference |
 | `mechanical_power` | `‖τ ⊙ v‖²` | — | — | joint mechanical power penalty; opt-in (not used by the shipped OCPs), useful against power-limit violations on the real robot |
 
 End-effector kinematics (`ee_pos`, `ee_x`, `ee_z`) come from the planner's
@@ -139,7 +148,7 @@ It is then immediately usable from any yaml.
   Terminal terms never see `inputs` — `control_regularization` is invalid there.
 - Tuning intuition from the pregrasp task: strong terminal `ee_position_sq`
   (1500) is what actually pins the goal; running translation terms (90–120)
-  shape the approach; `joint_velocity` and `control_regularization` are the
+  shape the approach; `velocity_regularization` and `control_regularization` are the
   brakes. If the controller saturates torque/velocity limits during the reach,
   raise the brakes or soften the terminal cost before touching the hardware.
 
@@ -148,18 +157,23 @@ It is then immediately usable from any yaml.
 The planner packs a flat reference vector consumed by `ReferenceLayout`:
 
 ```
-[ goal_pos(3) | goal_q(nq) | goal_x_axis(3) | goal_z_axis(3) | goal_tau(nv) | weights(n_weights, optional) ]
+[ ee_pos_ref(3) | q_ref(nq) | ee_x_axis_ref(3) | ee_z_axis_ref(3) |
+  u_ref(nv) | v_ref(nv) | weights(n_weights, optional) ]
 ```
 
-- `goal_pos`: target TCP position. `goal_q`: IK joint solution for the goal
-  pose. `goal_x_axis`/`goal_z_axis`: columns of the goal rotation.
-  `goal_tau`: gravity torques at `goal_q`.
+- `ee_pos_ref`: target TCP position.
+- `ee_x_axis_ref`/`ee_z_axis_ref`: columns of the reference TCP rotation.
+- `q_ref`, `v_ref`, `u_ref`: generic state/control regularization references.
+  Cost terms do not prescribe where these values come from; the OCP
+  `references:` policy does. In the deployed pregrasp configuration they are
+  refreshed at every MPC cycle as `q_measured`, zero velocity, and
+  `gravity(q_measured)`.
 - `weights` (only when `n_weights > 0`): a per-phase scaling vector. A term
   with `ref_weight_index: i` gets its yaml weight multiplied by `weights[i]`.
   This is how one yaml serves a multi-phase task: the planner switches the
   weight vector per phase while the term structure stays fixed.
   `pick_and_place.yaml` uses `n_weights: 6` with the convention
-  `0: ee, 1: orientation, 2: posture, 3: control, 4: velocity, 5: final_position`.
+  `0: ee, 1: orientation, 2: position, 3: control, 4: velocity, 5: final_position`.
 
 ## 6. Tasks available today
 
@@ -192,7 +206,7 @@ a packed `reference_vec` matching §5. The cost library and solver are shared.
 
 ## 8. Runtime weight overrides
 
-`sbmpc.ocp.with_weight_overrides(ocp, {"posture": 20.0})` returns a copy with
+`sbmpc.ocp.with_weight_overrides(ocp, {"position_regularization": 20.0})` returns a copy with
 matching running/terminal term weights replaced (unknown names ignored) — the
 hook for programmatic tuning sweeps without writing yaml files.
 

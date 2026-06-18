@@ -13,7 +13,7 @@ from robot_descriptions.panda_description import URDF_PATH as PANDA_URDF_PATH
 
 from sbmpc.settings import Config, DynamicsModel, RobotConfig
 from sbmpc.costs import FactoryObjective
-from sbmpc.ocp import build_cost_model, load_ocp_config
+from sbmpc.ocp import ReferenceSpec, build_cost_model, load_ocp_config
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -36,20 +36,42 @@ PREGRASP_CLEARANCE = 0.05
 
 @dataclass(frozen=True)
 class PandaPregraspReference:
-    goal_pos: jax.Array
-    goal_q: jax.Array
-    goal_x_axis: jax.Array
-    goal_z_axis: jax.Array
-    goal_tau: jax.Array
+    ee_pos_ref: jax.Array
+    q_ref: jax.Array
+    ee_x_axis_ref: jax.Array
+    ee_z_axis_ref: jax.Array
+    u_ref: jax.Array
+    v_ref: jax.Array
+
+    @property
+    def goal_pos(self) -> jax.Array:
+        return self.ee_pos_ref
+
+    @property
+    def goal_q(self) -> jax.Array:
+        return self.q_ref
+
+    @property
+    def goal_x_axis(self) -> jax.Array:
+        return self.ee_x_axis_ref
+
+    @property
+    def goal_z_axis(self) -> jax.Array:
+        return self.ee_z_axis_ref
+
+    @property
+    def goal_tau(self) -> jax.Array:
+        return self.u_ref
 
     def as_vector(self) -> jax.Array:
         return jnp.concatenate(
             [
-                self.goal_pos,
-                self.goal_q,
-                self.goal_x_axis,
-                self.goal_z_axis,
-                self.goal_tau,
+                self.ee_pos_ref,
+                self.q_ref,
+                self.ee_x_axis_ref,
+                self.ee_z_axis_ref,
+                self.u_ref,
+                self.v_ref,
             ]
         )
 
@@ -117,12 +139,9 @@ class PandaPregraspPlanner:
         )
         self.goal_tau = self.gravity_torques(self.goal_q)
 
-        self.reference = PandaPregraspReference(
-            goal_pos=self.goal_pos,
-            goal_q=self.goal_q,
-            goal_x_axis=self.goal_rotation[:, 0],
-            goal_z_axis=self.goal_rotation[:, 2],
-            goal_tau=self.goal_tau,
+        self.reference = self.reference_for_state(
+            self.home_q,
+            jnp.zeros(self.nv, dtype=jnp.float32),
         )
         self.reference_vec = self.reference.as_vector()
 
@@ -313,6 +332,80 @@ class PandaPregraspPlanner:
     def ee_features(self, q: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         features = self._ee_features_jax(q)
         return features[:3], features[3:6], features[6:9]
+
+    def reference_for_state(
+        self,
+        q_ref: jax.Array,
+        v_ref: jax.Array | None = None,
+        u_ref: jax.Array | None = None,
+    ) -> PandaPregraspReference:
+        q_ref = jnp.asarray(q_ref, dtype=jnp.float32)
+        v_ref = (
+            jnp.zeros(self.nv, dtype=jnp.float32)
+            if v_ref is None
+            else jnp.asarray(v_ref, dtype=jnp.float32)
+        )
+        u_ref = (
+            self.gravity_torques(q_ref)
+            if u_ref is None
+            else jnp.asarray(u_ref, dtype=jnp.float32)
+        )
+        return PandaPregraspReference(
+            ee_pos_ref=self.goal_pos,
+            q_ref=q_ref,
+            ee_x_axis_ref=jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
+            ee_z_axis_ref=jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
+            u_ref=u_ref,
+            v_ref=v_ref,
+        )
+
+    def reference_vector_for_state(
+        self,
+        q_ref: jax.Array,
+        v_ref: jax.Array | None = None,
+        u_ref: jax.Array | None = None,
+    ) -> jax.Array:
+        return self.reference_for_state(q_ref, v_ref, u_ref).as_vector()
+
+    def reference_for_policy(
+        self,
+        measured_q: jax.Array,
+        measured_v: jax.Array,
+        policy: ReferenceSpec,
+    ) -> PandaPregraspReference:
+        measured_q = jnp.asarray(measured_q, dtype=jnp.float32)
+        measured_v = jnp.asarray(measured_v, dtype=jnp.float32)
+
+        if policy.q_ref == "goal_ik":
+            q_ref = self.goal_q
+        elif policy.q_ref == "measured":
+            q_ref = measured_q
+        else:
+            raise ValueError(f"unsupported q_ref policy: {policy.q_ref}")
+
+        if policy.v_ref == "zero":
+            v_ref = jnp.zeros(self.nv, dtype=jnp.float32)
+        elif policy.v_ref == "measured":
+            v_ref = measured_v
+        else:
+            raise ValueError(f"unsupported v_ref policy: {policy.v_ref}")
+
+        if policy.u_ref == "zero":
+            u_ref = jnp.zeros(self.nu, dtype=jnp.float32)
+        elif policy.u_ref == "gravity_q_ref":
+            u_ref = self.gravity_torques(q_ref)
+        else:
+            raise ValueError(f"unsupported u_ref policy: {policy.u_ref}")
+
+        return self.reference_for_state(q_ref, v_ref, u_ref)
+
+    def reference_vector_for_policy(
+        self,
+        measured_q: jax.Array,
+        measured_v: jax.Array,
+        policy: ReferenceSpec,
+    ) -> jax.Array:
+        return self.reference_for_policy(measured_q, measured_v, policy).as_vector()
 
 
 class PandaPregraspObjective(FactoryObjective):
