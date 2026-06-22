@@ -269,6 +269,7 @@ class PandaPickAndPlaceController:
             )
 
         gripper_width = float(self.planner.gripper_target(phase))
+
         return PlannerOutput(
             tau_ff=tau_ff,
             K=gains_array,
@@ -393,6 +394,9 @@ class PandaPregraspController:
         self._default_num_steps = self._validate_num_steps(num_steps)
         self._solution_initialized = False
         self._last_tau_ff: np.ndarray | None = None
+        self._trajectory_start_q: jax.Array | None = None
+        self._trajectory_duration_sec = 0.0
+        self._trajectory_step_index = 0
         self._started = False
         self._compute_running_cost = compute_running_cost
         self._compute_task_diagnostics = compute_task_diagnostics
@@ -409,6 +413,7 @@ class PandaPregraspController:
         self._started = False
         self._solution_initialized = False
         self._last_tau_ff = None
+        self._reset_trajectory()
 
     def warmup(
         self,
@@ -444,19 +449,19 @@ class PandaPregraspController:
         effective_num_steps = self._validate_num_steps(
             self._default_num_steps if num_steps is None else num_steps
         )
-        if reset_guess or not self._solution_initialized:
-            self._seed_gravity_comp_solution(state)
         previous_u = (
             None
             if reset_guess or not self._solution_initialized
             else self._last_tau_ff
         )
-        reference_vec = self.planner.reference_vector_for_policy(
+        reference_vec = self._reference_for_current_horizon(
             q,
             v,
-            self.ocp_config.references,
-            previous_u,
+            previous_u=previous_u,
+            reset_trajectory=reset_guess or not self._solution_initialized,
         )
+        if reset_guess or not self._solution_initialized:
+            self._seed_nominal_solution_from_reference(reference_vec)
         planner_prepare_time_ms = 1000.0 * (time.perf_counter() - prepare_start)
 
         command_start = time.perf_counter()
@@ -497,10 +502,13 @@ class PandaPregraspController:
                     self.objective.running_cost(
                         state,
                         jnp.asarray(tau_ff, dtype=jnp.float32),
-                        reference_vec,
+                        self._running_cost_reference(reference_vec),
                     )
                 )
             )
+
+        if self._trajectory_enabled():
+            self._trajectory_step_index += 1
 
         return PlannerOutput(
             tau_ff=tau_ff,
@@ -541,16 +549,119 @@ class PandaPregraspController:
         predicted = np.asarray(jax.block_until_ready(predicted), dtype=np.float32)
         return predicted[: self.planner.nq], predicted[self.planner.nq :]
 
-    def _seed_gravity_comp_solution(self, state: jax.Array) -> None:
-        q = jnp.asarray(state[: self.planner.nq], dtype=jnp.float32)
-        tau = jnp.clip(
-            self.planner.gravity_torques(q),
+    def _trajectory_enabled(self) -> bool:
+        return bool(self.ocp_config.trajectory.enabled)
+
+    def _reset_trajectory(self) -> None:
+        self._trajectory_start_q = None
+        self._trajectory_duration_sec = 0.0
+        self._trajectory_step_index = 0
+
+    def _initialize_trajectory(self, q: jax.Array) -> None:
+        spec = self.ocp_config.trajectory
+        start = jnp.asarray(q, dtype=jnp.float32)
+        goal = jnp.asarray(self.planner.goal_q, dtype=jnp.float32)
+        dq_abs = np.abs(np.asarray(goal - start, dtype=np.float64))
+        velocity_limit = (
+            np.asarray(self.planner.velocity_limits, dtype=np.float64)
+            * float(spec.max_velocity_fraction)
+        )
+        # Minimum-jerk peak speed is 1.875 * |dq| / duration.
+        duration_from_limits = float(
+            np.max(1.875 * dq_abs / np.maximum(velocity_limit, 1e-6), initial=0.0)
+        )
+        duration = max(float(spec.duration_sec), duration_from_limits, float(self.config.MPC.dt))
+        self._trajectory_start_q = start
+        self._trajectory_duration_sec = duration
+        self._trajectory_step_index = 0
+
+    def _trajectory_samples(self) -> tuple[jax.Array, jax.Array]:
+        if self._trajectory_start_q is None:
+            raise RuntimeError("trajectory has not been initialized")
+        horizon = int(self.config.MPC.horizon)
+        dt = float(self.config.MPC.dt)
+        duration = max(float(self._trajectory_duration_sec), dt)
+        steps = self._trajectory_step_index + np.arange(horizon + 1, dtype=np.float64)
+        s = np.clip((steps * dt) / duration, 0.0, 1.0)
+        blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+        blend_dot = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / duration
+        start = np.asarray(self._trajectory_start_q, dtype=np.float64)
+        goal = np.asarray(self.planner.goal_q, dtype=np.float64)
+        delta = goal - start
+        q_ref = start[None, :] + blend[:, None] * delta[None, :]
+        v_ref = blend_dot[:, None] * delta[None, :]
+        return (
+            jnp.asarray(q_ref, dtype=jnp.float32),
+            jnp.asarray(v_ref, dtype=jnp.float32),
+        )
+
+    def _u_reference_for_q(self, q_ref: jax.Array) -> jax.Array:
+        if self.ocp_config.references.u_ref == "zero":
+            return jnp.zeros(self.planner.nu, dtype=jnp.float32)
+        if self.ocp_config.references.u_ref == "gravity_q_ref":
+            return self.planner.gravity_torques(q_ref)
+        raise ValueError(f"unsupported u_ref policy: {self.ocp_config.references.u_ref}")
+
+    def _previous_u_reference(
+        self,
+        previous_u: np.ndarray | None,
+        first_u_ref: jax.Array,
+    ) -> jax.Array:
+        policy = self.ocp_config.references.u_prev_ref
+        if policy == "previous_control":
+            if previous_u is None:
+                return first_u_ref
+            return jnp.asarray(previous_u, dtype=jnp.float32)
+        if policy == "u_ref":
+            return first_u_ref
+        if policy == "zero":
+            return jnp.zeros(self.planner.nu, dtype=jnp.float32)
+        raise ValueError(f"unsupported u_prev_ref policy: {policy}")
+
+    def _reference_for_current_horizon(
+        self,
+        q: jax.Array,
+        v: jax.Array,
+        *,
+        previous_u: np.ndarray | None,
+        reset_trajectory: bool,
+    ) -> jax.Array:
+        if not self._trajectory_enabled():
+            return self.planner.reference_vector_for_policy(
+                q,
+                v,
+                self.ocp_config.references,
+                previous_u,
+            )
+
+        if reset_trajectory or self._trajectory_start_q is None:
+            self._initialize_trajectory(q)
+
+        q_refs, v_refs = self._trajectory_samples()
+        u_refs = [self._u_reference_for_q(q_ref) for q_ref in q_refs]
+        first_u_prev = self._previous_u_reference(previous_u, u_refs[0])
+        refs = [
+            self.planner.reference_vector_for_state(q_ref, v_ref, u_ref, first_u_prev)
+            for q_ref, v_ref, u_ref in zip(q_refs, v_refs, u_refs)
+        ]
+        return jnp.stack(refs, axis=0)
+
+    def _seed_nominal_solution_from_reference(self, reference_vec: jax.Array) -> None:
+        u_start = 9 + self.planner.nq
+        u_stop = u_start + self.planner.nu
+        if reference_vec.ndim == 2:
+            tau = reference_vec[: self.config.MPC.horizon, u_start:u_stop]
+        else:
+            tau = jnp.tile(reference_vec[u_start:u_stop], (self.config.MPC.horizon, 1))
+        self.controller.sampler.optimal_samples = jnp.clip(
+            tau.astype(jnp.float32),
             -self.planner.torque_limits,
             self.planner.torque_limits,
         )
-        self.controller.sampler.optimal_samples = jnp.tile(
-            tau.astype(jnp.float32), (self.config.MPC.horizon, 1)
-        )
+
+    @staticmethod
+    def _running_cost_reference(reference_vec: jax.Array) -> jax.Array:
+        return reference_vec[0, :] if reference_vec.ndim == 2 else reference_vec
 
     def _validate_num_steps(self, value: int) -> int:
         num_steps = int(value)

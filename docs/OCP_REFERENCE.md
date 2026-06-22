@@ -16,7 +16,7 @@ Implementation pointers (ground truth):
 
 | What | Where |
 |---|---|
-| YAML loading / schema dataclasses | `sbmpc/ocp.py` (`OCPConfig`, `MpcSpec`, `SimSpec`, `load_ocp_config`) |
+| YAML loading / schema dataclasses | `sbmpc/ocp.py` (`OCPConfig`, `MpcSpec`, `SimSpec`, `TrajectorySpec`, `load_ocp_config`) |
 | Cost-term registry + formulas | `sbmpc/costs.py` (`TERM_BUILDERS`) |
 | Reference vector layout | `sbmpc/costs.py` (`ReferenceLayout`) |
 | Existing OCPs | `sbmpc/ocp_configs/pregrasp.yaml`, `sbmpc/ocp_configs/pick_and_place.yaml` |
@@ -85,6 +85,11 @@ sim:                      # closed-loop sandbox only (scripts/panda_pregrasp.py)
   iterations: 400         # closed-loop steps
   integrator: custom_discrete   # si_euler | euler | rk4 | custom_discrete
 
+trajectory:               # optional runtime joint-space reference generator
+  enabled: false          # true = minimum-jerk q/v refs from measured q0 to goal IK
+  duration_sec: 6.0       # nominal duration; may be lengthened by velocity limits
+  max_velocity_fraction: 0.25  # peak trajectory speed fraction of joint limits
+
 references:               # generic state/control refs used by regularization terms
   q_ref: measured          # measured | goal_ik
   v_ref: zero              # zero | measured
@@ -109,6 +114,8 @@ Constraints enforced at build time:
 - `references.u_prev_ref` must be `previous_control`, `u_ref`, or `zero`.
   It initializes the first step of `command_rate_regularization`; after that,
   the term compares each planned torque with the preceding planned torque.
+- `trajectory.duration_sec` must be non-negative.
+- `trajectory.max_velocity_fraction` must be in `(0, 1]`.
 - All terms must stay JAX-differentiable: the exact-gain path takes a jvp of
   the rollout cost w.r.t. the initial state.
 
@@ -131,8 +138,8 @@ stage), and `ctx` is the decoded reference (§5). Contribution =
 | `ee_translation_z` | `abs((ee_pos_ref − ee_pos)[2])` | `ee_pos_ref` | — | vertical reach component, kept separate so descend/lift phases can weight it differently |
 | `ee_position_sq` | `‖ee_pos_ref − ee_pos‖²` | `ee_pos_ref` | — | quadratic; sharp near the reference — typical as a **terminal** term |
 | `orientation` | `(1 − ee_z·ee_z_axis_ref) + x_axis_weight·(1 − ee_x·ee_x_axis_ref)` | `ee_x_axis_ref`, `ee_z_axis_ref` | `x_axis_weight` (default 0.5) | axis alignment of the TCP frame; z axis is the tool axis |
-| `position_regularization` | `‖q − q_ref‖²` | `q_ref` | — | joint-position regularization; the planner decides whether `q_ref` is the measured state, IK goal, nominal trajectory sample, etc. |
-| `control_regularization` | `Σ w_i(τ_i − u_ref_i)²` | `u_ref` | `weights` (optional per joint) | **running-only**; by default pregrasp sets `u_ref = gravity(q_measured_now)` |
+| `position_regularization` | `Σ w_i(q_i − q_ref_i)²` | `q_ref` | `weights` (optional per joint) | joint-position regularization; the planner decides whether `q_ref` is the measured state, IK goal, nominal trajectory sample, etc. |
+| `control_regularization` | `Σ w_i(τ_i − u_ref_i)²` | `u_ref` | `weights` (optional per joint) | **running-only**; pregrasp commonly sets `u_ref = gravity(q_ref)` |
 | `command_rate_regularization` | `Σ w_i(τ_k,i − τ_{k−1,i})²` | `u_prev_ref` for `k=0` | `weights` (optional per joint) | **running-only**; penalizes command jumps. For `k>0`, `τ_{k−1}` is the previous planned torque inside the same horizon. |
 | `velocity_regularization` | `Σ w_i(v_i − v_ref_i)²` | `v_ref` | `weights` (optional per joint) | damps motion; pregrasp uses zero velocity as the reference |
 | `mechanical_power` | `‖τ ⊙ v‖²` | — | — | joint mechanical power penalty; opt-in (not used by the shipped OCPs), useful against power-limit violations on the real robot |
@@ -151,11 +158,14 @@ It is then immediately usable from any yaml.
   effective running weight).
 - Terminal cost is added once on the final state: `cost += Σ term(state_N, ref)`.
   Terminal terms never see `inputs` — `control_regularization` is invalid there.
-- Tuning intuition from the pregrasp task: strong terminal `ee_position_sq`
-  (1500) is what actually pins the goal; running translation terms (90–120)
-  shape the approach; `velocity_regularization` and `control_regularization` are the
-  brakes. If the controller saturates torque/velocity limits during the reach,
-  raise the brakes or soften the terminal cost before touching the hardware.
+- Current pregrasp tuning tracks a generated joint-space trajectory rather than
+  pulling directly with Cartesian running costs. `position_regularization` follows
+  the q reference, `velocity_regularization` follows the v reference,
+  `command_rate_regularization` smooths torque changes, and
+  `control_regularization` keeps torques near the selected gravity/zero reference.
+  If the reach is accurate but oscillatory, first reduce sampling sharpness/noise
+  (`lambda`, `std_dev_scale`) or increase command-rate damping; if one joint lags,
+  prefer per-joint weights over globally cranking all costs.
 
 ## 5. The reference vector (what terms can "see")
 
@@ -170,9 +180,12 @@ The planner packs a flat reference vector consumed by `ReferenceLayout`:
 - `ee_x_axis_ref`/`ee_z_axis_ref`: columns of the reference TCP rotation.
 - `q_ref`, `v_ref`, `u_ref`: generic state/control regularization references.
   Cost terms do not prescribe where these values come from; the OCP
-  `references:` policy does. In the deployed pregrasp configuration they are
-  refreshed at every MPC cycle as `q_measured`, zero velocity, and
-  `gravity(q_measured)`.
+  `references:` and optional `trajectory:` policies do. With
+  `trajectory.enabled: true`, pregrasp generates a minimum-jerk joint trajectory
+  from the measured start state to the pregrasp IK and packs its horizon samples
+  as `q_ref`/`v_ref`; `u_ref: gravity_q_ref` then evaluates gravity at each
+  sampled `q_ref`. With trajectory disabled, the static `references:` choices
+  are used directly at every MPC cycle.
 - `u_prev_ref`: first-step command-rate reference. In deployed pregrasp this is
   the previous `tau_ff` published by the planner, falling back to `u_ref` on the
   first active cycle.

@@ -77,6 +77,15 @@ class ReferenceSpec:
 
 
 @dataclass(frozen=True)
+class TrajectorySpec:
+    """Runtime joint-space reference trajectory for reaching tasks."""
+
+    enabled: bool = False
+    duration_sec: float = 6.0
+    max_velocity_fraction: float = 0.25
+
+
+@dataclass(frozen=True)
 class OCPConfig:
     name: str
     running_terms: tuple[TermSpec, ...]
@@ -85,6 +94,7 @@ class OCPConfig:
     mpc: MpcSpec = field(default_factory=MpcSpec)
     sim: SimSpec = field(default_factory=SimSpec)
     references: ReferenceSpec = field(default_factory=ReferenceSpec)
+    trajectory: TrajectorySpec = field(default_factory=TrajectorySpec)
 
 
 def _term_specs(items: list[dict[str, Any]] | None) -> tuple[TermSpec, ...]:
@@ -159,6 +169,22 @@ def _reference_spec(d: dict[str, Any] | None) -> ReferenceSpec:
     )
 
 
+def _trajectory_spec(d: dict[str, Any] | None) -> TrajectorySpec:
+    d = d or {}
+    spec = TrajectorySpec(
+        enabled=bool(d.get("enabled", TrajectorySpec.enabled)),
+        duration_sec=float(d.get("duration_sec", TrajectorySpec.duration_sec)),
+        max_velocity_fraction=float(
+            d.get("max_velocity_fraction", TrajectorySpec.max_velocity_fraction)
+        ),
+    )
+    if spec.duration_sec < 0.0:
+        raise ValueError("trajectory.duration_sec must be non-negative.")
+    if not (0.0 < spec.max_velocity_fraction <= 1.0):
+        raise ValueError("trajectory.max_velocity_fraction must be in (0, 1].")
+    return spec
+
+
 def ocp_config_from_dict(data: dict[str, Any], *, default_name: str = "ocp") -> OCPConfig:
     return OCPConfig(
         name=str(data.get("name", default_name)),
@@ -168,6 +194,7 @@ def ocp_config_from_dict(data: dict[str, Any], *, default_name: str = "ocp") -> 
         mpc=_mpc_spec(data.get("mpc")),
         sim=_sim_spec(data.get("sim")),
         references=_reference_spec(data.get("references")),
+        trajectory=_trajectory_spec(data.get("trajectory")),
     )
 
 

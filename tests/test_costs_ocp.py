@@ -329,6 +329,27 @@ def test_reference_policy_rejects_unknown_previous_control_reference() -> None:
         ocp_config_from_dict({"references": {"u_prev_ref": "gravity_q_ref"}})
 
 
+def test_trajectory_policy_parses_valid_choices() -> None:
+    ocp = ocp_config_from_dict(
+        {
+            "trajectory": {
+                "enabled": True,
+                "duration_sec": 5.5,
+                "max_velocity_fraction": 0.2,
+            }
+        }
+    )
+
+    assert ocp.trajectory.enabled
+    assert ocp.trajectory.duration_sec == 5.5
+    assert ocp.trajectory.max_velocity_fraction == 0.2
+
+
+def test_trajectory_policy_rejects_invalid_velocity_fraction() -> None:
+    with pytest.raises(ValueError, match=r"trajectory\.max_velocity_fraction"):
+        ocp_config_from_dict({"trajectory": {"max_velocity_fraction": 0.0}})
+
+
 def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     ocp = load_ocp_config("pregrasp")
     running_terms = {term.name: term for term in ocp.running_terms}
@@ -339,69 +360,83 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     assert ocp.mpc.dt == 0.04
     assert ocp.mpc.horizon == 12
     assert ocp.mpc.num_control_points == 4
-    assert ocp.mpc.std_dev_scale == 0.1
+    assert ocp.mpc.num_samples == 1024
+    assert ocp.mpc.num_gain_samples == 64
+    assert ocp.mpc.lambda_mpc == 0.03
+    assert ocp.mpc.std_dev_scale == 0.035
+    assert ocp.trajectory.enabled
+    assert ocp.trajectory.duration_sec == 5.5
+    assert ocp.trajectory.max_velocity_fraction == 0.20
     assert ocp.references.q_ref == "measured"
     assert ocp.references.v_ref == "zero"
     assert ocp.references.u_ref == "gravity_q_ref"
     assert ocp.references.u_prev_ref == "previous_control"
-    assert running["ee_translation_xy"] == 500.0
-    assert running["ee_translation_z"] == 50.0
-    assert running["orientation"] == 300.0
-    assert running_terms["orientation"].params["x_axis_weight"] == 1.0
-    assert running["position_regularization"] == 5.0
-    assert running["control_regularization"] == 0.00005
-    assert running_terms["control_regularization"].params["weights"] == [
+
+    assert set(running) == {
+        "position_regularization",
+        "velocity_regularization",
+        "command_rate_regularization",
+        "control_regularization",
+    }
+    assert running["position_regularization"] == 1800.0
+    assert running_terms["position_regularization"].params["weights"] == [
         1.0,
-        3.0,
+        1.2,
         1.0,
-        2.5,
+        1.2,
         0.8,
-        1.5,
+        4.0,
         0.8,
     ]
-    assert running["command_rate_regularization"] == 0.02
+    assert running["velocity_regularization"] == 120.0
+    assert running_terms["velocity_regularization"].params["weights"] == [
+        1.0,
+        4.0,
+        1.2,
+        4.0,
+        0.8,
+        1.6,
+        0.8,
+    ]
+    assert running["command_rate_regularization"] == 0.20
     assert running_terms["command_rate_regularization"].params["weights"] == [
         1.0,
         3.0,
         1.0,
         2.5,
         0.8,
-        1.5,
-        0.8,
-    ]
-    assert running["velocity_regularization"] == 80.0
-    assert running_terms["velocity_regularization"].params["weights"] == [
         1.0,
-        5.0,
-        1.4,
-        4.5,
-        0.8,
-        5.0,
         0.8,
     ]
-    assert "joint_acceleration" not in running
-    assert running["mechanical_power"] == 0.01
-    assert running_terms["mechanical_power"].params["weights"] == [
+    assert running["control_regularization"] == 0.0001
+    assert running_terms["control_regularization"].params["weights"] == [
+        1.0,
+        3.0,
         1.0,
         2.5,
+        0.8,
         1.0,
-        2.0,
-        0.7,
-        1.5,
-        0.7,
+        0.8,
     ]
-    assert "ee_position_sq" not in terminal
-    assert terminal["ee_translation_xy"] == 150.0
-    assert terminal["ee_translation_z"] == 15.0
-    assert terminal["orientation"] == 60.0
-    assert terminal["position_regularization"] == 1.0
-    assert terminal["velocity_regularization"] == 16.0
-    assert terminal_terms["velocity_regularization"].params["weights"] == [
+
+    assert set(terminal) == {"position_regularization", "velocity_regularization"}
+    assert terminal["position_regularization"] == 4000.0
+    assert terminal_terms["position_regularization"].params["weights"] == [
         1.0,
-        5.0,
-        1.4,
-        4.5,
+        1.3,
+        1.0,
+        1.3,
         0.8,
         5.0,
+        0.8,
+    ]
+    assert terminal["velocity_regularization"] == 200.0
+    assert terminal_terms["velocity_regularization"].params["weights"] == [
+        1.0,
+        4.0,
+        1.2,
+        4.0,
+        0.8,
+        1.6,
         0.8,
     ]

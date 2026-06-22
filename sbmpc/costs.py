@@ -220,10 +220,12 @@ def _orientation(planner, *, x_axis_weight: float = 0.5, **_):
     return fn
 
 
-def _position_regularization(planner, **_):
+def _position_regularization(planner, *, weights=None, **_):
+    joint_weights = _joint_weights(planner, weights, name="position_regularization")
+
     def fn(state, inputs, previous_inputs, ctx):
         q = state[: planner.nq]
-        return jnp.sum(jnp.square(q - ctx.q_ref))
+        return jnp.sum(joint_weights * jnp.square(q - ctx.q_ref))
 
     return fn
 
