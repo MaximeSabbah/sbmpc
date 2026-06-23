@@ -358,13 +358,14 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     terminal = {name: term.weight for name, term in terminal_terms.items()}
 
     assert ocp.mpc.dt == 0.04
-    assert ocp.mpc.horizon == 12
+    assert ocp.mpc.horizon == 10
     assert ocp.mpc.num_control_points == 4
     assert ocp.mpc.num_samples == 1024
-    assert ocp.mpc.num_gain_samples == 64
+    assert ocp.mpc.num_gain_samples == 128
     assert ocp.mpc.lambda_mpc == 0.03
     assert ocp.mpc.std_dev_scale == 0.035
     assert ocp.trajectory.enabled
+    assert ocp.trajectory.horizon_reference == "window"
     assert ocp.trajectory.duration_sec == 5.5
     assert ocp.trajectory.max_velocity_fraction == 0.20
     assert ocp.references.q_ref == "measured"
@@ -388,7 +389,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         4.0,
         0.8,
     ]
-    assert running["velocity_regularization"] == 120.0
+    assert running["velocity_regularization"] == 150.0
     assert running_terms["velocity_regularization"].params["weights"] == [
         1.0,
         4.0,
@@ -420,7 +421,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     ]
 
     assert set(terminal) == {"position_regularization", "velocity_regularization"}
-    assert terminal["position_regularization"] == 4000.0
+    assert terminal["position_regularization"] == 3500.0
     assert terminal_terms["position_regularization"].params["weights"] == [
         1.0,
         1.3,
@@ -430,7 +431,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         5.0,
         0.8,
     ]
-    assert terminal["velocity_regularization"] == 200.0
+    assert terminal["velocity_regularization"] == 300.0
     assert terminal_terms["velocity_regularization"].params["weights"] == [
         1.0,
         4.0,

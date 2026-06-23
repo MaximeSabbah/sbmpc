@@ -1,13 +1,13 @@
 # PREGRASP controller config.
 #
 # This is the single tuning surface for both simulation checks and the real
-# robot. Tune it for the real Franka first; simulation is only informative.
+# robot.
 name: pregrasp
 n_weights: 0
 
 # --- MPPI / solver knobs ---
 mpc:
-  horizon: 12
+  horizon: 10
   num_samples: 1024          # parallel MPPI rollouts
   num_gain_samples: 128       # same-cycle rollouts differentiated for feedback gains
   num_control_points: 4      # spline control points (<= horizon)
@@ -30,6 +30,10 @@ sim:
 # measured start is too far to respect max_velocity_fraction.
 trajectory:
   enabled: true
+  # window: MPC tracks the plan across its horizon (true MPC tracking, default).
+  # constant: hold the current plan point across the horizon as a zero-velocity
+  #           position setpoint (non-anticipatory, calmer regulator).
+  horizon_reference: window
   duration_sec: 5.5
   max_velocity_fraction: 0.20
 
@@ -44,10 +48,10 @@ references:
 
 running_terms:
   - {name: position_regularization, weight: 1800.0, params: {weights: [1.0, 1.2, 1.0, 1.2, 0.8, 4.0, 0.8]}}
-  - {name: velocity_regularization, weight: 120.0, params: {weights: [1.0, 4.0, 1.2, 4.0, 0.8, 1.6, 0.8]}}
+  - {name: velocity_regularization, weight: 150.0, params: {weights: [1.0, 4.0, 1.2, 4.0, 0.8, 1.6, 0.8]}}
   - {name: command_rate_regularization, weight: 0.20, params: {weights: [1.0, 3.0, 1.0, 2.5, 0.8, 1.0, 0.8]}}
   - {name: control_regularization, weight: 0.0001, params: {weights: [1.0, 3.0, 1.0, 2.5, 0.8, 1.0, 0.8]}}
 
 terminal_terms:
-  - {name: position_regularization, weight: 4000.0, params: {weights: [1.0, 1.3, 1.0, 1.3, 0.8, 5.0, 0.8]}}
-  - {name: velocity_regularization, weight: 200.0, params: {weights: [1.0, 4.0, 1.2, 4.0, 0.8, 1.6, 0.8]}}
+  - {name: position_regularization, weight: 3500.0, params: {weights: [1.0, 1.3, 1.0, 1.3, 0.8, 5.0, 0.8]}}
+  - {name: velocity_regularization, weight: 300.0, params: {weights: [1.0, 4.0, 1.2, 4.0, 0.8, 1.6, 0.8]}}

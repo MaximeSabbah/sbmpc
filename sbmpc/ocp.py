@@ -81,6 +81,11 @@ class TrajectorySpec:
     """Runtime joint-space reference trajectory for reaching tasks."""
 
     enabled: bool = False
+    # How the planned trajectory is fed to the MPC horizon in tracking mode:
+    #   "window"   -> the sliding horizon window of the plan (true MPC tracking)
+    #   "constant" -> the current plan point held across the horizon as a
+    #                 zero-velocity position setpoint (non-anticipatory regulator)
+    horizon_reference: str = "window"
     duration_sec: float = 6.0
     max_velocity_fraction: float = 0.25
 
@@ -171,8 +176,16 @@ def _reference_spec(d: dict[str, Any] | None) -> ReferenceSpec:
 
 def _trajectory_spec(d: dict[str, Any] | None) -> TrajectorySpec:
     d = d or {}
+    horizon_reference = (
+        str(d.get("horizon_reference", TrajectorySpec.horizon_reference)).strip().lower()
+    )
+    if horizon_reference not in {"window", "constant"}:
+        raise ValueError(
+            "trajectory.horizon_reference must be one of: constant, window."
+        )
     spec = TrajectorySpec(
         enabled=bool(d.get("enabled", TrajectorySpec.enabled)),
+        horizon_reference=horizon_reference,
         duration_sec=float(d.get("duration_sec", TrajectorySpec.duration_sec)),
         max_velocity_fraction=float(
             d.get("max_velocity_fraction", TrajectorySpec.max_velocity_fraction)

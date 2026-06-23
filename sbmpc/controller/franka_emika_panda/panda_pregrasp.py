@@ -141,7 +141,8 @@ class PandaPregraspPlanner:
         )
         self.goal_tau = self.gravity_torques(self.goal_q)
 
-        self.reference = self.reference_for_state(
+        self.reference = PandaPregraspPlanner.reference_for_state(
+            self,
             self.home_q,
             jnp.zeros(self.nv, dtype=jnp.float32),
         )
@@ -310,6 +311,21 @@ class PandaPregraspPlanner:
         pin.computeGeneralizedGravity(self.pin_model, self.pin_data, q_np)
         return jnp.asarray(self.pin_data.g, dtype=jnp.float32)
 
+    def gravity_torques_batch(self, qs: jax.Array) -> jax.Array:
+        qs_np = np.asarray(qs, dtype=np.float64)
+        if qs_np.ndim == 1:
+            return self.gravity_torques(qs_np)
+        if qs_np.ndim != 2 or qs_np.shape[1] != self.nq:
+            raise ValueError(
+                f"qs must have shape ({self.nq},) or (N, {self.nq}), "
+                f"got {qs_np.shape}."
+            )
+        torques = np.empty((qs_np.shape[0], self.nu), dtype=np.float32)
+        for idx, q_np in enumerate(qs_np):
+            pin.computeGeneralizedGravity(self.pin_model, self.pin_data, q_np)
+            torques[idx, :] = np.asarray(self.pin_data.g, dtype=np.float32)
+        return jnp.asarray(torques, dtype=jnp.float32)
+
     def dynamics(
         self,
         state: jax.Array,
@@ -376,6 +392,52 @@ class PandaPregraspPlanner:
         u_prev_ref: jax.Array | None = None,
     ) -> jax.Array:
         return self.reference_for_state(q_ref, v_ref, u_ref, u_prev_ref).as_vector()
+
+    def reference_vectors_for_states(
+        self,
+        q_refs: jax.Array,
+        v_refs: jax.Array,
+        u_refs: jax.Array,
+        u_prev_ref: jax.Array,
+    ) -> jax.Array:
+        q_refs = jnp.asarray(q_refs, dtype=jnp.float32)
+        v_refs = jnp.asarray(v_refs, dtype=jnp.float32)
+        u_refs = jnp.asarray(u_refs, dtype=jnp.float32)
+        if q_refs.ndim != 2 or q_refs.shape[1] != self.nq:
+            raise ValueError(
+                f"q_refs must have shape (N, {self.nq}), got {q_refs.shape}."
+            )
+        if v_refs.shape != (q_refs.shape[0], self.nv):
+            raise ValueError(
+                f"v_refs must have shape (N, {self.nv}), got {v_refs.shape}."
+            )
+        if u_refs.shape != (q_refs.shape[0], self.nu):
+            raise ValueError(
+                f"u_refs must have shape (N, {self.nu}), got {u_refs.shape}."
+            )
+
+        sample_count = q_refs.shape[0]
+        return jnp.concatenate(
+            [
+                jnp.broadcast_to(self.goal_pos, (sample_count, 3)),
+                q_refs,
+                jnp.broadcast_to(
+                    jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),
+                    (sample_count, 3),
+                ),
+                jnp.broadcast_to(
+                    jnp.asarray(self.goal_rotation[:, 2], dtype=jnp.float32),
+                    (sample_count, 3),
+                ),
+                u_refs,
+                jnp.broadcast_to(
+                    jnp.asarray(u_prev_ref, dtype=jnp.float32),
+                    (sample_count, self.nu),
+                ),
+                v_refs,
+            ],
+            axis=1,
+        )
 
     def reference_for_policy(
         self,

@@ -397,6 +397,10 @@ class PandaPregraspController:
         self._trajectory_start_q: jax.Array | None = None
         self._trajectory_duration_sec = 0.0
         self._trajectory_step_index = 0
+        self._trajectory_q_refs: jax.Array | None = None
+        self._trajectory_v_refs: jax.Array | None = None
+        self._trajectory_u_refs: jax.Array | None = None
+        self._trajectory_reference_vecs: jax.Array | None = None
         self._started = False
         self._compute_running_cost = compute_running_cost
         self._compute_task_diagnostics = compute_task_diagnostics
@@ -556,12 +560,20 @@ class PandaPregraspController:
         self._trajectory_start_q = None
         self._trajectory_duration_sec = 0.0
         self._trajectory_step_index = 0
+        self._trajectory_q_refs = None
+        self._trajectory_v_refs = None
+        self._trajectory_u_refs = None
+        self._trajectory_reference_vecs = None
 
     def _initialize_trajectory(self, q: jax.Array) -> None:
         spec = self.ocp_config.trajectory
+        dt = float(self.config.MPC.dt)
+        horizon = int(self.config.MPC.horizon)
         start = jnp.asarray(q, dtype=jnp.float32)
         goal = jnp.asarray(self.planner.goal_q, dtype=jnp.float32)
-        dq_abs = np.abs(np.asarray(goal - start, dtype=np.float64))
+        start_np = np.asarray(start, dtype=np.float64)
+        goal_np = np.asarray(goal, dtype=np.float64)
+        dq_abs = np.abs(goal_np - start_np)
         velocity_limit = (
             np.asarray(self.planner.velocity_limits, dtype=np.float64)
             * float(spec.max_velocity_fraction)
@@ -570,36 +582,39 @@ class PandaPregraspController:
         duration_from_limits = float(
             np.max(1.875 * dq_abs / np.maximum(velocity_limit, 1e-6), initial=0.0)
         )
-        duration = max(float(spec.duration_sec), duration_from_limits, float(self.config.MPC.dt))
-        self._trajectory_start_q = start
-        self._trajectory_duration_sec = duration
-        self._trajectory_step_index = 0
-
-    def _trajectory_samples(self) -> tuple[jax.Array, jax.Array]:
-        if self._trajectory_start_q is None:
-            raise RuntimeError("trajectory has not been initialized")
-        horizon = int(self.config.MPC.horizon)
-        dt = float(self.config.MPC.dt)
-        duration = max(float(self._trajectory_duration_sec), dt)
-        steps = self._trajectory_step_index + np.arange(horizon + 1, dtype=np.float64)
+        duration = max(float(spec.duration_sec), duration_from_limits, dt)
+        trajectory_steps = int(np.ceil(duration / dt))
+        sample_count = max(horizon + 1, trajectory_steps + horizon + 1)
+        steps = np.arange(sample_count, dtype=np.float64)
         s = np.clip((steps * dt) / duration, 0.0, 1.0)
         blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
         blend_dot = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / duration
-        start = np.asarray(self._trajectory_start_q, dtype=np.float64)
-        goal = np.asarray(self.planner.goal_q, dtype=np.float64)
-        delta = goal - start
-        q_ref = start[None, :] + blend[:, None] * delta[None, :]
+        delta = goal_np - start_np
+        q_ref = start_np[None, :] + blend[:, None] * delta[None, :]
         v_ref = blend_dot[:, None] * delta[None, :]
-        return (
-            jnp.asarray(q_ref, dtype=jnp.float32),
-            jnp.asarray(v_ref, dtype=jnp.float32),
-        )
 
-    def _u_reference_for_q(self, q_ref: jax.Array) -> jax.Array:
+        self._trajectory_start_q = start
+        self._trajectory_duration_sec = duration
+        self._trajectory_step_index = 0
+        self._trajectory_q_refs = jnp.asarray(q_ref, dtype=jnp.float32)
+        self._trajectory_v_refs = jnp.asarray(v_ref, dtype=jnp.float32)
+        self._trajectory_u_refs = self._u_references_for_q_refs(q_ref)
+        self._trajectory_reference_vecs = self.planner.reference_vectors_for_states(
+            self._trajectory_q_refs,
+            self._trajectory_v_refs,
+            self._trajectory_u_refs,
+            self._trajectory_u_refs[0],
+        )
+        jax.block_until_ready(self._trajectory_q_refs)
+        jax.block_until_ready(self._trajectory_v_refs)
+        jax.block_until_ready(self._trajectory_u_refs)
+        jax.block_until_ready(self._trajectory_reference_vecs)
+
+    def _u_references_for_q_refs(self, q_refs: np.ndarray) -> jax.Array:
         if self.ocp_config.references.u_ref == "zero":
-            return jnp.zeros(self.planner.nu, dtype=jnp.float32)
+            return jnp.zeros((q_refs.shape[0], self.planner.nu), dtype=jnp.float32)
         if self.ocp_config.references.u_ref == "gravity_q_ref":
-            return self.planner.gravity_torques(q_ref)
+            return self.planner.gravity_torques_batch(q_refs)
         raise ValueError(f"unsupported u_ref policy: {self.ocp_config.references.u_ref}")
 
     def _previous_u_reference(
@@ -637,14 +652,32 @@ class PandaPregraspController:
         if reset_trajectory or self._trajectory_start_q is None:
             self._initialize_trajectory(q)
 
-        q_refs, v_refs = self._trajectory_samples()
-        u_refs = [self._u_reference_for_q(q_ref) for q_ref in q_refs]
-        first_u_prev = self._previous_u_reference(previous_u, u_refs[0])
-        refs = [
-            self.planner.reference_vector_for_state(q_ref, v_ref, u_ref, first_u_prev)
-            for q_ref, v_ref, u_ref in zip(q_refs, v_refs, u_refs)
-        ]
-        return jnp.stack(refs, axis=0)
+        window = self._trajectory_reference_window(previous_u)
+        if self.ocp_config.trajectory.horizon_reference == "constant":
+            # Hold the current plan point across the whole horizon as a pure
+            # position setpoint (zero velocity reference). The solver broadcasts
+            # this 1-D reference, intentionally bypassing the horizon lookahead
+            # for a calmer, non-anticipatory regulator.
+            v_start = 9 + self.planner.nq + 2 * self.planner.nv
+            return window[0, :].at[v_start : v_start + self.planner.nv].set(0.0)
+        return window
+
+    def _trajectory_reference_window(self, previous_u: np.ndarray | None) -> jax.Array:
+        if self._trajectory_reference_vecs is None or self._trajectory_u_refs is None:
+            raise RuntimeError("trajectory has not been initialized")
+        horizon = int(self.config.MPC.horizon)
+        window = horizon + 1
+        sample_count = int(self._trajectory_reference_vecs.shape[0])
+        start = min(self._trajectory_step_index, max(0, sample_count - window))
+        stop = start + window
+        refs = self._trajectory_reference_vecs[start:stop, :]
+        first_u_prev = self._previous_u_reference(
+            previous_u,
+            self._trajectory_u_refs[start],
+        )
+        u_prev_start = 9 + self.planner.nq + self.planner.nv
+        u_prev_stop = u_prev_start + self.planner.nv
+        return refs.at[0, u_prev_start:u_prev_stop].set(first_u_prev)
 
     def _seed_nominal_solution_from_reference(self, reference_vec: jax.Array) -> None:
         u_start = 9 + self.planner.nq

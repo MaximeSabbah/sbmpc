@@ -1,8 +1,11 @@
+from dataclasses import replace
+
 import jax.numpy as jnp
 import numpy as np
 
 from sbmpc.controller.franka_emika_panda.planner_api import PandaPickAndPlaceController, PandaPregraspController, TaskPose
 from sbmpc.controller.franka_emika_panda.panda_pregrasp import PandaPregraspPlanner, make_panda_pregrasp_config
+from sbmpc.ocp import load_ocp_config
 from sbmpc.controller.franka_emika_panda.panda_pick_and_place import (
     Phase,
     PandaPickAndPlacePlanner,
@@ -199,6 +202,112 @@ def test_panda_pregrasp_planner_has_no_inverse_dynamics_seed() -> None:
     assert not hasattr(planner, "nominal_torque_sequence_from_state")
     assert not hasattr(planner, "nominal_torque_sequence_to_goal")
     assert not hasattr(planner, "nominal_torque_sequence")
+
+
+def test_panda_pregrasp_controller_caches_trajectory_references() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=False)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+
+    gravity_batch_calls = 0
+    original_gravity_batch = planner.gravity_torques_batch
+
+    def wrapped_gravity_batch(qs):
+        nonlocal gravity_batch_calls
+        gravity_batch_calls += 1
+        return original_gravity_batch(qs)
+
+    planner.gravity_torques_batch = wrapped_gravity_batch
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            compute_running_cost=False,
+            compute_task_diagnostics=False,
+        )
+    )
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    reference0 = controller._reference_for_current_horizon(
+        q,
+        v,
+        previous_u=None,
+        reset_trajectory=True,
+    )
+    window0 = controller._trajectory_reference_window(previous_u=None)
+    controller._trajectory_step_index += 1
+    reference1 = controller._reference_for_current_horizon(
+        q,
+        v,
+        previous_u=np.zeros(controller.planner.nu, dtype=np.float32),
+        reset_trajectory=False,
+    )
+
+    expected_reference_width = 9 + 3 * controller.planner.nv + controller.planner.nq
+    # Tracking mode hands the solver the sliding horizon window (one reference
+    # row per horizon node), not a single frozen waypoint.
+    assert reference0.shape == (config.MPC.horizon + 1, expected_reference_width)
+    assert reference1.shape == reference0.shape
+    assert np.allclose(np.asarray(reference0), np.asarray(window0))
+    assert gravity_batch_calls == 1
+    assert controller._trajectory_q_refs is not None
+    assert controller._trajectory_v_refs is not None
+    assert controller._trajectory_u_refs is not None
+    assert controller._trajectory_reference_vecs is not None
+    # Advancing the trajectory index slides the window forward by one sample.
+    q_ref_delta = np.max(
+        np.abs(
+            np.asarray(reference1[0, 3 : 3 + controller.planner.nq])
+            - np.asarray(reference0[0, 3 : 3 + controller.planner.nq])
+        )
+    )
+    assert q_ref_delta > 0.0
+
+    controller.reset_runtime_state_after_warmup()
+
+    assert controller._trajectory_q_refs is None
+    assert controller._trajectory_v_refs is None
+    assert controller._trajectory_u_refs is None
+    assert controller._trajectory_reference_vecs is None
+
+
+def test_panda_pregrasp_controller_constant_horizon_reference_holds_zero_velocity() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=False)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    ocp = load_ocp_config("pregrasp")
+    ocp = replace(ocp, trajectory=replace(ocp.trajectory, horizon_reference="constant"))
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            compute_running_cost=False,
+            compute_task_diagnostics=False,
+            ocp_config=ocp,
+        )
+    )
+
+    q = controller.planner.home_q
+    v = jnp.zeros(controller.planner.nv, dtype=jnp.float32)
+    reference = controller._reference_for_current_horizon(
+        q,
+        v,
+        previous_u=None,
+        reset_trajectory=True,
+    )
+
+    width = 9 + 3 * controller.planner.nv + controller.planner.nq
+    # Constant mode collapses the horizon window to a single broadcast setpoint...
+    assert reference.shape == (width,)
+    # ...with the velocity reference zeroed (pure position hold).
+    v_start = 9 + controller.planner.nq + 2 * controller.planner.nv
+    v_ref = np.asarray(reference[v_start : v_start + controller.planner.nv])
+    assert np.allclose(v_ref, 0.0)
 
 
 def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:
