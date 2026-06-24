@@ -22,6 +22,7 @@ class FakePlanner:
     nq = 2
     nv = 2
     torque_limits = jnp.array([10.0, 10.0], dtype=jnp.float32)
+    velocity_limits = jnp.array([2.0, 2.0], dtype=jnp.float32)
 
     def ee_features(self, q):
         ee_pos = jnp.array([q[0], q[1], 0.0], dtype=jnp.float32)
@@ -139,6 +140,44 @@ def test_control_regularization_uses_local_torque_reference() -> None:
     # sum((inputs - u_ref)^2) = 4 + 4 = 8, weight = 2.
     np.testing.assert_allclose(
         float(model.running(state, inputs, ref)), 16.0, rtol=1e-5
+    )
+
+
+def test_control_regularization_scale_normalizes_by_torque_limit() -> None:
+    planner = FakePlanner()  # torque_limits = [10, 10]
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(
+            TermSpec("control_regularization", 1.0, params={"scale": "torque_limit"}),
+        ),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    state = jnp.zeros(4, jnp.float32)
+    inputs = jnp.array([5.0, 10.0], jnp.float32)
+    ref = _reference(planner, [0.0, 0.0, 0.0], [0.0, 0.0])
+
+    # ((inputs - u_ref) / torque_limit)^2 = (5/10)^2 + (10/10)^2 = 0.25 + 1.0
+    np.testing.assert_allclose(
+        float(model.running(state, inputs, ref)), 1.25, rtol=1e-5
+    )
+
+
+def test_velocity_limit_penalizes_speed_above_fraction_of_limit() -> None:
+    planner = FakePlanner()  # velocity_limits = [2, 2]
+    ocp = OCPConfig(
+        name="t",
+        running_terms=(TermSpec("velocity_limit", 1.0, params={"fraction": 0.5}),),
+        terminal_terms=(),
+    )
+    model = build_cost_model(ocp, planner)
+    # threshold = 0.5 * 2 = 1.0; q = [0, 0], v = [0.5, 1.5].
+    state = jnp.array([0.0, 0.0, 0.5, 1.5], jnp.float32)
+    ref = _reference(planner, [0.0, 0.0, 0.0], [0.0, 0.0])
+
+    # joint 0 below threshold (0); joint 1: ((1.5 - 1.0) / 2.0)^2 = 0.0625.
+    np.testing.assert_allclose(
+        float(model.running(state, jnp.zeros(2, jnp.float32), ref)), 0.0625, rtol=1e-5
     )
 
 
@@ -376,8 +415,10 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     assert set(running) == {
         "position_regularization",
         "velocity_regularization",
+        "ee_position_sq",
         "command_rate_regularization",
         "control_regularization",
+        "velocity_limit",
     }
     assert running["position_regularization"] == 1800.0
     assert running_terms["position_regularization"].params["weights"] == [
@@ -399,7 +440,9 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         1.6,
         0.8,
     ]
-    assert running["command_rate_regularization"] == 0.20
+    assert running["ee_position_sq"] == 400.0
+    assert running["command_rate_regularization"] == 20.0
+    assert running_terms["command_rate_regularization"].params["scale"] == "torque_limit"
     assert running_terms["command_rate_regularization"].params["weights"] == [
         1.0,
         3.0,
@@ -409,7 +452,8 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         1.0,
         0.8,
     ]
-    assert running["control_regularization"] == 0.0001
+    assert running["control_regularization"] == 0.5
+    assert running_terms["control_regularization"].params["scale"] == "torque_limit"
     assert running_terms["control_regularization"].params["weights"] == [
         1.0,
         3.0,
@@ -419,8 +463,14 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         1.0,
         0.8,
     ]
+    assert running["velocity_limit"] == 1500.0
+    assert running_terms["velocity_limit"].params["fraction"] == 0.8
 
-    assert set(terminal) == {"position_regularization", "velocity_regularization"}
+    assert set(terminal) == {
+        "position_regularization",
+        "velocity_regularization",
+        "ee_position_sq",
+    }
     assert terminal["position_regularization"] == 3500.0
     assert terminal_terms["position_regularization"].params["weights"] == [
         1.0,
@@ -441,3 +491,4 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         1.6,
         0.8,
     ]
+    assert terminal["ee_position_sq"] == 1200.0

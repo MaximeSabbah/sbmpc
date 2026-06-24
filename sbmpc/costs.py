@@ -242,21 +242,40 @@ def _joint_weights(planner, weights, *, name: str):
     return weights_arr
 
 
-def _control_regularization(planner, *, weights=None, **_):
+def _resolve_scale(planner, scale, size):
+    """Per-element normalization for a cost term so its weight is comparable to
+    the others. ``None`` is a no-op (scale 1); a name resolves to a robot limit;
+    otherwise a scalar/vector is used as-is."""
+    if scale is None:
+        return jnp.ones(size, dtype=jnp.float32)
+    if isinstance(scale, str):
+        named = {"torque_limit": "torque_limits", "velocity_limit": "velocity_limits"}
+        attr = named.get(scale)
+        if attr is None:
+            raise ValueError(
+                f"unknown cost scale '{scale}'. Known: {', '.join(sorted(named))}."
+            )
+        return jnp.asarray(getattr(planner, attr), dtype=jnp.float32)
+    return jnp.asarray(scale, dtype=jnp.float32)
+
+
+def _control_regularization(planner, *, weights=None, scale=None, **_):
     joint_weights = _joint_weights(planner, weights, name="control_regularization")
+    inv_scale = 1.0 / _resolve_scale(planner, scale, planner.nv)
 
     def fn(state, inputs, previous_inputs, ctx):
-        return jnp.sum(joint_weights * jnp.square(inputs - ctx.u_ref))
+        return jnp.sum(joint_weights * jnp.square((inputs - ctx.u_ref) * inv_scale))
 
     return fn
 
 
-def _command_rate_regularization(planner, *, weights=None, **_):
+def _command_rate_regularization(planner, *, weights=None, scale=None, **_):
     joint_weights = _joint_weights(planner, weights, name="command_rate_regularization")
+    inv_scale = 1.0 / _resolve_scale(planner, scale, planner.nv)
 
     def fn(state, inputs, previous_inputs, ctx):
         prev = ctx.u_prev_ref if previous_inputs is None else previous_inputs
-        return jnp.sum(joint_weights * jnp.square(inputs - prev))
+        return jnp.sum(joint_weights * jnp.square((inputs - prev) * inv_scale))
 
     return fn
 
@@ -309,6 +328,28 @@ def _mechanical_power(planner, *, weights=None, **_):
     return fn
 
 
+def _velocity_limit(planner, *, fraction: float = 0.8, weights=None, **_):
+    """Smooth, differentiable penalty as |v| nears the joint velocity limit.
+
+    Zero below ``fraction`` * limit, growing quadratically above it, expressed as
+    a fraction of the limit so its weight is comparable to the other terms. This
+    is a soft reliability barrier distinct from ``velocity_regularization`` (which
+    tracks ``v_ref``): it keeps the optimizer from commanding limit-violating
+    speeds without a hard, non-differentiable constraint.
+    """
+    joint_weights = _joint_weights(planner, weights, name="velocity_limit")
+    limit = jnp.asarray(planner.velocity_limits, dtype=jnp.float32)
+    threshold = limit * float(fraction)
+
+    def fn(state, inputs, previous_inputs, ctx):
+        del inputs, previous_inputs, ctx
+        v = state[planner.nq :]
+        excess = jnp.maximum((jnp.abs(v) - threshold) / limit, 0.0)
+        return jnp.sum(joint_weights * jnp.square(excess))
+
+    return fn
+
+
 TERM_BUILDERS: dict[str, Callable[..., TermFn]] = {
     "ee_translation_xy": _ee_translation_xy,
     "ee_translation_z": _ee_translation_z,
@@ -318,6 +359,7 @@ TERM_BUILDERS: dict[str, Callable[..., TermFn]] = {
     "control_regularization": _control_regularization,
     "command_rate_regularization": _command_rate_regularization,
     "velocity_regularization": _velocity_regularization,
+    "velocity_limit": _velocity_limit,
     "joint_acceleration": _joint_acceleration,
     "mechanical_power": _mechanical_power,
 }
