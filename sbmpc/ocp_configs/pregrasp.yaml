@@ -46,16 +46,12 @@ references:
   u_ref: gravity_q_ref     # gravity_q_ref | zero
   u_prev_ref: previous_control  # previous_control | u_ref | zero
 
-# Torque terms are normalized by torque_limit (scale: torque_limit) so their
-# weights live on the same order of magnitude as the position/velocity terms
-# instead of needing a ~1e-4 fudge. ee_position_sq adds task-space accuracy and
-# velocity_limit is a soft reliability barrier near the joint speed limits.
 running_terms:
   - {name: position_regularization, weight: 1800.0, params: {weights: [1.0, 1.2, 1.0, 1.2, 0.8, 4.0, 0.8]}}
   - {name: velocity_regularization, weight: 150.0, params: {weights: [1.0, 4.0, 1.2, 4.0, 0.8, 1.6, 0.8]}}
   - {name: ee_position_sq, weight: 400.0}
   - {name: command_rate_regularization, weight: 20.0, params: {scale: torque_limit, weights: [1.0, 3.0, 1.0, 2.5, 0.8, 1.0, 0.8]}}
-  - {name: control_regularization, weight: 0.5, params: {scale: torque_limit, weights: [1.0, 3.0, 1.0, 2.5, 0.8, 1.0, 0.8]}}
+  - {name: control_regularization, weight: 10.0, params: {scale: torque_limit, weights: [1.0, 3.0, 1.0, 2.5, 0.8, 1.0, 0.8]}}
   - {name: velocity_limit, weight: 1500.0, params: {fraction: 0.8}}
 
 terminal_terms:
