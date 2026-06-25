@@ -394,6 +394,16 @@ class PandaPregraspController:
         self._default_num_steps = self._validate_num_steps(num_steps)
         self._solution_initialized = False
         self._last_tau_ff: np.ndarray | None = None
+        self._last_input_sequence: jax.Array | None = None
+        self._joint_paths_for_control_sequences_fn = (
+            self._make_joint_paths_for_control_sequences_fn()
+        )
+        self._ee_positions_for_joint_path_fn = jax.jit(
+            jax.vmap(self.planner.ee_position)
+        )
+        self._ee_positions_for_joint_paths_fn = jax.jit(
+            jax.vmap(jax.vmap(self.planner.ee_position))
+        )
         self._trajectory_start_q: jax.Array | None = None
         self._trajectory_duration_sec = 0.0
         self._trajectory_step_index = 0
@@ -417,7 +427,21 @@ class PandaPregraspController:
         self._started = False
         self._solution_initialized = False
         self._last_tau_ff = None
+        self._last_input_sequence = None
+        if hasattr(self.controller, "last_sample_control_sequences"):
+            self.controller.last_sample_control_sequences = None
+        if hasattr(self.controller, "last_sample_costs"):
+            self.controller.last_sample_costs = None
         self._reset_trajectory()
+
+    def set_rollout_capture_enabled(self, enabled: bool) -> None:
+        self.controller.store_last_rollouts = bool(enabled)
+        if enabled:
+            return
+        if hasattr(self.controller, "last_sample_control_sequences"):
+            self.controller.last_sample_control_sequences = None
+        if hasattr(self.controller, "last_sample_costs"):
+            self.controller.last_sample_costs = None
 
     def warmup(
         self,
@@ -478,6 +502,7 @@ class PandaPregraspController:
         input_sequence = jax.block_until_ready(input_sequence)
         planner_command_time_ms = 1000.0 * (time.perf_counter() - command_start)
         self._solution_initialized = True
+        self._last_input_sequence = input_sequence
 
         tau_ff = np.asarray(input_sequence[0], dtype=np.float32)
         self._last_tau_ff = tau_ff.copy()
@@ -552,6 +577,150 @@ class PandaPregraspController:
         )
         predicted = np.asarray(jax.block_until_ready(predicted), dtype=np.float32)
         return predicted[: self.planner.nq], predicted[self.planner.nq :]
+
+    def planned_end_effector_path(
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        input_sequence: np.ndarray | jax.Array | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return the latest optimized nominal rollout as joint and EE paths.
+
+        This is intentionally computed on demand for visualization tools. Keep
+        it out of the default control path unless the caller explicitly opts
+        into rollout visualization and warms this path before arming.
+        """
+
+        q_path = self.planned_joint_path(q, v, input_sequence=input_sequence)
+        if q_path is None:
+            return None
+
+        ee_path = self._ee_positions_for_joint_path(q_path)
+        return q_path, ee_path
+
+    def representative_end_effector_rollouts(
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        *,
+        max_rollouts: int = 16,
+    ) -> np.ndarray | None:
+        """Return nominal plus lowest-cost sampled EE rollouts from the last MPPI step."""
+
+        max_rollouts = int(max_rollouts)
+        if max_rollouts <= 0:
+            return np.empty((0, int(self.config.MPC.horizon) + 1, 3), dtype=np.float32)
+
+        sequences = getattr(self.controller, "last_sample_control_sequences", None)
+        costs = getattr(self.controller, "last_sample_costs", None)
+        if sequences is None or costs is None:
+            return None
+
+        costs_np = np.asarray(jax.block_until_ready(costs), dtype=np.float64).reshape(-1)
+        if sequences.ndim != 3 or int(sequences.shape[0]) != costs_np.shape[0]:
+            return None
+
+        selected_indices = self._representative_rollout_indices(costs_np, max_rollouts)
+        selected_sequences = jax.block_until_ready(
+            sequences[jnp.asarray(selected_indices, dtype=jnp.int32)]
+        )
+        q_paths = self._joint_paths_for_control_sequences(q, v, selected_sequences)
+        if q_paths.shape[0] <= 0:
+            return np.empty((0, int(self.config.MPC.horizon) + 1, 3), dtype=np.float32)
+        return self._ee_positions_for_joint_paths(q_paths)
+
+    def planned_joint_path(
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        input_sequence: np.ndarray | jax.Array | None = None,
+    ) -> np.ndarray | None:
+        controls = self._last_input_sequence if input_sequence is None else input_sequence
+        if controls is None:
+            return None
+
+        q = PandaPickAndPlaceController._joint_vector(q, self.planner.nq, "q")
+        v = PandaPickAndPlaceController._joint_vector(v, self.planner.nv, "v")
+        controls = jnp.asarray(controls, dtype=jnp.float32)
+        if controls.ndim != 2 or controls.shape[1] != self.planner.nu:
+            raise ValueError(
+                "input_sequence must have shape "
+                f"(horizon, {self.planner.nu}), got {controls.shape}."
+            )
+
+        q_path = self._joint_path_for_control_sequence(q, v, controls)
+        return np.asarray(jax.block_until_ready(q_path), dtype=np.float32)
+
+    def _joint_path_for_control_sequence(
+        self,
+        q: jax.Array,
+        v: jax.Array,
+        controls: jax.Array,
+    ) -> jax.Array:
+        return self._joint_paths_for_control_sequences(q, v, controls[jnp.newaxis, ...])[0]
+
+    def _joint_paths_for_control_sequences(
+        self,
+        q: np.ndarray | jax.Array,
+        v: np.ndarray | jax.Array,
+        controls: np.ndarray | jax.Array,
+    ) -> jax.Array:
+        q = PandaPickAndPlaceController._joint_vector(q, self.planner.nq, "q")
+        v = PandaPickAndPlaceController._joint_vector(v, self.planner.nv, "v")
+        controls = jnp.asarray(controls, dtype=jnp.float32)
+        if controls.ndim != 3 or controls.shape[2] != self.planner.nu:
+            raise ValueError(
+                "control sequences must have shape "
+                f"(N, horizon, {self.planner.nu}), got {controls.shape}."
+            )
+        return self._joint_paths_for_control_sequences_fn(q, v, controls)
+
+    def _make_joint_paths_for_control_sequences_fn(self):
+        dt = jnp.asarray(self.config.MPC.dt, dtype=jnp.float32)
+        nq = self.planner.nq
+
+        def rollout_paths(q: jax.Array, v: jax.Array, controls: jax.Array) -> jax.Array:
+            state0 = jnp.concatenate([q, v], axis=0)
+
+            def rollout(sequence: jax.Array) -> jax.Array:
+                def step(state: jax.Array, control: jax.Array) -> tuple[jax.Array, jax.Array]:
+                    next_state = self.model.integrate_rollout_single(state, control, dt)
+                    return next_state, next_state[:nq]
+
+                _, q_tail = jax.lax.scan(step, state0, sequence)
+                return jnp.concatenate([state0[:nq][jnp.newaxis, :], q_tail], axis=0)
+
+            return jax.vmap(rollout)(controls)
+
+        return jax.jit(rollout_paths)
+
+    def _ee_positions_for_joint_path(self, q_path: np.ndarray | jax.Array) -> np.ndarray:
+        q_path = jnp.asarray(q_path, dtype=jnp.float32)
+        ee_path = self._ee_positions_for_joint_path_fn(q_path)
+        return np.asarray(jax.block_until_ready(ee_path), dtype=np.float32)
+
+    def _ee_positions_for_joint_paths(self, q_paths: np.ndarray | jax.Array) -> np.ndarray:
+        q_paths = jnp.asarray(q_paths, dtype=jnp.float32)
+        ee_paths = self._ee_positions_for_joint_paths_fn(q_paths)
+        return np.asarray(jax.block_until_ready(ee_paths), dtype=np.float32)
+
+    @staticmethod
+    def _representative_rollout_indices(
+        costs: np.ndarray,
+        max_rollouts: int,
+    ) -> list[int]:
+        if costs.size <= 0:
+            return []
+
+        indices: list[int] = [0]
+        finite_candidates = np.flatnonzero(np.isfinite(costs))
+        finite_candidates = finite_candidates[finite_candidates != 0]
+        if finite_candidates.size > 0 and max_rollouts > 1:
+            sorted_candidates = finite_candidates[
+                np.argsort(costs[finite_candidates], kind="stable")
+            ]
+            indices.extend(int(index) for index in sorted_candidates[: max_rollouts - 1])
+        return indices[:max_rollouts]
 
     def _trajectory_enabled(self) -> bool:
         return bool(self.ocp_config.trajectory.enabled)

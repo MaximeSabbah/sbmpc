@@ -292,6 +292,9 @@ class Controller:
         self.objective = rollout_gen.objective
         self.sampler = sampler
         self.gains_obj = gains_obj
+        self.store_last_rollouts = False
+        self.last_sample_control_sequences = None
+        self.last_sample_costs = None
 
     def command(
         self,
@@ -322,6 +325,12 @@ class Controller:
             optimal_samples = self.sampler.update(
                 previous_optimal_samples, samples, costs
             )
+            if self.store_last_rollouts:
+                self.last_sample_control_sequences = previous_optimal_samples + samples
+                self.last_sample_costs = costs
+            else:
+                self.last_sample_control_sequences = None
+                self.last_sample_costs = None
             if self.gains_obj.compute_gains:
                 self.gains_obj.cur_gains = self.gains_obj.gains_computation(
                     gain_costs, gain_samples, gradients

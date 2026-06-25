@@ -144,6 +144,7 @@ def test_panda_pick_and_place_controller_resets_solution_guess_on_phase_change()
 
 def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     controller = build_pregrasp_controller(gains=True)
+    controller.set_rollout_capture_enabled(True)
 
     output = controller.step(
         controller.planner.home_q,
@@ -166,6 +167,23 @@ def test_panda_pregrasp_controller_step_returns_ros_ready_shapes() -> None:
     assert np.all(np.isfinite(output.K))
     assert output.diagnostics.gain_mode == "exact_feedback"
     assert output.diagnostics.planner_command_time_ms is not None
+    path = controller.planned_end_effector_path(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+    )
+    assert path is not None
+    q_path, ee_path = path
+    assert q_path.shape == (controller.config.MPC.horizon + 1, controller.planner.nq)
+    assert ee_path.shape == (controller.config.MPC.horizon + 1, 3)
+    assert np.all(np.isfinite(ee_path))
+    rollouts = controller.representative_end_effector_rollouts(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+        max_rollouts=3,
+    )
+    assert rollouts is not None
+    assert rollouts.shape == (3, controller.config.MPC.horizon + 1, 3)
+    assert np.all(np.isfinite(rollouts))
 
 
 
