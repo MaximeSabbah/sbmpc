@@ -133,13 +133,22 @@ def test_panda_xml_joint_position_limits_match_agimus_description() -> None:
         assert _close(hi, float(ref["upper"])), f"{joint_name} upper"
 
 
-def test_panda_xml_joint_damping_friction_match_agimus_dynamics() -> None:
-    dynamics = _load_yaml(_agimus_share() / "robots" / "fer" / "dynamics.yaml")
-    joints = _mjcf_joints()
+def test_panda_xml_joints_use_menagerie_damping_standard() -> None:
+    # Joint dissipation uses the MuJoCo Menagerie Panda standard
+    # (armature=0.1, damping=1, no frictionloss) for numerical stability, matching
+    # the sim model. The real joint friction (small viscous + Coulomb, per the
+    # De Luca/Gaz identification) is a separate model not yet identified.
+    root = ET.parse(PANDA_XML).getroot()
+    panda_default = next(d for d in root.iter("default") if d.get("class") == "panda")
+    default_joint = panda_default.find("joint")
+    assert default_joint is not None
+    assert _close(float(default_joint.get("armature")), 0.1)
+    assert _close(float(default_joint.get("damping")), 1.0)
+    assert default_joint.get("frictionloss") in (None, "0", "0.0")
 
+    joints = _mjcf_joints()
     for joint_name in ARM_JOINTS:
         attrib = joints[joint_name]
-        ref = dynamics[joint_name]["dynamic"]
-        # MJCF damping mirrors the Agimus mu_viscous; frictionloss mirrors friction.
-        assert _close(float(attrib["damping"]), float(ref["mu_viscous"])), joint_name
-        assert _close(float(attrib["frictionloss"]), float(ref["friction"])), joint_name
+        # No per-joint override: inherit the standard from the panda class.
+        assert "damping" not in attrib, f"{joint_name} re-adds a damping override"
+        assert "frictionloss" not in attrib, f"{joint_name} re-adds frictionloss"
