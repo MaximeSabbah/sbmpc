@@ -213,13 +213,19 @@ def test_panda_pregrasp_controller_can_skip_task_diagnostics() -> None:
     assert output.diagnostics.goal_position.shape == (3,)
 
 
-def test_panda_pregrasp_planner_has_no_inverse_dynamics_seed() -> None:
-    # The pregrasp controller optimizes from a gravity-hold warm start; the
-    # cubic/inverse-dynamics tracking seed was removed on purpose.
+def test_panda_pregrasp_inverse_dynamics_matches_gravity_for_static_hold() -> None:
     planner = PandaPregraspPlanner()
-    assert not hasattr(planner, "nominal_torque_sequence_from_state")
-    assert not hasattr(planner, "nominal_torque_sequence_to_goal")
-    assert not hasattr(planner, "nominal_torque_sequence")
+    tau_inverse = planner.inverse_dynamics_torques(
+        planner.home_q,
+        jnp.zeros(planner.nv, dtype=jnp.float32),
+        jnp.zeros(planner.nv, dtype=jnp.float32),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(tau_inverse),
+        np.asarray(planner.gravity_torques(planner.home_q)),
+        atol=1e-4,
+    )
 
 
 def test_panda_pregrasp_controller_caches_trajectory_references() -> None:
@@ -229,15 +235,15 @@ def test_panda_pregrasp_controller_caches_trajectory_references() -> None:
     config.MPC.num_parallel_computations = 8
     config.MPC.num_control_points = 2
 
-    gravity_batch_calls = 0
-    original_gravity_batch = planner.gravity_torques_batch
+    inverse_batch_calls = 0
+    original_inverse_batch = planner.inverse_dynamics_torques_batch
 
-    def wrapped_gravity_batch(qs):
-        nonlocal gravity_batch_calls
-        gravity_batch_calls += 1
-        return original_gravity_batch(qs)
+    def wrapped_inverse_batch(qs, vs=None, accelerations=None):
+        nonlocal inverse_batch_calls
+        inverse_batch_calls += 1
+        return original_inverse_batch(qs, vs, accelerations)
 
-    planner.gravity_torques_batch = wrapped_gravity_batch
+    planner.inverse_dynamics_torques_batch = wrapped_inverse_batch
     controller = track_controller(
         PandaPregraspController(
             planner=planner,
@@ -270,11 +276,27 @@ def test_panda_pregrasp_controller_caches_trajectory_references() -> None:
     assert reference0.shape == (config.MPC.horizon + 1, expected_reference_width)
     assert reference1.shape == reference0.shape
     assert np.allclose(np.asarray(reference0), np.asarray(window0))
-    assert gravity_batch_calls == 1
+
+    q_ref0 = np.asarray(reference0[0, 3 : 3 + controller.planner.nq])
+    ee_ref0 = np.asarray(reference0[0, :3])
+    np.testing.assert_allclose(
+        ee_ref0,
+        np.asarray(controller.planner.ee_position(q_ref0)),
+        atol=1e-6,
+    )
+    assert not np.allclose(ee_ref0, np.asarray(controller.planner.goal_pos))
+    assert inverse_batch_calls == 1
     assert controller._trajectory_q_refs is not None
     assert controller._trajectory_v_refs is not None
+    assert controller._trajectory_a_refs is not None
     assert controller._trajectory_u_refs is not None
     assert controller._trajectory_reference_vecs is not None
+    midpoint = controller._trajectory_u_refs.shape[0] // 2
+    gravity_midpoint = planner.gravity_torques(controller._trajectory_q_refs[midpoint])
+    assert not np.allclose(
+        np.asarray(controller._trajectory_u_refs[midpoint]),
+        np.asarray(gravity_midpoint),
+    )
     # Advancing the trajectory index slides the window forward by one sample.
     q_ref_delta = np.max(
         np.abs(
@@ -288,6 +310,7 @@ def test_panda_pregrasp_controller_caches_trajectory_references() -> None:
 
     assert controller._trajectory_q_refs is None
     assert controller._trajectory_v_refs is None
+    assert controller._trajectory_a_refs is None
     assert controller._trajectory_u_refs is None
     assert controller._trajectory_reference_vecs is None
 
@@ -326,6 +349,45 @@ def test_panda_pregrasp_controller_constant_horizon_reference_holds_zero_velocit
     v_start = 9 + controller.planner.nq + 2 * controller.planner.nv
     v_ref = np.asarray(reference[v_start : v_start + controller.planner.nv])
     assert np.allclose(v_ref, 0.0)
+    u_start = 9 + controller.planner.nq
+    u_ref = np.asarray(reference[u_start : u_start + controller.planner.nu])
+    q_ref = reference[3 : 3 + controller.planner.nq]
+    np.testing.assert_allclose(
+        u_ref,
+        np.asarray(controller.planner.gravity_torques(q_ref)),
+        atol=1e-4,
+    )
+
+
+def test_panda_pregrasp_non_trajectory_mode_keeps_torque_minimization_reference() -> None:
+    planner = PandaPregraspPlanner()
+    config = make_panda_pregrasp_config(planner, visualize=False, gains=False)
+    config.MPC.horizon = 4
+    config.MPC.num_parallel_computations = 8
+    config.MPC.num_control_points = 2
+    ocp = load_ocp_config("pregrasp")
+    ocp = replace(ocp, trajectory=replace(ocp.trajectory, enabled=False))
+    controller = track_controller(
+        PandaPregraspController(
+            planner=planner,
+            config=config,
+            compute_running_cost=False,
+            compute_task_diagnostics=False,
+            ocp_config=ocp,
+        )
+    )
+
+    reference = controller._reference_for_current_horizon(
+        controller.planner.home_q,
+        jnp.zeros(controller.planner.nv, dtype=jnp.float32),
+        previous_u=None,
+        reset_trajectory=True,
+    )
+
+    u_start = 9 + controller.planner.nq
+    u_ref = np.asarray(reference[u_start : u_start + controller.planner.nu])
+    assert np.allclose(u_ref, 0.0)
+    assert controller._trajectory_u_refs is None
 
 
 def test_panda_pregrasp_controller_feedforward_mode_returns_zero_gain() -> None:

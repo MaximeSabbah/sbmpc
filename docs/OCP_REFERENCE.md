@@ -93,7 +93,7 @@ trajectory:               # optional runtime joint-space reference generator
 references:               # generic state/control refs used by regularization terms
   q_ref: measured          # measured | goal_ik
   v_ref: zero              # zero | measured
-  u_ref: gravity_q_ref     # gravity_q_ref | zero
+  u_ref: zero              # zero | gravity_q_ref
   u_prev_ref: previous_control  # previous_control | u_ref | zero
 
 running_terms:            # weighted sum, integrated as dt * sum(...) per step
@@ -109,11 +109,16 @@ Constraints enforced at build time:
 - Every term `name` must exist in `TERM_BUILDERS`.
 - `references.q_ref` must be `measured` or `goal_ik`.
 - `references.v_ref` must be `zero` or `measured`.
-- `references.u_ref` must be `gravity_q_ref` or `zero`; `gravity_q_ref`
-  means gravity compensation evaluated at the selected `q_ref`.
+- `references.u_ref` must be `gravity_q_ref` or `zero`; this is the fallback
+  control reference used when trajectory tracking is disabled. Use `zero` when
+  `control_regularization` should act as torque minimization.
 - `references.u_prev_ref` must be `previous_control`, `u_ref`, or `zero`.
   It initializes the first step of `command_rate_regularization`; after that,
   the term compares each planned torque with the preceding planned torque.
+- In pregrasp trajectory mode, the torque reference is implicit: the planner
+  precomputes a MuJoCo inverse-dynamics torque plan from the sampled
+  `q_ref`/`v_ref`/`ddq_ref`. `trajectory.u_ref` is intentionally not a YAML
+  field.
 - `trajectory.duration_sec` must be non-negative.
 - `trajectory.max_velocity_fraction` must be in `(0, 1]`.
 - All terms must stay JAX-differentiable: the exact-gain path takes a jvp of
@@ -178,14 +183,16 @@ The planner packs a flat reference vector consumed by `ReferenceLayout`:
 
 - `ee_pos_ref`: target TCP position.
 - `ee_x_axis_ref`/`ee_z_axis_ref`: columns of the reference TCP rotation.
-- `q_ref`, `v_ref`, `u_ref`: generic state/control regularization references.
-  Cost terms do not prescribe where these values come from; the OCP
-  `references:` and optional `trajectory:` policies do. With
-  `trajectory.enabled: true`, pregrasp generates a minimum-jerk joint trajectory
-  from the measured start state to the pregrasp IK and packs its horizon samples
-  as `q_ref`/`v_ref`; `u_ref: gravity_q_ref` then evaluates gravity at each
-  sampled `q_ref`. With trajectory disabled, the static `references:` choices
-  are used directly at every MPC cycle.
+- `q_ref`, `v_ref`, `u_ref`: generic state/control regularization references
+  carried in the flat vector. Cost terms do not prescribe where these values
+  come from; the OCP `references:` and optional `trajectory:` policies do. With
+  `trajectory.enabled: true`, pregrasp precomputes a minimum-jerk joint plan
+  from the measured start state to the pregrasp IK and packs moving-horizon
+  samples as `q_ref`/`v_ref`; it also precomputes a moving-horizon
+  inverse-dynamics torque plan from sampled `q_ref`/`v_ref`/`ddq_ref`. With
+  trajectory disabled, the static `references:` choices are used directly at
+  every MPC cycle, so `references.u_ref: zero` keeps
+  `control_regularization` as torque minimization.
 - `u_prev_ref`: first-step command-rate reference. In deployed pregrasp this is
   the previous `tau_ff` published by the planner, falling back to `u_ref` on the
   first active cycle.

@@ -358,6 +358,11 @@ def test_reference_policy_rejects_ambiguous_control_reference() -> None:
         ocp_config_from_dict({"references": {"u_ref": "gravity_measured"}})
 
 
+def test_reference_policy_rejects_trajectory_inverse_dynamics_reference() -> None:
+    with pytest.raises(ValueError, match=r"references\.u_ref"):
+        ocp_config_from_dict({"references": {"u_ref": "inverse_dynamics_q_ref"}})
+
+
 def test_reference_policy_rejects_home_position_reference() -> None:
     with pytest.raises(ValueError, match=r"references\.q_ref"):
         ocp_config_from_dict({"references": {"q_ref": "home"}})
@@ -384,6 +389,13 @@ def test_trajectory_policy_parses_valid_choices() -> None:
     assert ocp.trajectory.max_velocity_fraction == 0.2
 
 
+def test_trajectory_policy_rejects_explicit_control_reference() -> None:
+    with pytest.raises(ValueError, match=r"trajectory\.u_ref is implicit"):
+        ocp_config_from_dict({"trajectory": {"u_ref": "inverse_dynamics_q_ref"}})
+
+
+
+
 def test_trajectory_policy_rejects_invalid_velocity_fraction() -> None:
     with pytest.raises(ValueError, match=r"trajectory\.max_velocity_fraction"):
         ocp_config_from_dict({"trajectory": {"max_velocity_fraction": 0.0}})
@@ -402,25 +414,24 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
     assert ocp.mpc.num_samples == 1024
     assert ocp.mpc.num_gain_samples == 128
     assert ocp.mpc.lambda_mpc == 0.03
-    assert ocp.mpc.std_dev_scale == 0.035
+    assert ocp.mpc.std_dev_scale == 0.015
     assert ocp.trajectory.enabled
     assert ocp.trajectory.horizon_reference == "window"
-    assert ocp.trajectory.duration_sec == 5.5
+    assert ocp.trajectory.duration_sec == 7.5
     assert ocp.trajectory.max_velocity_fraction == 0.20
     assert ocp.references.q_ref == "measured"
     assert ocp.references.v_ref == "zero"
-    assert ocp.references.u_ref == "gravity_q_ref"
+    assert ocp.references.u_ref == "zero"
     assert ocp.references.u_prev_ref == "previous_control"
 
     assert set(running) == {
         "position_regularization",
         "velocity_regularization",
         "ee_position_sq",
-        "command_rate_regularization",
         "control_regularization",
         "velocity_limit",
     }
-    assert running["position_regularization"] == 1800.0
+    assert running["position_regularization"] == 1400.0
     assert running_terms["position_regularization"].params["weights"] == [
         1.0,
         1.2,
@@ -430,7 +441,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         4.0,
         0.8,
     ]
-    assert running["velocity_regularization"] == 150.0
+    assert running["velocity_regularization"] == 2500.0
     assert running_terms["velocity_regularization"].params["weights"] == [
         1.0,
         4.0,
@@ -440,19 +451,8 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         1.6,
         0.8,
     ]
-    assert running["ee_position_sq"] == 400.0
-    assert running["command_rate_regularization"] == 20.0
-    assert running_terms["command_rate_regularization"].params["scale"] == "torque_limit"
-    assert running_terms["command_rate_regularization"].params["weights"] == [
-        1.0,
-        3.0,
-        1.0,
-        2.5,
-        0.8,
-        1.0,
-        0.8,
-    ]
-    assert running["control_regularization"] == 0.5
+    assert running["ee_position_sq"] == 2000.0
+    assert running["control_regularization"] == 10.0
     assert running_terms["control_regularization"].params["scale"] == "torque_limit"
     assert running_terms["control_regularization"].params["weights"] == [
         1.0,
@@ -463,7 +463,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         1.0,
         0.8,
     ]
-    assert running["velocity_limit"] == 1500.0
+    assert running["velocity_limit"] == 500.0
     assert running_terms["velocity_limit"].params["fraction"] == 0.8
 
     assert set(terminal) == {
@@ -471,7 +471,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         "velocity_regularization",
         "ee_position_sq",
     }
-    assert terminal["position_regularization"] == 3500.0
+    assert terminal["position_regularization"] == 2500.0
     assert terminal_terms["position_regularization"].params["weights"] == [
         1.0,
         1.3,
@@ -481,7 +481,7 @@ def test_pregrasp_ocp_is_tuned_for_real_hardware_handoff() -> None:
         5.0,
         0.8,
     ]
-    assert terminal["velocity_regularization"] == 300.0
+    assert terminal["velocity_regularization"] == 1500.0
     assert terminal_terms["velocity_regularization"].params["weights"] == [
         1.0,
         4.0,

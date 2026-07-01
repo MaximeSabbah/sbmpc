@@ -71,6 +71,8 @@ class PlannerOutput:
     next_phase: object
     gripper_command: GripperCommand
     diagnostics: PlannerDiagnostics
+    reference_q: np.ndarray | None = None
+    reference_v: np.ndarray | None = None
 
 
 GAIN_MODE_FEEDFORWARD = "feedforward"
@@ -409,6 +411,7 @@ class PandaPregraspController:
         self._trajectory_step_index = 0
         self._trajectory_q_refs: jax.Array | None = None
         self._trajectory_v_refs: jax.Array | None = None
+        self._trajectory_a_refs: jax.Array | None = None
         self._trajectory_u_refs: jax.Array | None = None
         self._trajectory_reference_vecs: jax.Array | None = None
         self._started = False
@@ -524,6 +527,17 @@ class PandaPregraspController:
                     - jnp.clip(jnp.dot(ee_x, reference.goal_x_axis), -1.0, 1.0)
                 )
             )
+        running_reference = self._running_cost_reference(reference_vec)
+        reference_q = np.asarray(
+            running_reference[3 : 3 + self.planner.nq],
+            dtype=np.float32,
+        )
+        v_ref_start = 9 + self.planner.nq + 2 * self.planner.nv
+        reference_v = np.asarray(
+            running_reference[v_ref_start : v_ref_start + self.planner.nv],
+            dtype=np.float32,
+        )
+
         running_cost = None
         if self._compute_running_cost:
             running_cost = float(
@@ -531,7 +545,7 @@ class PandaPregraspController:
                     self.objective.running_cost(
                         state,
                         jnp.asarray(tau_ff, dtype=jnp.float32),
-                        self._running_cost_reference(reference_vec),
+                        running_reference,
                     )
                 )
             )
@@ -558,6 +572,8 @@ class PandaPregraspController:
                 planner_prepare_time_ms=planner_prepare_time_ms,
                 planner_command_time_ms=planner_command_time_ms,
             ),
+            reference_q=reference_q,
+            reference_v=reference_v,
         )
 
     def predict_state(
@@ -731,6 +747,7 @@ class PandaPregraspController:
         self._trajectory_step_index = 0
         self._trajectory_q_refs = None
         self._trajectory_v_refs = None
+        self._trajectory_a_refs = None
         self._trajectory_u_refs = None
         self._trajectory_reference_vecs = None
 
@@ -758,16 +775,23 @@ class PandaPregraspController:
         s = np.clip((steps * dt) / duration, 0.0, 1.0)
         blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
         blend_dot = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / duration
+        blend_ddot = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (duration**2)
         delta = goal_np - start_np
         q_ref = start_np[None, :] + blend[:, None] * delta[None, :]
         v_ref = blend_dot[:, None] * delta[None, :]
+        a_ref = blend_ddot[:, None] * delta[None, :]
 
         self._trajectory_start_q = start
         self._trajectory_duration_sec = duration
         self._trajectory_step_index = 0
         self._trajectory_q_refs = jnp.asarray(q_ref, dtype=jnp.float32)
         self._trajectory_v_refs = jnp.asarray(v_ref, dtype=jnp.float32)
-        self._trajectory_u_refs = self._u_references_for_q_refs(q_ref)
+        self._trajectory_a_refs = jnp.asarray(a_ref, dtype=jnp.float32)
+        self._trajectory_u_refs = self._u_references_for_trajectory(
+            q_ref,
+            v_ref,
+            a_ref,
+        )
         self._trajectory_reference_vecs = self.planner.reference_vectors_for_states(
             self._trajectory_q_refs,
             self._trajectory_v_refs,
@@ -776,15 +800,17 @@ class PandaPregraspController:
         )
         jax.block_until_ready(self._trajectory_q_refs)
         jax.block_until_ready(self._trajectory_v_refs)
+        jax.block_until_ready(self._trajectory_a_refs)
         jax.block_until_ready(self._trajectory_u_refs)
         jax.block_until_ready(self._trajectory_reference_vecs)
 
-    def _u_references_for_q_refs(self, q_refs: np.ndarray) -> jax.Array:
-        if self.ocp_config.references.u_ref == "zero":
-            return jnp.zeros((q_refs.shape[0], self.planner.nu), dtype=jnp.float32)
-        if self.ocp_config.references.u_ref == "gravity_q_ref":
-            return self.planner.gravity_torques_batch(q_refs)
-        raise ValueError(f"unsupported u_ref policy: {self.ocp_config.references.u_ref}")
+    def _u_references_for_trajectory(
+        self,
+        q_refs: np.ndarray,
+        v_refs: np.ndarray,
+        a_refs: np.ndarray,
+    ) -> jax.Array:
+        return self.planner.inverse_dynamics_torques_batch(q_refs, v_refs, a_refs)
 
     def _previous_u_reference(
         self,

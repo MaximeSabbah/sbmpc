@@ -117,6 +117,12 @@ class PandaPregraspPlanner:
         self.torque_limits = _ARM_TORQUE_LIMITS
         self.velocity_limits = _ARM_VELOCITY_LIMITS
 
+        (
+            self._inverse_mj_model,
+            self._inverse_mj_data,
+            self._inverse_q_pad,
+            self._inverse_v_pad,
+        ) = self._build_mujoco_inverse_model(str(PANDA_XML_PATH))
         (self._dynamics_jax, self._step_jax, self._ee_features_jax) = (
             self._build_mjx_functions(str(PANDA_XML_PATH))
         )
@@ -190,10 +196,7 @@ class PandaPregraspPlanner:
         )
         return reduced_model, reduced_model.createData()
 
-    def _build_mjx_functions(
-        self, panda_xml_path: str
-    ) -> tuple[callable, callable, callable]:
-        mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
+    def _configure_direct_torque_actuators(self, mj_model: mujoco.MjModel) -> None:
         torque_limits_np = np.asarray(self.torque_limits)
         mj_model.actuator_gainprm[:7, 0] = 1.0
         mj_model.actuator_gainprm[:7, 1:] = 0.0
@@ -203,6 +206,22 @@ class PandaPregraspPlanner:
         mj_model.actuator_ctrlrange[:7, 0] = -torque_limits_np
         mj_model.actuator_ctrlrange[:7, 1] = torque_limits_np
         mj_model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+
+    def _build_mujoco_inverse_model(
+        self, panda_xml_path: str
+    ) -> tuple[mujoco.MjModel, mujoco.MjData, np.ndarray, np.ndarray]:
+        mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
+        self._configure_direct_torque_actuators(mj_model)
+        mj_data = mujoco.MjData(mj_model)
+        q_pad = np.zeros(mj_model.nq - self.nq, dtype=np.float64)
+        v_pad = np.zeros(mj_model.nv - self.nv, dtype=np.float64)
+        return mj_model, mj_data, q_pad, v_pad
+
+    def _build_mjx_functions(
+        self, panda_xml_path: str
+    ) -> tuple[callable, callable, callable]:
+        mj_model = mujoco.MjModel.from_xml_path(panda_xml_path)
+        self._configure_direct_torque_actuators(mj_model)
         mjx_model = mjx.put_model(mj_model)
         mjx_data_template = mjx.put_data(mj_model, mujoco.MjData(mj_model))
         gripper_site_id = mujoco.mj_name2id(
@@ -326,6 +345,83 @@ class PandaPregraspPlanner:
             torques[idx, :] = np.asarray(self.pin_data.g, dtype=np.float32)
         return jnp.asarray(torques, dtype=jnp.float32)
 
+    def inverse_dynamics_torques(
+        self,
+        q: jax.Array,
+        v: jax.Array | None = None,
+        a: jax.Array | None = None,
+    ) -> jax.Array:
+        q_np = np.asarray(q, dtype=np.float64)
+        if q_np.shape != (self.nq,):
+            raise ValueError(f"q must have shape ({self.nq},), got {q_np.shape}.")
+        v_np = (
+            np.zeros(self.nv, dtype=np.float64)
+            if v is None
+            else np.asarray(v, dtype=np.float64)
+        )
+        a_np = (
+            np.zeros(self.nv, dtype=np.float64)
+            if a is None
+            else np.asarray(a, dtype=np.float64)
+        )
+        if v_np.shape != (self.nv,):
+            raise ValueError(f"v must have shape ({self.nv},), got {v_np.shape}.")
+        if a_np.shape != (self.nv,):
+            raise ValueError(f"a must have shape ({self.nv},), got {a_np.shape}.")
+        self._inverse_mj_data.qpos[:] = np.concatenate([q_np, self._inverse_q_pad])
+        self._inverse_mj_data.qvel[:] = np.concatenate([v_np, self._inverse_v_pad])
+        self._inverse_mj_data.qacc[:] = np.concatenate([a_np, self._inverse_v_pad])
+        mujoco.mj_inverse(self._inverse_mj_model, self._inverse_mj_data)
+        tau = self._inverse_mj_data.qfrc_inverse[: self.nu].copy()
+        return jnp.asarray(tau, dtype=jnp.float32)
+
+    def inverse_dynamics_torques_batch(
+        self,
+        qs: jax.Array,
+        vs: jax.Array | None = None,
+        accelerations: jax.Array | None = None,
+    ) -> jax.Array:
+        qs_np = np.asarray(qs, dtype=np.float64)
+        if qs_np.ndim == 1:
+            return self.inverse_dynamics_torques(qs_np, vs, accelerations)
+        if qs_np.ndim != 2 or qs_np.shape[1] != self.nq:
+            raise ValueError(
+                f"qs must have shape ({self.nq},) or (N, {self.nq}), "
+                f"got {qs_np.shape}."
+            )
+        if vs is None:
+            vs_np = np.zeros((qs_np.shape[0], self.nv), dtype=np.float64)
+        else:
+            vs_np = np.asarray(vs, dtype=np.float64)
+        if accelerations is None:
+            acc_np = np.zeros((qs_np.shape[0], self.nv), dtype=np.float64)
+        else:
+            acc_np = np.asarray(accelerations, dtype=np.float64)
+        expected = (qs_np.shape[0], self.nv)
+        if vs_np.shape != expected:
+            raise ValueError(f"vs must have shape {expected}, got {vs_np.shape}.")
+        if acc_np.shape != expected:
+            raise ValueError(
+                f"accelerations must have shape {expected}, got {acc_np.shape}."
+            )
+        torques = np.empty((qs_np.shape[0], self.nu), dtype=np.float32)
+        for idx, (q_np, v_np, a_np) in enumerate(zip(qs_np, vs_np, acc_np)):
+            self._inverse_mj_data.qpos[:] = np.concatenate(
+                [q_np, self._inverse_q_pad]
+            )
+            self._inverse_mj_data.qvel[:] = np.concatenate(
+                [v_np, self._inverse_v_pad]
+            )
+            self._inverse_mj_data.qacc[:] = np.concatenate(
+                [a_np, self._inverse_v_pad]
+            )
+            mujoco.mj_inverse(self._inverse_mj_model, self._inverse_mj_data)
+            torques[idx, :] = np.asarray(
+                self._inverse_mj_data.qfrc_inverse[: self.nu],
+                dtype=np.float32,
+            )
+        return jnp.asarray(torques, dtype=jnp.float32)
+
     def dynamics(
         self,
         state: jax.Array,
@@ -417,9 +513,10 @@ class PandaPregraspPlanner:
             )
 
         sample_count = q_refs.shape[0]
+        ee_pos_refs = jax.vmap(self.ee_position)(q_refs)
         return jnp.concatenate(
             [
-                jnp.broadcast_to(self.goal_pos, (sample_count, 3)),
+                ee_pos_refs,
                 q_refs,
                 jnp.broadcast_to(
                     jnp.asarray(self.goal_rotation[:, 0], dtype=jnp.float32),

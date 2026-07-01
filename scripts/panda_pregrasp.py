@@ -205,6 +205,13 @@ def main() -> None:
         f"u_ref={ocp.references.u_ref} "
         f"u_prev_ref={ocp.references.u_prev_ref}"
     )
+    torque_plan = "inverse_dynamics" if ocp.trajectory.enabled else "off"
+    print(
+        "trajectory: "
+        f"enabled={ocp.trajectory.enabled} "
+        f"horizon_reference={ocp.trajectory.horizon_reference} "
+        f"torque_plan={torque_plan}"
+    )
     print(f"goal_pos = {np.asarray(planner.goal_pos)}")
     if config.MPC.gains:
         print(

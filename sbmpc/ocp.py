@@ -151,11 +151,18 @@ def _sim_spec(d: dict[str, Any] | None) -> SimSpec:
     )
 
 
-def _choice(d: dict[str, Any], key: str, default: str, valid: set[str]) -> str:
+def _choice(
+    d: dict[str, Any],
+    key: str,
+    default: str,
+    valid: set[str],
+    *,
+    section: str = "references",
+) -> str:
     value = str(d.get(key, default)).strip().lower()
     if value not in valid:
         choices = ", ".join(sorted(valid))
-        raise ValueError(f"references.{key} must be one of: {choices}.")
+        raise ValueError(f"{section}.{key} must be one of: {choices}.")
     return value
 
 
@@ -164,7 +171,12 @@ def _reference_spec(d: dict[str, Any] | None) -> ReferenceSpec:
     return ReferenceSpec(
         q_ref=_choice(d, "q_ref", ReferenceSpec.q_ref, {"goal_ik", "measured"}),
         v_ref=_choice(d, "v_ref", ReferenceSpec.v_ref, {"zero", "measured"}),
-        u_ref=_choice(d, "u_ref", ReferenceSpec.u_ref, {"zero", "gravity_q_ref"}),
+        u_ref=_choice(
+            d,
+            "u_ref",
+            ReferenceSpec.u_ref,
+            {"zero", "gravity_q_ref"},
+        ),
         u_prev_ref=_choice(
             d,
             "u_prev_ref",
@@ -176,6 +188,11 @@ def _reference_spec(d: dict[str, Any] | None) -> ReferenceSpec:
 
 def _trajectory_spec(d: dict[str, Any] | None) -> TrajectorySpec:
     d = d or {}
+    if "u_ref" in d:
+        raise ValueError(
+            "trajectory.u_ref is implicit: trajectory tracking precomputes a "
+            "MuJoCo inverse-dynamics torque plan."
+        )
     horizon_reference = (
         str(d.get("horizon_reference", TrajectorySpec.horizon_reference)).strip().lower()
     )
